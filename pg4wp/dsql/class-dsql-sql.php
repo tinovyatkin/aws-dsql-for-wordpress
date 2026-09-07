@@ -24,6 +24,7 @@ class DSQL_SelectSQLRewriter extends SelectSQLRewriter {
 final class DSQL_SQL {
     private PDO $pdo;
     private string $foundRowsQuery = '';
+    private array $dateColumns = [];
 
     public function __construct(PDO $pdo) { $this->pdo = $pdo; }
 
@@ -44,6 +45,7 @@ final class DSQL_SQL {
             return ['SELECT COUNT(*) FROM (' . $this->foundRowsQuery . ') AS dsql_found_rows'];
         }
         [$sql, $literals] = $this->protectLiterals(trim($mysql));
+        $this->zeroDates($sql, $literals);
         $calc = stripos($sql, 'SQL_CALC_FOUND_ROWS') !== false;
         $sql = str_ireplace('SQL_CALC_FOUND_ROWS', '', $sql);
 
@@ -117,6 +119,43 @@ final class DSQL_SQL {
         return $sql . ' RETURNING *';
     }
 
+    /** Translate zero dates only in temporal columns, never in article/option text. */
+    private function zeroDates(string $sql, array &$literals): void {
+        $replace = function(string $marker) use (&$literals): void {
+            if (isset($literals[$marker]) && preg_match("/^'0000-00-00(?: 00:00:00(?:\.0+)?)?'$/D", $literals[$marker])) {
+                $literals[$marker] = str_replace('0000-00-00','0001-01-01',$literals[$marker]);
+            }
+        };
+        $marker = "'__dsql_[a-f0-9]+_[0-9]+'";
+        if (preg_match('/^CREATE\s+TABLE\b/i',$sql)) {
+            preg_match_all('/(?:^|,|\()\s*[\x60"]?\w+[\x60"]?\s+(?:datetime|timestamp|date)\b[^,]*?\bDEFAULT\s+('.$marker.')/i',$sql,$m);
+            foreach ($m[1] as $literal) $replace($literal);
+            return;
+        }
+        preg_match_all('/\b(?:FROM|JOIN|UPDATE|INTO)\s+[\x60"]?(\w+)[\x60"]?/i',$sql,$tables);
+        $dates=[];
+        foreach (array_unique($tables[1]) as $table) {
+            if (!isset($this->dateColumns[$table])) {
+                $s=$this->pdo->prepare("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=? AND data_type IN ('timestamp without time zone','timestamp with time zone','date')");
+                $s->execute([$table]);$this->dateColumns[$table]=$s->fetchAll(PDO::FETCH_COLUMN);
+            }
+            $dates=array_merge($dates,$this->dateColumns[$table]);
+        }
+        if (!$dates) return;
+        if (preg_match('/^INSERT\s+(?:IGNORE\s+)?INTO\s+[\x60"]?\w+[\x60"]?\s*\(([^)]+)\)\s*VALUES\s*(.*)/is',$sql,$insert)) {
+            $columns=array_map(static fn($c)=>trim($c," \t\n\x60\""),explode(',',$insert[1]));
+            preg_match_all('/\(([^()]*)\)/',$insert[2],$groups);
+            foreach ($groups[1] as $group) {
+                $values=array_map('trim',explode(',',$group));
+                if (count($columns)!==count($values)) continue;
+                foreach ($columns as $i=>$column) { if (in_array($column,$dates,true)) $replace($values[$i]); }
+            }
+        }
+        $names=implode('|',array_map(static fn($d)=>preg_quote($d,'/'),array_unique($dates)));
+        preg_match_all('/(?:[\x60"]?\w+[\x60"]?\.)?[\x60"]?(?:'.$names.')[\x60"]?\s*(?:=|!=|<>|<=|>=|<|>)\s*('.$marker.')/i',$sql,$matches);
+        foreach ($matches[1] as $literal) $replace($literal);
+    }
+
     /**
      * Never apply regex SQL rewrites to article text, serialized PHP, or secrets.
      * Parse MySQL string quoting first, then restore PostgreSQL-quoted values.
@@ -158,8 +197,6 @@ final class DSQL_SQL {
             }
             if (!$closed) { throw new RuntimeException('Unterminated SQL string'); }
             if (str_contains($value, "\0")) { throw new RuntimeException('NUL bytes in text are unsupported by PostgreSQL'); }
-            // PostgreSQL has no MySQL zero timestamp. Preserve a reversible sentinel.
-            if ($value === '0000-00-00 00:00:00') { $value = '0001-01-01 00:00:00'; }
             $marker = "'" . $nonce . count($values) . "'";
             $values[$marker] = $this->pdo->quote($value);
             $out .= $marker;

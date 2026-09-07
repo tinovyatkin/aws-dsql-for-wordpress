@@ -10,9 +10,11 @@ use Aws\AuroraDsql\PdoPgsql\OCCRetry;
 $autoload = defined('DSQL_AUTOLOAD') ? DSQL_AUTOLOAD : dirname(__DIR__, 2) . '/vendor/autoload.php';
 require_once $autoload;
 require_once __DIR__ . '/class-dsql-sql.php';
+require_once __DIR__ . '/class-dsql-schema-catalog.php';
 
 class DSQL_WPDB extends wpdb {
     private DSQL_SQL $translator;
+    private DSQL_Schema_Catalog $schemaCatalog;
     private float $connectedAt = 0;
     private array $indexJobs = [];
     public bool $defer_index_wait = false;
@@ -44,6 +46,7 @@ class DSQL_WPDB extends wpdb {
                 PDO::ATTR_STRINGIFY_FETCHES => true,
             ]);
             $this->translator = new DSQL_SQL($this->dbh);
+            $this->schemaCatalog = new DSQL_Schema_Catalog($this->dbh);
             $this->connectedAt = microtime(true);
             $this->is_mysql = false;
             $this->ready = true;
@@ -70,7 +73,7 @@ class DSQL_WPDB extends wpdb {
     }
     public function close() { $this->dbh = null; $this->ready = false; return true; }
     public function check_database_version() { return null; }
-    public function db_version() { return '8.0'; } // MySQL dialect compatibility advertised to core.
+    public function db_version() { return '8.0.17'; } // MySQL dialect: integer display widths have no storage meaning.
     public function db_server_info() { return 'Aurora DSQL (PostgreSQL-compatible)'; }
     public function has_cap($cap) { return in_array($cap, ['collation', 'group_concat', 'subqueries', 'set_charset', 'utf8mb4', 'identifier_placeholders'], true); }
     public function _real_escape($data) {
@@ -109,8 +112,13 @@ class DSQL_WPDB extends wpdb {
         $this->last_query = $query;
         $start = microtime(true);
         try {
+            if (preg_match('/^\s*(?:ALTER\s+TABLE|DROP\s+TABLE)(?:\s+IF\s+EXISTS)?\s+[\x60"]?(\w+)/i', $query, $ddl)
+                && $this->schemaCatalog->get($ddl[1])) {
+                throw new RuntimeException('Schema changes on restored tables require a migration-aware upgrade; refusing to make the saved schema metadata stale');
+            }
             $emulated = $this->metadataQuery($query);
             $rows = [];
+            $rowTypes = [];
             if ($emulated !== null) {
                 $rows = $emulated;
                 $this->num_queries++;
@@ -129,15 +137,22 @@ class DSQL_WPDB extends wpdb {
                         $job = $stmt->fetchColumn();
                         if ($job) { $this->indexJobs[] = $job; }
                     } else {
+                        for ($i=0; $i<$stmt->columnCount(); $i++) {
+                            $meta=$stmt->getColumnMeta($i);
+                            $rowTypes[$meta['name']]=$meta['native_type']??'';
+                        }
                         $rows = $stmt->columnCount() ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
                         $this->rows_affected += $stmt->rowCount();
                     }
                 }
                 if (!$this->defer_index_wait) { $this->wait_for_indexes(); }
             }
-            $this->last_result = array_map(static function ($row) {
-                foreach ($row as &$value) {
-                    if ($value === '0001-01-01 00:00:00') { $value = '0000-00-00 00:00:00'; }
+            $this->last_result = array_map(static function ($row) use ($rowTypes) {
+                foreach ($row as $field=>&$value) {
+                    if (is_resource($value)) { $value=stream_get_contents($value); }
+                    if (in_array($rowTypes[$field]??'', ['timestamp','timestamptz','date'],true) && is_string($value)) {
+                        $value=preg_replace('/^0001-01-01/', '0000-00-00', $value);
+                    }
                     elseif ($value !== null) { $value = (string) $value; }
                 }
                 return (object) $row;
@@ -203,6 +218,8 @@ class DSQL_WPDB extends wpdb {
         }
         if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode/i', $query)) { return [['sql_mode' => '']]; }
         if (preg_match('/^\s*SHOW\s+INDEX(?:ES)?\s+FROM\s+[\x60"]?(\w+)/i', $query, $m)) {
+            $saved = $this->schemaCatalog->get($m[1]);
+            if ($saved) { return $saved['indexes']; }
             $stmt = $this->dbh->prepare("SELECT t.relname AS \"Table\",
                 CASE WHEN i.indisunique THEN 0 ELSE 1 END AS \"Non_unique\",
                 CASE WHEN i.indisprimary THEN 'PRIMARY' ELSE substr(idx.relname, length(t.relname)+2) END AS \"Key_name\",
@@ -223,6 +240,8 @@ class DSQL_WPDB extends wpdb {
             return $this->dbh->query($sql)->fetchAll(PDO::FETCH_ASSOC);
         }
         if (preg_match('/^\s*(?:DESCRIBE|DESC|SHOW\s+(?:FULL\s+)?COLUMNS\s+FROM)\s+[\x60"]?(\w+)/i', $query, $m)) {
+            $saved = $this->schemaCatalog->get($m[1]);
+            if ($saved) { return $saved['columns']; }
             $stmt = $this->dbh->prepare("SELECT column_name, data_type, is_nullable, column_default, character_maximum_length, is_identity
                 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ? ORDER BY ordinal_position");
             $stmt->execute([$m[1]]);

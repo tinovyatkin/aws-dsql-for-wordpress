@@ -147,17 +147,26 @@ Do not activate this as an ordinary plugin or point it at an existing MySQL
 site expecting data to migrate automatically. A DSQL cluster contains the
 built-in `postgres` database; this prototype uses its `public` schema.
 
+## Backup and restore migration
+
+The fork now includes a logical MySQL backup, DSQL preflight, empty-target restore,
+and full-table verification CLI. Restored tables retain their original MySQL
+schema metadata; the unchanged core schema passes dbDelta without false changes.
+See [the migration workflow and rollback boundary](docs/backup-restore-migration.md).
+The CLI never changes the live WordPress connection.
+
 ## Known limits
 
-- **Schema upgrades are incomplete.** `SHOW INDEX`/column introspection work, but
-  `dbDelta()` still sees differences between MySQL types and their PostgreSQL
-  representation. Do not run production upgrades or migrations with this prototype.
+- **Automatic schema upgrades remain incomplete.** Migrated tables use a verified
+  MySQL metadata catalog, so unchanged schemas compare correctly. ALTER/DROP on
+  those tables is deliberately blocked until migration-aware upgrades are implemented.
+  Fresh tables created outside the restore path still have partial introspection.
 - The reused SQL rewrite rules are not a complete MySQL grammar or complete
   MySQL behavior emulation. Arbitrary plugin SQL, multisite, MySQL collations,
   unsigned integer semantics, complex `REPLACE` operations, and unusual schema
   changes need separate work and testing.
-- MySQL zero timestamps currently use a year-1 sentinel. That approximation
-  reserves the exact sentinel value and needs refinement for full fidelity.
+- MySQL zero dates use a year-1 sentinel in temporal columns only. Literal text
+  is preserved. Migration preflight rejects real source dates using that sentinel.
 - NUL bytes in PostgreSQL text values are rejected explicitly.
 - DSQL limits on transactions, rows, index keys, and connection lifetime still apply.
   Manual multi-statement transactions need whole-transaction retry at their owner.
