@@ -1,20 +1,20 @@
 <?php
 /*
-Plugin Name: PostgreSQL for WordPress (PG4WP)
-Plugin URI: https://github.com/PostgreSQL-For-Wordpress/postgresql-for-wordpress
-Description: PG4WP is a special plugin enabling WordPress to use a PostgreSQL database.
-Version: v3.0.0
-Author: PostgreSQL-For-Wordpress
-Author URI: https://github.com/PostgreSQL-For-Wordpress
+Plugin Name: AWS DSQL for WordPress
+Plugin URI: https://github.com/tinovyatkin/aws-dsql-for-wordpress
+Description: Experimental Aurora DSQL database drop-in, derived from PostgreSQL for WordPress.
+Version: 0.1.0
+Author: tinovyatkin and PG4WP contributors
 License: GPLv2 or newer.
 */
 
 // Ensure we only load this config once
-if(!defined('PG4WP_ROOT')) {
+if(!defined('PG4WP_BOOTSTRAPPED')) {
+    define('PG4WP_BOOTSTRAPPED', true);
 
     // You can choose the driver to load here
     if (!defined('DB_DRIVER')) {
-        define('DB_DRIVER', 'pgsql');
+        define('DB_DRIVER', 'dsql');
     }
 
     // Set this to 'true' and check that `pg4wp` is writable if you want debug logs to be written
@@ -25,12 +25,16 @@ if(!defined('PG4WP_ROOT')) {
     if (!defined('PG4WP_LOG_ERRORS')) {
         // If you just want to log queries that generate errors, leave PG4WP_DEBUG to "false"
         // and set this to true
-        define('PG4WP_LOG_ERRORS', true);
+        define('PG4WP_LOG_ERRORS', false);
     }
 
     // This defines the directory where PG4WP files are loaded from
     //   3 places checked : wp-content, wp-content/plugins and the base directory
-    if(file_exists(ABSPATH . 'wp-content/pg4wp')) {
+    if (defined('PG4WP_ROOT')) {
+        // Explicit development path.
+    } elseif(file_exists(ABSPATH . 'wp-content/plugins/aws-dsql-for-wordpress/pg4wp')) {
+        define('PG4WP_ROOT', ABSPATH . 'wp-content/plugins/aws-dsql-for-wordpress/pg4wp');
+    } elseif(file_exists(ABSPATH . 'wp-content/pg4wp')) {
         define('PG4WP_ROOT', ABSPATH . 'wp-content/pg4wp');
     } elseif(file_exists(ABSPATH . 'wp-content/plugins/pg4wp')) {
         define('PG4WP_ROOT', ABSPATH . 'wp-content/plugins/pg4wp');

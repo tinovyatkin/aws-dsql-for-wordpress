@@ -10,6 +10,14 @@
 */
 
 // This is required by class-wpdb so we must load it first
+// DSQL uses the official wpdb extension point and AWS's PDO connector.
+// Keep the original PG4WP driver available for existing PostgreSQL users.
+if (DB_DRIVER === 'dsql') {
+    require_once PG4WP_ROOT . '/dsql/class-dsql-wpdb.php';
+    $wpdb = new DSQL_WPDB(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+    return;
+}
+
 require_once ABSPATH . '/wp-includes/version.php';
 require_once ABSPATH . '/wp-includes/cache.php';
 require_once ABSPATH . '/wp-includes/l10n.php';

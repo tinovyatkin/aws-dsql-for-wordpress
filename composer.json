@@ -1,0 +1,16 @@
+{
+  "name": "tinovyatkin/aws-dsql-for-wordpress",
+  "description": "Experimental Aurora DSQL database drop-in for WordPress, derived from PG4WP",
+  "type": "wordpress-plugin",
+  "license": "GPL-2.0-or-later",
+  "require": {
+    "php": ">=8.2",
+    "ext-pdo_pgsql": "*",
+    "awslabs/aurora-dsql-pdo-pgsql": "^0.1"
+  },
+  "config": {
+    "platform": {
+      "php": "8.2.0"
+    }
+  }
+}
