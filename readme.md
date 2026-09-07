@@ -188,3 +188,11 @@ Original PG4WP work is credited to Hawk__, kevinoid, mattbucci, and the
 Their original driver and unit tests are retained. Source is GPL-2.0-or-later;
 see [license.md](license.md). AWS connector dependencies retain their own
 Apache-2.0 notices and are installed with Composer/npm, not vendored into Git.
+# Controlled schema upgrades
+
+Version 0.4 adds a CLI-only upgrade runner with schema planning, verified table
+rebuilds, synchronized MySQL metadata, retained originals, separate upgrade
+credentials and recovery from interrupted DDL. Core/plugin versions must be
+pinned; automatic updates remain disabled. See
+[controlled upgrades](docs/controlled-upgrades.md) for setup, commands, tested
+scope and the remaining limitations.

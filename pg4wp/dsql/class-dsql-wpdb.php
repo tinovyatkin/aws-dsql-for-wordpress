@@ -24,13 +24,19 @@ class DSQL_WPDB extends wpdb {
     public array $dsql_errors = [];
     public int $dsql_error_count = 0;
     private int $queryRetries = 0;
+    private ?\WPDSQLUpgrade\Engine $schemaUpgrade = null;
 
     public function db_connect($allow_bail = true) {
         $start = microtime(true);
         try {
             $profile = defined('DSQL_PROFILE') ? DSQL_PROFILE : null;
             $provider = null;
-            if ($profile) {
+            $upgrade=class_exists('WPDSQLUpgrade\\Context',false) ? \WPDSQLUpgrade\Context::$session : null;
+            if($upgrade) {
+                $profile=$upgrade->data['target']['profile']??null;
+                if(isset($upgrade->data['target']['credentials_file']))$provider=\Aws\Credentials\CredentialProvider::ini($profile?:'default',$upgrade->data['target']['credentials_file']);
+            }
+            if ($profile && !$provider) {
                 // Connector 0.1.1 passes "profile" to defaultProvider(), which
                 // the PHP SDK ignores for shared profiles. Use its client resolver.
                 $sdkClient = new \Aws\DSQL\DSQLClient([
@@ -117,6 +123,7 @@ class DSQL_WPDB extends wpdb {
     }
 
     public function query($query) {
+        if($this->schemaUpgrade)$this->schemaUpgrade->session->assertActive();
         if (!$this->check_connection()) { return false; }
         $query = apply_filters('query', $query);
         if (!$query) { return false; }
@@ -126,9 +133,15 @@ class DSQL_WPDB extends wpdb {
         $stage = 'metadata';
         $this->queryRetries = 0;
         try {
-            if (preg_match('/^\s*(?:ALTER\s+TABLE|DROP\s+TABLE)(?:\s+IF\s+EXISTS)?\s+[\x60"]?(\w+)/i', $query, $ddl)
-                && $this->schemaCatalog->get($ddl[1])) {
-                throw new RuntimeException('Schema changes on restored tables require a migration-aware upgrade; refusing to make the saved schema metadata stale');
+            if (preg_match('/^\s*(?:CREATE|ALTER|DROP|RENAME|TRUNCATE)\b/i', $query)) {
+                if($this->schemaUpgrade) {
+                    $this->schemaUpgrade->execute($query);
+                    $this->schemaCatalog->clear();
+                    $this->translator=new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema);
+                    $this->num_queries++;
+                    return true;
+                }
+                if($this->schemaCatalog->managed())throw new RuntimeException('Schema changes on restored tables require the controlled DSQL upgrade runner');
             }
             $emulated = $this->metadataQuery($query);
             $rows = [];
@@ -199,8 +212,23 @@ class DSQL_WPDB extends wpdb {
             $this->last_error = $e->getMessage();
             if (preg_match('/^\s*(INSERT|REPLACE)\b/i', $query)) { $this->insert_id = 0; }
             $this->recordFailure($e, $query, $stage, $start, $this->queryRetries);
+            if($this->schemaUpgrade) {
+                $this->schemaUpgrade->session->fail();
+                file_put_contents($this->schemaUpgrade->session->directory.'/failure.txt',$e->getMessage());
+                chmod($this->schemaUpgrade->session->directory.'/failure.txt',0600);
+                throw new RuntimeException('Controlled DSQL upgrade stopped after a database/schema failure; inspect its private journal');
+            }
             return false;
         }
+    }
+
+    public function enable_schema_upgrade(\WPDSQLUpgrade\Session $session): void {
+        require_once dirname(__DIR__,2).'/upgrade/Engine.php';
+        $this->schemaUpgrade=new \WPDSQLUpgrade\Engine($this->dbh,$session);
+    }
+    public function verify_schema_upgrade(): array {
+        if(!$this->schemaUpgrade)throw new RuntimeException('No controlled upgrade context');
+        return $this->schemaUpgrade->verify();
     }
 
     private function recordFailure(Throwable $error, string $query, string $stage, float $started, int $retries = 0): array {

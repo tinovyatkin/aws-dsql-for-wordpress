@@ -13,8 +13,12 @@
 // DSQL uses the official wpdb extension point and AWS's PDO connector.
 // Keep the original PG4WP driver available for existing PostgreSQL users.
 if (DB_DRIVER === 'dsql') {
+    require_once dirname(PG4WP_ROOT) . '/upgrade/Context.php';
+    $dsqlUpgrade=\WPDSQLUpgrade\Context::load(ABSPATH,DB_HOST);
+    \WPDSQLUpgrade\Context::blockUnlessOwner(ABSPATH);
     require_once PG4WP_ROOT . '/dsql/class-dsql-wpdb.php';
-    $wpdb = new DSQL_WPDB(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+    $wpdb = new DSQL_WPDB($dsqlUpgrade ? $dsqlUpgrade->data['target']['user'] : DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+    if($dsqlUpgrade)$wpdb->enable_schema_upgrade($dsqlUpgrade);
     return;
 }
 

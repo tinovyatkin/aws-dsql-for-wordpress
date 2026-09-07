@@ -36,4 +36,22 @@ final class DSQL_Schema_Catalog {
         if (!hash_equals($r['fingerprint'],$this->fingerprint($table,$metadata['target_schema']??'public'))) { throw new RuntimeException('DSQL schema differs from its restored metadata: '.$table); }
         return $this->cache[$table]=$metadata;
     }
+    /** Upgrade-only publication after the physical schema has been verified. */
+    public function replace(array $table,string $previous): void {
+        $this->pdo->beginTransaction();
+        try {
+            $this->remove($previous);
+            $this->put($table);
+            $this->pdo->commit();
+        } catch (Throwable $error) {if($this->pdo->inTransaction())$this->pdo->rollBack();throw $error;}
+        $this->cache=[];
+    }
+    public function remove(string $table): void {
+        $s=$this->pdo->prepare('DELETE FROM "'.self::TABLE.'" WHERE table_name=?');$s->execute([$table]);unset($this->cache[$table]);
+    }
+    public function clear(): void {$this->cache=[];}
+    public function managed(): bool {
+        try {$this->pdo->query('SELECT table_name FROM "'.self::TABLE.'" LIMIT 1');return true;}
+        catch(PDOException $error){if((string)$error->getCode()==='42P01')return false;throw $error;}
+    }
 }
