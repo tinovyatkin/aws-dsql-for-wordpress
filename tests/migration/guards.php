@@ -24,3 +24,14 @@ $plan=Plan::inspect($backup,$bad);
 if($plan['restore_supported'])throw new RuntimeException('Unsupported schema accepted');
 echo "PASS Unsupported schema blocks the restore plan\n";
 rejects(static fn()=>Backup::source(['dsn'=>'mysql:host=remote.example.invalid;dbname=x','user'=>'x','password'=>'x']),'Remote MySQL requires verified TLS','ssl_ca');
+$source=Backup::source(require $root.'/source-config.php');
+if($source->query('SELECT DATABASE()')->fetchColumn()!=='wordpress_fixture')throw new RuntimeException('Synthetic MySQL fixture required');
+$probe='wp_migration_nul_'.bin2hex(random_bytes(4));
+try {
+    $source->exec('CREATE TABLE '.Backup::qi($probe,'`').' (value varchar(32)) ENGINE=InnoDB');
+    $s=$source->prepare('INSERT INTO '.Backup::qi($probe,'`').' (value) VALUES (?)');$s->execute(["real\0nul"]);$s->closeCursor();
+    $inspection=Backup::inspectSource($source);
+    $nul=array_filter($inspection['issues'],static fn($i)=>$i['table']===$probe&&str_contains($i['reason'],'NUL'));
+    if(count($nul)!==1)throw new RuntimeException('NUL preflight missed a real NUL');
+    echo "PASS Source preflight detects real NUL bytes without Unicode false positives\n";
+} finally {$source->exec('DROP TABLE '.Backup::qi($probe,'`'));}

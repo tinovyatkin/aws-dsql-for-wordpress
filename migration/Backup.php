@@ -92,7 +92,7 @@ final class Backup {
             $lengths=[];$nul=[];
             foreach ($columns as $c) {
                 $field=self::qi($c['Field'],chr(96));$lengths[]="COALESCE(OCTET_LENGTH($field),0)";
-                if (preg_match('/char|text|enum|json/i',$c['Type'])) $nul[]="LOCATE(0x00,$field)>0";
+                if (preg_match('/char|text|enum|json/i',$c['Type'])) $nul[]="LOCATE(0x00,CAST($field AS BINARY))>0";
             }
             $sizes=$p->query('SELECT MAX(GREATEST(0,'.implode(',',$lengths).')) AS max_column, MAX('.implode('+',$lengths).') AS max_row, SUM(CASE WHEN '.($nul?implode(' OR ',$nul):'FALSE').' THEN 1 ELSE 0 END) AS nul_rows FROM '.$q)->fetch();
             if ((int)$sizes['max_column']>1048576) $issues[]=['table'=>$name,'reason'=>'Column exceeds DSQL 1 MiB limit'];
