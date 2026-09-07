@@ -168,4 +168,4 @@ and duplicate rows in a table without a primary key. Eleven restored-WordPress
 checks passed, including unchanged login, imported IDs, new identity allocation,
 literal zero/year-1 text, and zero `dbDelta` differences. Seven rejection-path
 checks covered overwrite, corruption, production/synthetic separation, unsupported
-schema, nonempty targets, remote MySQL TLS, and byte-exact source NUL detection. No production data was restored.
+schema, nonempty targets, remote MySQL TLS, and byte-exact source NUL detection. The restored site also rendered in a browser after restoration. No production data was restored.
