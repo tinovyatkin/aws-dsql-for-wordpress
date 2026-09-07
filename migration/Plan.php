@@ -21,8 +21,9 @@ final class Plan {
         throw new \RuntimeException('Unsupported MySQL type: '.$t);
     }
     public static function temporal(array $c): bool { return (bool)preg_match('/^(datetime|timestamp|date)\b/i',$c['Type']); }
-    public static function convert(?string $value,array $c,bool $reverse=false): ?string {
-        if ($value===null || !self::temporal($c)) { return $value; }
+    public static function convert(?string $value,array $c,bool $reverse=false,bool $codec=false): ?string {
+        if ($value===null) return null;
+        if (!self::temporal($c)) { return $codec ? ($reverse ? \DSQL_Value_Codec::decode($value) : \DSQL_Value_Codec::encode($value)) : $value; }
         if ($reverse) {
             $value=preg_replace('/^0001-01-01/', '0000-00-00', $value);
             if (preg_match('/^(?:datetime|timestamp)\((\d+)\)/i',$c['Type'],$precision)) {
@@ -35,7 +36,9 @@ final class Plan {
     }
     public static function indexes(array $t): array {
         $groups=[];
+        if ($t['archived']??false) return [];
         foreach ($t['indexes'] as $index) {
+            if (in_array($index['Key_name'],$t['omitted_indexes']??[],true)) continue;
             if ($index['Index_type']!=='BTREE' || !empty($index['Expression'])) { throw new \RuntimeException('Unsupported index type/expression'); }
             if (!(int)$index['Non_unique'] && $index['Sub_part']!==null) { throw new \RuntimeException('A unique prefix index needs explicit DSQL emulation'); }
             $groups[$index['Key_name']][(int)$index['Seq_in_index']]=$index;
@@ -43,6 +46,7 @@ final class Plan {
         foreach ($groups as &$group) { ksort($group);$group=array_values($group); }
         return $groups;
     }
+    public static function tableName(array $t): string { return Backup::qi($t['target_schema']??'public').'.'.Backup::qi($t['name']); }
     public static function ddl(array $t,\PDO $pdo): array {
         $fields=[];$groups=self::indexes($t);
         if (preg_match('/\bFOREIGN\s+KEY\b|\bCHECK\s*\(|\bPARTITION\s+BY\b/i',$t['mysql_ddl'])) { throw new \RuntimeException('Explicit constraint/partition translation is required'); }
@@ -51,7 +55,7 @@ final class Plan {
             if ($c['Null']==='NO') { $line.=' NOT NULL'; }
             if (!str_contains($c['Extra']??'','auto_increment') && $c['Default']!==null) {
                 $value=(string)$c['Default'];
-                $line.=' DEFAULT '.(preg_match('/^CURRENT_TIMESTAMP(?:\(\d*\))?$/i',$value)&&self::temporal($c) ? 'CURRENT_TIMESTAMP' : $pdo->quote(self::convert($value,$c)));
+                $line.=' DEFAULT '.(preg_match('/^CURRENT_TIMESTAMP(?:\(\d*\))?$/i',$value)&&self::temporal($c) ? 'CURRENT_TIMESTAMP' : $pdo->quote(self::convert($value,$c,false,$t['value_codec']??false)));
             }
             if (str_starts_with(strtolower($c['Type']), 'enum(')) {
                 $values=str_getcsv(substr($c['Type'],5,-1),',',"'",'\\');
@@ -60,12 +64,12 @@ final class Plan {
             $fields[]=$line;
         }
         if (isset($groups['PRIMARY'])) { $fields[]='PRIMARY KEY ('.implode(',',array_map(static fn($i)=>Backup::qi($i['Column_name']),$groups['PRIMARY'])).')'; }
-        $ddl=['CREATE TABLE '.Backup::qi($t['name']).' ('.implode(',',$fields).')'];
+        $ddl=['CREATE TABLE '.self::tableName($t).' ('.implode(',',$fields).')'];
         foreach ($groups as $name=>$group) {
             if ($name==='PRIMARY') { continue; }
             $indexName=$t['name'].'_'.$name;
             if (strlen($indexName)>63) { $indexName=substr($indexName,0,46).'_'.substr(hash('sha256',$indexName),0,16); }
-            $ddl[]='CREATE '.(!$group[0]['Non_unique']?'UNIQUE ':'').'INDEX ASYNC '.Backup::qi($indexName).' ON '.Backup::qi($t['name']).' ('.implode(',',array_map(static fn($i)=>Backup::qi($i['Column_name']),$group)).')';
+            $ddl[]='CREATE '.(!$group[0]['Non_unique']?'UNIQUE ':'').'INDEX ASYNC '.Backup::qi($indexName).' ON '.self::tableName($t).' ('.implode(',',array_map(static fn($i)=>Backup::qi($i['Column_name']),$group)).')';
         }
         return $ddl;
     }
@@ -86,9 +90,15 @@ final class Plan {
                     $hashes[]=hash('sha256',Backup::row($row));$count++;$bytes=0;
                     foreach ($row as $i=>$value) {
                         if ($value===null) { continue; }
-                        $bytes+=strlen($value);
-                        if (strlen($value)>1048576) { throw new \RuntimeException('A column exceeds DSQL 1 MiB limit'); }
-                        if ($types[$i]!=='bytea' && (!preg_match('//u',$value) || str_contains($value,"\0"))) { throw new \RuntimeException('A text value is not PostgreSQL-compatible UTF-8'); }
+                        $stored=$types[$i]==='bytea'?$value:self::convert($value,$columns[$i],false,$t['value_codec']??false);
+                        $bytes+=strlen($stored);
+                        if (strlen($stored)>1048576) { throw new \RuntimeException('A column exceeds DSQL 1 MiB limit after encoding'); }
+                        if ($types[$i]!=='bytea' && (!preg_match('//u',$value) || str_contains($stored,"\0"))) { throw new \RuntimeException('A text value is not PostgreSQL-compatible UTF-8'); }
+                        if (str_contains($value,"\0") && $types[$i]!=='bytea') {
+                            if ($types[$i]!=='text') throw new \RuntimeException('NUL text codec requires a TEXT column');
+                            foreach($groups as $g) foreach($g as $part) if($part['Column_name']===$columns[$i]['Field']) throw new \RuntimeException('NUL encoding of indexed text is unsupported');
+                        }
+                        if (preg_match('/^varchar\((\d+)\)$/',$types[$i],$size) && mb_strlen($stored,'UTF-8')>(int)$size[1]) throw new \RuntimeException('Encoded value exceeds original varchar capacity');
                         if (self::temporal($columns[$i]) && str_starts_with($value,'0001-01-01')) { throw new \RuntimeException('Reserved zero-date sentinel occurs in a source date'); }
                         if (str_starts_with($types[$i],'bigint') && preg_match('/^\d{19,}$/',$value) && (strlen($value)>19 || strcmp($value,'9223372036854775807')>0)) { throw new \RuntimeException('Integer exceeds signed PostgreSQL bigint range'); }
                     }
@@ -103,6 +113,6 @@ final class Plan {
             } catch (\Throwable $e) { $issues[]=['table'=>$label,'reason'=>$e->getMessage()]; }
             $rows+=$count;
         }
-        return ['format'=>'wordpress-dsql-restore-plan-v1','tables'=>count($manifest['tables']),'rows'=>$rows,'restore_supported'=>!$issues,'issues'=>$issues,'cutover_ready'=>false,'cutover_note'=>'Requires a write freeze, a final verified snapshot, full application checks, and an explicit cutover decision.'];
+        return ['format'=>'wordpress-dsql-restore-plan-v1','tables'=>count($manifest['tables']),'rows'=>$rows,'archive_tables'=>count(array_filter($manifest['tables'],static fn($t)=>$t['archived']??false)),'policy_sha256'=>$manifest['policy_sha256']??null,'restore_supported'=>!$issues,'issues'=>$issues,'cutover_ready'=>false,'cutover_note'=>'Requires a write freeze, a final verified snapshot, full application checks, and an explicit cutover decision.'];
     }
 }

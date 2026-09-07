@@ -147,6 +147,13 @@ Do not activate this as an ordinary plugin or point it at an existing MySQL
 site expecting data to migrate automatically. A DSQL cluster contains the
 built-in `postgres` database; this prototype uses its `public` schema.
 
+## Full-schema rehearsal
+
+A production-shaped rehearsal now covers all 61 schema tables, 8,369 synthetic
+rows, the active plugin versions, Olga, and Redis. It uses an explicit archive
+policy, a reversible NUL text codec, and a non-admin database role. See the
+[full migration demo report](docs/full-migration-demo.md).
+
 ## Backup and restore migration
 
 The fork now includes a logical MySQL backup, DSQL preflight, empty-target restore,
@@ -167,7 +174,8 @@ The CLI never changes the live WordPress connection.
   changes need separate work and testing.
 - MySQL zero dates use a year-1 sentinel in temporal columns only. Literal text
   is preserved. Migration preflight rejects real source dates using that sentinel.
-- NUL bytes in PostgreSQL text values are rejected explicitly.
+- NULs can use the opt-in reversible text codec on unindexed TEXT columns.
+  Other NUL uses and SQL pattern searches inside encoded payloads remain unsupported.
 - DSQL limits on transactions, rows, index keys, and connection lifetime still apply.
   Manual multi-statement transactions need whole-transaction retry at their owner.
 - The tests do not establish compatibility with a production site's full plugin

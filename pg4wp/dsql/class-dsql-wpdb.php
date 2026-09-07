@@ -14,6 +14,8 @@ require_once __DIR__ . '/class-dsql-schema-catalog.php';
 
 class DSQL_WPDB extends wpdb {
     private DSQL_SQL $translator;
+    private bool $valueCodec=false;
+    private string $schema='public';
     private DSQL_Schema_Catalog $schemaCatalog;
     private float $connectedAt = 0;
     private array $indexJobs = [];
@@ -45,7 +47,11 @@ class DSQL_WPDB extends wpdb {
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
                 PDO::ATTR_STRINGIFY_FETCHES => true,
             ]);
-            $this->translator = new DSQL_SQL($this->dbh);
+            $this->schema=defined('DSQL_SCHEMA')?DSQL_SCHEMA:'public';
+            if(!in_array($this->schema,['public','wp_live'],true)) throw new RuntimeException('Unsupported application schema');
+            $this->dbh->exec('SET search_path TO "'.$this->schema.'", pg_catalog');
+            $this->valueCodec=defined('DSQL_VALUE_CODEC') && DSQL_VALUE_CODEC==='frame-v1';
+            $this->translator = new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema);
             $this->schemaCatalog = new DSQL_Schema_Catalog($this->dbh);
             $this->connectedAt = microtime(true);
             $this->is_mysql = false;
@@ -147,13 +153,14 @@ class DSQL_WPDB extends wpdb {
                 }
                 if (!$this->defer_index_wait) { $this->wait_for_indexes(); }
             }
-            $this->last_result = array_map(static function ($row) use ($rowTypes) {
+            $decodeValues=$this->valueCodec && $emulated===null;
+            $this->last_result = array_map(static function ($row) use ($rowTypes,$decodeValues) {
                 foreach ($row as $field=>&$value) {
                     if (is_resource($value)) { $value=stream_get_contents($value); }
                     if (in_array($rowTypes[$field]??'', ['timestamp','timestamptz','date'],true) && is_string($value)) {
                         $value=preg_replace('/^0001-01-01/', '0000-00-00', $value);
                     }
-                    elseif ($value !== null) { $value = (string) $value; }
+                    elseif ($value !== null) { $value = $decodeValues && ($rowTypes[$field]??'')!=='bytea'?DSQL_Value_Codec::decode((string)$value):(string)$value; }
                 }
                 return (object) $row;
             }, $rows);
@@ -216,6 +223,9 @@ class DSQL_WPDB extends wpdb {
             && preg_match('/\bENGINE\s*=\s*[\'"]MyISAM[\'"]/i', $query)) {
             return [];
         }
+        if (preg_match('/^\s*SELECT\s+COUNT\(\*\)\s+FROM\s+information_schema\.statistics\b/i',$query)
+            && preg_match('/index_type\s*=\s*[\'"]FULLTEXT[\'"]/i',$query)) { return [['count'=>'0']]; }
+        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?autocommit/i',$query)) { return [['autocommit'=>$this->dbh->inTransaction()?'0':'1']]; }
         if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode/i', $query)) { return [['sql_mode' => '']]; }
         if (preg_match('/^\s*SHOW\s+INDEX(?:ES)?\s+FROM\s+[\x60"]?(\w+)/i', $query, $m)) {
             $saved = $this->schemaCatalog->get($m[1]);
@@ -229,13 +239,13 @@ class DSQL_WPDB extends wpdb {
                 JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class idx ON idx.oid=i.indexrelid
                 CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
                 JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum
-                WHERE t.relname=? AND n.nspname='public' AND i.indisvalid
+                WHERE t.relname=? AND n.nspname=? AND i.indisvalid
                 ORDER BY idx.relname, k.ordinality");
-            $stmt->execute([$m[1]]);
+            $stmt->execute([$m[1],$this->schema]);
             return $stmt->fetchAll(PDO::FETCH_ASSOC);
         }
         if (preg_match('/^\s*SHOW\s+(?:FULL\s+)?TABLES(?:\s+LIKE\s+(.+))?/i', $query, $m)) {
-            $sql = "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'";
+            $sql = "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = '".$this->schema."'";
             if (isset($m[1])) { $sql .= ' AND tablename LIKE ' . $this->translator->quote_mysql_literal(rtrim(trim($m[1]), ';')); }
             return $this->dbh->query($sql)->fetchAll(PDO::FETCH_ASSOC);
         }
@@ -243,8 +253,8 @@ class DSQL_WPDB extends wpdb {
             $saved = $this->schemaCatalog->get($m[1]);
             if ($saved) { return $saved['columns']; }
             $stmt = $this->dbh->prepare("SELECT column_name, data_type, is_nullable, column_default, character_maximum_length, is_identity
-                FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ? ORDER BY ordinal_position");
-            $stmt->execute([$m[1]]);
+                FROM information_schema.columns WHERE table_name = ? AND table_schema = ? ORDER BY ordinal_position");
+            $stmt->execute([$m[1],$this->schema]);
             return array_map(static function ($r) {
                 $type = match ($r['data_type']) {
                     'character varying' => 'varchar(' . $r['character_maximum_length'] . ')',

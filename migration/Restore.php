@@ -18,12 +18,16 @@ final class Restore {
         if (!$expectedHost) { throw new \RuntimeException('An explicit expected destination is required'); }
         // Resolve all DDL before creating anything. Unsupported constraints fail here.
         $ddls=[];foreach ($manifest['tables'] as $t) { $ddls[$t['name']]=Plan::ddl($t,$p); }
-        $existing=$p->query("SELECT tablename FROM pg_tables WHERE schemaname='public'")->fetchAll(\PDO::FETCH_COLUMN);
+        $existing=$p->query("SELECT tablename FROM pg_tables WHERE schemaname IN ('public','wp_live','wp_archive')")->fetchAll(\PDO::FETCH_COLUMN);
         if ($existing) { throw new \RuntimeException('Destination is not empty; restore never overwrites or merges existing tables'); }
+        $appSchema=$manifest['policy']['active_schema']??'public';
+        if($appSchema!=='public') $p->exec('CREATE SCHEMA '.Backup::qi($appSchema));
+        $p->exec('SET search_path TO '.Backup::qi($appSchema).', pg_catalog');
         $id=hash_file('sha256',$directory.'/manifest.json');
-        $p->exec('CREATE TABLE "'.self::STATE.'" (id text PRIMARY KEY, phase text NOT NULL, manifest_sha256 text NOT NULL, created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP)');
-        $s=$p->prepare('INSERT INTO "'.self::STATE.'" (id,phase,manifest_sha256) VALUES (?,?,?)');$s->execute(['restore','schema',$id]);
+        $p->exec('CREATE TABLE "'.self::STATE.'" (id text PRIMARY KEY, phase text NOT NULL, manifest_sha256 text NOT NULL, policy_sha256 text NOT NULL, created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+        $s=$p->prepare('INSERT INTO "'.self::STATE.'" (id,phase,manifest_sha256,policy_sha256) VALUES (?,?,?,?)');$s->execute(['restore','schema',$id,$manifest['policy_sha256']??'']);
         $catalog=new \DSQL_Schema_Catalog($p);$catalog->create();$jobs=[];
+        if(array_filter($manifest['tables'],static fn($t)=>$t['archived']??false)) $p->exec('CREATE SCHEMA wp_archive');
         try {
             foreach ($ddls as $name=>$statements) {
                 foreach ($statements as $sql) {
@@ -37,10 +41,14 @@ final class Restore {
                 self::loadTable($p,$directory,$table);
                 foreach ($table['columns'] as $c) {
                     if (!str_contains($c['Extra']??'','auto_increment')) continue;
-                    $max=$p->query('SELECT MAX('.Backup::qi($c['Field']).') FROM '.Backup::qi($table['name']))->fetchColumn();
+                    $max=$p->query('SELECT MAX('.Backup::qi($c['Field']).') FROM '.Plan::tableName($table))->fetchColumn();
+                    if(preg_match('/\bAUTO_INCREMENT=(\d+)/',$table['mysql_ddl'],$counter)) {
+                        if(strlen($counter[1])>18) throw new \RuntimeException('AUTO_INCREMENT needs signed-range review');
+                        $next=(int)$counter[1]; if($next>1) $max=(string)max((int)($max??0),$next-1);
+                    }
                     // Restore original IDs first, then allocate beyond the greatest imported ID.
                     $s=$p->prepare('SELECT setval(pg_get_serial_sequence(?,?),?,?)');
-                    $s->execute([$table['name'],$c['Field'],$max===null?'1':$max,$max===null?'false':'true']);
+                    $s->execute([Plan::tableName($table),$c['Field'],$max===null?'1':$max,$max===null?'false':'true']);
                 }
                 $catalog->put($table);
             }
@@ -67,32 +75,35 @@ final class Restore {
             foreach ($row as $i=>$value) {
                 $c=$table['columns'][$i];$binary=Plan::type($c)==='bytea';
                 $placeholders[]=$binary?"decode(?, 'base64')":'?';
-                $params[]=$binary && $value!==null?base64_encode($value):Plan::convert($value,$c);
+                $params[]=$binary && $value!==null?base64_encode($value):Plan::convert($value,$c,false,$table['value_codec']??false);
             }
             $groups[]='('.implode(',',$placeholders).')';
         }
-        $sql='INSERT INTO '.Backup::qi($table['name']).' ('.implode(',',array_map(static fn($c)=>Backup::qi($c['Field']),$table['columns'])).') VALUES '.implode(',',$groups);
+        $sql='INSERT INTO '.Plan::tableName($table).' ('.implode(',',array_map(static fn($c)=>Backup::qi($c['Field']),$table['columns'])).') VALUES '.implode(',',$groups);
         $p->transaction(static function(\PDO $tx)use($sql,$params){$s=$tx->prepare($sql);$s->execute($params);});
     }
     public static function verify(\PDO $p,string $directory,array $manifest): array {
+        $p->exec('SET search_path TO '.Backup::qi($manifest['policy']['active_schema']??'public').', pg_catalog');
+        $state=$p->query('SELECT manifest_sha256,policy_sha256 FROM "'.self::STATE.'" WHERE id=\'restore\'')->fetch(\PDO::FETCH_ASSOC);
+        if(!$state || !hash_equals($state['manifest_sha256'],hash_file('sha256',$directory.'/manifest.json')) || !hash_equals($state['policy_sha256'],$manifest['policy_sha256']??'')) throw new \RuntimeException('Restore manifest/policy binding mismatch');
         $checks=[];
         foreach ($manifest['tables'] as $table) {
             $columns=[];
             foreach ($table['columns'] as $c) {
                 $q=Backup::qi($c['Field']);$columns[]=Plan::type($c)==='bytea'?"encode($q,'base64') AS $q":$q;
             }
-            $s=$p->query('SELECT '.implode(',',$columns).' FROM '.Backup::qi($table['name']));$hashes=[];$count=0;
+            $s=$p->query('SELECT '.implode(',',$columns).' FROM '.Plan::tableName($table));$hashes=[];$count=0;
             while ($row=$s->fetch(\PDO::FETCH_NUM)) {
                 foreach ($row as $i=>&$v) {
                     if ($v===null) continue;
                     if (Plan::type($table['columns'][$i])==='bytea') { $v=base64_decode($v,true); }
-                    else { $v=Plan::convert((string)$v,$table['columns'][$i],true); }
+                    else { $v=Plan::convert((string)$v,$table['columns'][$i],true,$table['value_codec']??false); }
                 }
                 unset($v);$hashes[]=hash('sha256',Backup::row($row));$count++;
             }
             $digest=Backup::digest($hashes);
-            $checks[]=['table'=>$table['name'],'source_rows'=>$table['rows'],'target_rows'=>$count,'rows_sha256'=>$digest,'matches'=>$count===$table['rows']&&hash_equals($table['rows_sha256'],$digest)];
+            $checks[]=['table'=>$table['name'],'target_schema'=>$table['target_schema']??'public','source_rows'=>$table['rows'],'target_rows'=>$count,'rows_sha256'=>$digest,'matches'=>$count===$table['rows']&&hash_equals($table['rows_sha256'],$digest)];
         }
-        return ['format'=>'wordpress-dsql-restore-verification-v1','manifest_sha256'=>hash_file('sha256',$directory.'/manifest.json'),'verified'=>!array_filter($checks,static fn($c)=>!$c['matches']),'tables'=>$checks,'verified_at'=>gmdate('c'),'cutover_performed'=>false];
+        return ['format'=>'wordpress-dsql-restore-verification-v1','manifest_sha256'=>hash_file('sha256',$directory.'/manifest.json'),'policy_sha256'=>$manifest['policy_sha256']??null,'verified'=>!array_filter($checks,static fn($c)=>!$c['matches']),'tables'=>$checks,'verified_at'=>gmdate('c'),'cutover_performed'=>false];
     }
 }

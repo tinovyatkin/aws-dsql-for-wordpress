@@ -77,7 +77,9 @@ final class Backup {
         return $manifest;
     }
     /** Schema and aggregate limits only; never exports source row values. */
-    public static function inspectSource(\PDO $p): array {
+    public static function inspectSource(\PDO $p,array $policy=[]): array {
+        if(!class_exists(Policy::class))require_once __DIR__.'/Policy.php';
+        $policy=$policy?:Policy::load(null);$adaptations=[];
         $db=$p->query('SELECT DATABASE()')->fetchColumn();
         $s=$p->prepare('SELECT TABLE_NAME,ENGINE,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? ORDER BY TABLE_NAME');$s->execute([$db]);$tables=$s->fetchAll();$issues=[];
         foreach ($tables as $t) {
@@ -88,23 +90,34 @@ final class Backup {
             $ddl=array_values($p->query("SHOW CREATE TABLE $q")->fetch())[1];
             if (preg_match('/\bFOREIGN\s+KEY\b|\bCHECK\s*\(|\bPARTITION\s+BY\b/i',$ddl)) $issues[]=['table'=>$name,'reason'=>'Explicit constraint/partition translation is required'];
             $indexes=$p->query("SHOW INDEX FROM $q")->fetchAll();
-            try {Plan::indexes(['indexes'=>$indexes]);}catch(\Throwable $e){$issues[]=['table'=>$name,'reason'=>$e->getMessage()];}
-            $lengths=[];$nul=[];
+            $effective=[];
+            try {$mapped=Policy::table(['name'=>$name,'indexes'=>$indexes],$policy);$effective=Plan::indexes($mapped);
+                if($mapped['archived'])$adaptations[]=['table'=>$name,'action'=>'read-only archive'];
+                foreach($mapped['omitted_indexes'] as $index)$adaptations[]=['table'=>$name,'action'=>'omit optional FULLTEXT index','index'=>$index];
+            }catch(\Throwable $e){$issues[]=['table'=>$name,'reason'=>$e->getMessage()];}
+            $indexed=[];foreach($effective as $g)foreach($g as $part)$indexed[]=$part['Column_name'];
+            $lengths=[];$nul=[];$unsafeNul=[];
             foreach ($columns as $c) {
                 $field=self::qi($c['Field'],chr(96));$lengths[]="COALESCE(OCTET_LENGTH($field),0)";
-                if (preg_match('/char|text|enum|json/i',$c['Type'])) $nul[]="LOCATE(0x00,CAST($field AS BINARY))>0";
+                if (preg_match('/char|text|enum|json/i',$c['Type'])) {
+                    $condition="LOCATE(0x00,CAST($field AS BINARY))>0";$nul[]=$condition;
+                    if(!preg_match('/^(tinytext|mediumtext|longtext|text)$/i',$c['Type'])||in_array($c['Field'],$indexed,true))$unsafeNul[]=$condition;
+                }
             }
-            $sizes=$p->query('SELECT MAX(GREATEST(0,'.implode(',',$lengths).')) AS max_column, MAX('.implode('+',$lengths).') AS max_row, SUM(CASE WHEN '.($nul?implode(' OR ',$nul):'FALSE').' THEN 1 ELSE 0 END) AS nul_rows FROM '.$q)->fetch();
+            $sizes=$p->query('SELECT MAX(GREATEST(0,'.implode(',',$lengths).')) AS max_column, MAX('.implode('+',$lengths).') AS max_row, SUM(CASE WHEN '.($nul?implode(' OR ',$nul):'FALSE').' THEN 1 ELSE 0 END) AS nul_rows, SUM(CASE WHEN '.($unsafeNul?implode(' OR ',$unsafeNul):'FALSE').' THEN 1 ELSE 0 END) AS unsafe_nul_rows FROM '.$q)->fetch();
             if ((int)$sizes['max_column']>1048576) $issues[]=['table'=>$name,'reason'=>'Column exceeds DSQL 1 MiB limit'];
             if ((int)$sizes['max_row']>2097152) $issues[]=['table'=>$name,'reason'=>'Row exceeds DSQL 2 MiB limit'];
-            if ((int)$sizes['nul_rows']) $issues[]=['table'=>$name,'reason'=>'Text contains NUL bytes','rows'=>(int)$sizes['nul_rows']];
+            if ((int)$sizes['nul_rows']) {
+                if(!$policy['value_codec']||(int)$sizes['unsafe_nul_rows'])$issues[]=['table'=>$name,'reason'=>'NUL value requires an enabled codec on unindexed TEXT','rows'=>(int)$sizes['nul_rows']];
+                else $adaptations[]=['table'=>$name,'action'=>'reversible NUL text envelope','rows'=>(int)$sizes['nul_rows']];
+            }
         }
         foreach (['TRIGGERS'=>'TRIGGER_SCHEMA','ROUTINES'=>'ROUTINE_SCHEMA','EVENTS'=>'EVENT_SCHEMA'] as $collection=>$field) {
             $s=$p->prepare("SELECT COUNT(*) FROM information_schema.$collection WHERE $field=?");$s->execute([$db]);
             if ((int)$s->fetchColumn()) $issues[]=['reason'=>'Source has '.$collection];
             $s->closeCursor();
         }
-        return ['source_engine'=>$p->getAttribute(\PDO::ATTR_SERVER_VERSION),'tables'=>count($tables),'preflight_passed'=>!$issues,'issues'=>$issues,'data_scanned'=>'aggregate sizes and NUL counts only','cutover_ready'=>false];
+        return ['source_engine'=>$p->getAttribute(\PDO::ATTR_SERVER_VERSION),'tables'=>count($tables),'preflight_passed'=>!$issues,'issues'=>$issues,'adaptations'=>$adaptations,'policy_sha256'=>hash('sha256',self::json($policy)),'data_scanned'=>'aggregate sizes and NUL counts only','cutover_ready'=>false];
     }
     public static function load(string $directory): array {
         if (!is_file($directory.'/manifest.json') || !is_file($directory.'/manifest.sha256')) { throw new \RuntimeException('Complete backup manifest and checksum required'); }

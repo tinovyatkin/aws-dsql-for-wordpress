@@ -3,6 +3,7 @@
 ini_set('zend.exception_ignore_args','1');
 require dirname(__DIR__).'/migration/Backup.php';
 require dirname(__DIR__).'/migration/Plan.php';
+require dirname(__DIR__).'/migration/Policy.php';
 use WPDSQLMigration\Backup;
 use WPDSQLMigration\Plan;
 use WPDSQLMigration\Restore;
@@ -22,14 +23,14 @@ try {
         } else throw new RuntimeException('Provide --mysql-config or --wordpress-path');
         if (isset($options['mysql-ca'])) $config['ssl_ca']=$options['mysql-ca'];
         if ($command==='inspect-source') {
-            $report=Backup::inspectSource(Backup::source($config));
+            $report=Backup::inspectSource(Backup::source($config),\WPDSQLMigration\Policy::load($options['policy']??null));
             if (isset($options['report'])) {file_put_contents($options['report'],Backup::json($report)."\n");chmod($options['report'],0600);}
             echo Backup::json($report),"\n";exit($report['preflight_passed']?0:1);
         }
         $manifest=Backup::export(Backup::source($config),required('backup'),required('classification'));
         echo Backup::json(['backup_complete'=>true,'tables'=>count($manifest['tables']),'rows'=>array_sum(array_column($manifest['tables'],'rows'))]),"\n";
     } elseif (in_array($command,['plan','restore','verify'],true)) {
-        $directory=required('backup');$manifest=Backup::load($directory);
+        $directory=required('backup');$manifest=\WPDSQLMigration\Policy::apply(Backup::load($directory),\WPDSQLMigration\Policy::load($options['policy']??null));
         if ($command==='plan') { $report=Plan::inspect($directory,$manifest); }
         else {
             require dirname(__DIR__).'/vendor/autoload.php';require dirname(__DIR__).'/migration/Restore.php';

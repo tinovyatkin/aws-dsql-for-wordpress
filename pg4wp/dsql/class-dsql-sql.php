@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 require_once dirname(__DIR__) . '/driver_pgsql_rewrite.php';
+require_once __DIR__.'/class-dsql-value-codec.php';
 
 class DSQL_SelectSQLRewriter extends SelectSQLRewriter {
     // The upstream routines can change projection/aggregation semantics.
@@ -25,8 +26,10 @@ final class DSQL_SQL {
     private PDO $pdo;
     private string $foundRowsQuery = '';
     private array $dateColumns = [];
+    private array $nulMarkers = [];
+    private array $binaryColumns = [];
 
-    public function __construct(PDO $pdo) { $this->pdo = $pdo; }
+    public function __construct(PDO $pdo,private bool $valueCodec=false,private string $schema='public') { $this->pdo = $pdo; }
 
     public function quote_mysql_literal(string $literal): string {
         [$masked, $values] = $this->protectLiterals($literal);
@@ -45,7 +48,21 @@ final class DSQL_SQL {
             return ['SELECT COUNT(*) FROM (' . $this->foundRowsQuery . ') AS dsql_found_rows'];
         }
         [$sql, $literals] = $this->protectLiterals(trim($mysql));
+        $this->validateBinaryWrites($sql);
         $this->zeroDates($sql, $literals);
+        // WordPress login/email lookup assumes MySQL's case-insensitive comparison.
+        if(preg_match('/\bFROM\s+[\x60"]?\w+_users[\x60"]?\b/i',$sql)) {
+            $sql=preg_replace('/(?<![\w"])([\x60"]?(?:user_login|user_email)[\x60"]?)\s*=\s*(\'__dsql_[a-f0-9]+_[0-9]+\')/i','LOWER($1) = LOWER($2)',$sql);
+        }
+        // Used by the active AI plugin's log summaries and retention queries.
+        $sql=preg_replace_callback('/\bDATE_(SUB|ADD)\(\s*((?:UTC_TIMESTAMP|NOW|CURRENT_TIMESTAMP)\(\s*\))\s*,\s*INTERVAL\s+(-?\d+)\s+(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR)\s*\)/i',
+            static fn($m)=>'('.$m[2].(strtoupper($m[1])==='SUB'?' - ':' + ')."INTERVAL '".$m[3].' '.strtolower($m[4])."')",$sql);
+        $sql=preg_replace('/\bUTC_TIMESTAMP\(\s*\)/i', "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')", $sql);
+        // AI request-log filter options union text values with a numeric user_id.
+        // MySQL promotes the mixed column to text; PostgreSQL needs the cast.
+        if (stripos($sql,'UNION ALL')!==false && preg_match('/\b\w*wpai_request_logs\b/i',$sql)) {
+            $sql=preg_replace('/\buser_id\s+AS\s+value\b/i','CAST(user_id AS TEXT) AS value',$sql);
+        }
         $calc = stripos($sql, 'SQL_CALC_FOUND_ROWS') !== false;
         $sql = str_ireplace('SQL_CALC_FOUND_ROWS', '', $sql);
 
@@ -100,9 +117,9 @@ final class DSQL_SQL {
                 JOIN pg_namespace n ON n.oid=t.relnamespace
                 CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
                 JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum
-                WHERE t.relname=? AND n.nspname='public' AND i.indisunique AND i.indisvalid
+                WHERE t.relname=? AND n.nspname=? AND i.indisunique AND i.indisvalid AND k.ordinality<=i.indnkeyatts
                 GROUP BY i.indexrelid, i.indisprimary ORDER BY i.indisprimary DESC");
-            $stmt->execute([$table]);
+            $stmt->execute([$table,$this->schema]);
             $target = null;
             foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $key) {
                 $names = str_getcsv(trim($key['columns'], '{}'), ',', '"', '\\');
@@ -117,6 +134,32 @@ final class DSQL_SQL {
             return preg_replace('/^INSERT\s+IGNORE\b/i', 'INSERT', $sql) . ' ON CONFLICT DO NOTHING RETURNING *';
         }
         return $sql . ' RETURNING *';
+    }
+
+    /** Keep runtime writes within the same binary-text contract as migration preflight. */
+    private function validateBinaryWrites(string $sql): void {
+        if(!$this->nulMarkers || !preg_match('/^(INSERT|REPLACE|UPDATE)\b/i',$sql))return;
+        $assignments=[];
+        if(preg_match('/^(?:INSERT|REPLACE)\s+(?:IGNORE\s+)?INTO\s+[\x60"]?(\w+)[\x60"]?\s*\(([^)]+)\)\s*VALUES\s*(.*)/is',$sql,$m)) {
+            $table=$m[1];$columns=array_map(static fn($c)=>trim($c," \t\n\x60\""),explode(',',$m[2]));
+            preg_match_all('/\(([^()]*)\)/',$m[3],$groups);
+            foreach($groups[1] as $group){$values=array_map('trim',explode(',',$group));if(count($values)!==count($columns))continue;
+                foreach($values as $i=>$value)if(isset($this->nulMarkers[$value]))$assignments[$value]=$columns[$i];}
+        } elseif(preg_match('/^UPDATE\s+[\x60"]?(\w+)[\x60"]?/i',$sql,$m)) {
+            $table=$m[1];preg_match_all('/[\x60"]?(\w+)[\x60"]?\s*=\s*(\'__dsql_[a-f0-9]+_[0-9]+\')/i',$sql,$matches,PREG_SET_ORDER);
+            foreach($matches as $a)if(isset($this->nulMarkers[$a[2]]))$assignments[$a[2]]=$a[1];
+        }
+        if(count($assignments)!==count($this->nulMarkers))throw new RuntimeException('Binary text requires direct literal assignment');
+        foreach($assignments as $column){
+            $key=$table.'.'.$column;
+            if(!array_key_exists($key,$this->binaryColumns)){
+                $s=$this->pdo->prepare("SELECT data_type FROM information_schema.columns WHERE table_schema=? AND table_name=? AND column_name=?");
+                $s->execute([$this->schema,$table,$column]);$text=$s->fetchColumn()==='text';
+                $s=$this->pdo->prepare("SELECT COUNT(*) FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE k.ordinality<=i.indnkeyatts AND n.nspname=? AND t.relname=? AND a.attname=?");
+                $s->execute([$this->schema,$table,$column]);$this->binaryColumns[$key]=$text && (int)$s->fetchColumn()===0;
+            }
+            if(!$this->binaryColumns[$key])throw new RuntimeException('NUL encoding is supported only for unindexed TEXT columns');
+        }
     }
 
     /** Translate zero dates only in temporal columns, never in article/option text. */
@@ -136,8 +179,8 @@ final class DSQL_SQL {
         $dates=[];
         foreach (array_unique($tables[1]) as $table) {
             if (!isset($this->dateColumns[$table])) {
-                $s=$this->pdo->prepare("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=? AND data_type IN ('timestamp without time zone','timestamp with time zone','date')");
-                $s->execute([$table]);$this->dateColumns[$table]=$s->fetchAll(PDO::FETCH_COLUMN);
+                $s=$this->pdo->prepare("SELECT column_name FROM information_schema.columns WHERE table_schema=? AND table_name=? AND data_type IN ('timestamp without time zone','timestamp with time zone','date')");
+                $s->execute([$this->schema,$table]);$this->dateColumns[$table]=$s->fetchAll(PDO::FETCH_COLUMN);
             }
             $dates=array_merge($dates,$this->dateColumns[$table]);
         }
@@ -162,6 +205,7 @@ final class DSQL_SQL {
      * @return array{string,array<string,string>}
      */
     private function protectLiterals(string $sql): array {
+        $this->nulMarkers=[];
         $out = '';
         $values = [];
         $nonce = '__dsql_' . bin2hex(random_bytes(8)) . '_';
@@ -196,8 +240,11 @@ final class DSQL_SQL {
                 }
             }
             if (!$closed) { throw new RuntimeException('Unterminated SQL string'); }
-            if (str_contains($value, "\0")) { throw new RuntimeException('NUL bytes in text are unsupported by PostgreSQL'); }
+            $hasNul=str_contains($value,"\0");
+            if ($this->valueCodec) { $value=DSQL_Value_Codec::encode($value); }
+            elseif (str_contains($value, "\0")) { throw new RuntimeException('NUL bytes in text are unsupported by PostgreSQL'); }
             $marker = "'" . $nonce . count($values) . "'";
+            if($hasNul)$this->nulMarkers[$marker]=true;
             $values[$marker] = $this->pdo->quote($value);
             $out .= $marker;
         }

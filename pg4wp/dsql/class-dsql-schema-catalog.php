@@ -8,17 +8,19 @@ final class DSQL_Schema_Catalog {
     public function create(): void {
         $this->pdo->exec('CREATE TABLE "'.self::TABLE.'" (table_name text PRIMARY KEY, metadata text NOT NULL, fingerprint text NOT NULL)');
     }
-    public function fingerprint(string $table): string {
-        $s=$this->pdo->prepare("SELECT column_name,data_type,is_nullable,column_default,character_maximum_length,numeric_precision,numeric_scale,datetime_precision,is_identity FROM information_schema.columns WHERE table_schema='public' AND table_name=? ORDER BY ordinal_position");$s->execute([$table]);$columns=$s->fetchAll(PDO::FETCH_ASSOC);
-        $s=$this->pdo->prepare("SELECT indexname,indexdef FROM pg_indexes WHERE schemaname='public' AND tablename=? ORDER BY indexname");$s->execute([$table]);$indexes=$s->fetchAll(PDO::FETCH_ASSOC);
+    public function fingerprint(string $table,string $schema='public'): string {
+        $s=$this->pdo->prepare("SELECT column_name,data_type,is_nullable,column_default,character_maximum_length,numeric_precision,numeric_scale,datetime_precision,is_identity FROM information_schema.columns WHERE table_schema=? AND table_name=? ORDER BY ordinal_position");$s->execute([$schema,$table]);$columns=$s->fetchAll(PDO::FETCH_ASSOC);
+        $s=$this->pdo->prepare("SELECT indexname,indexdef FROM pg_indexes WHERE schemaname=? AND tablename=? ORDER BY indexname");$s->execute([$schema,$table]);$indexes=$s->fetchAll(PDO::FETCH_ASSOC);
         $normalize=static function($rows) { return array_map(static fn($r)=>array_map(static fn($v)=>$v===null?null:(string)$v,$r),$rows); };
         $columns=$normalize($columns);$indexes=$normalize($indexes);
         return hash('sha256',json_encode([$columns,$indexes],JSON_THROW_ON_ERROR));
     }
     public function put(array $table): void {
-        $metadata=['mysql_ddl'=>$table['mysql_ddl'],'columns'=>$table['columns'],'indexes'=>$table['indexes']];
+        $metadata=['mysql_ddl'=>$table['mysql_ddl'],'columns'=>$table['columns'],'source_indexes'=>$table['indexes'],
+            'indexes'=>array_values(array_filter($table['indexes'],static fn($i)=>!in_array($i['Key_name'],$table['omitted_indexes']??[],true))),
+            'target_schema'=>$table['target_schema']??'public','archived'=>$table['archived']??false,'omitted_indexes'=>$table['omitted_indexes']??[],'value_codec'=>$table['value_codec']??false];
         $s=$this->pdo->prepare('INSERT INTO "'.self::TABLE.'" (table_name,metadata,fingerprint) VALUES (?,?,?)');
-        $s->execute([$table['name'],json_encode($metadata,JSON_THROW_ON_ERROR),$this->fingerprint($table['name'])]);
+        $s->execute([$table['name'],json_encode($metadata,JSON_THROW_ON_ERROR),$this->fingerprint($table['name'],$table['target_schema']??'public')]);
         unset($this->cache[$table['name']]);
     }
     public function get(string $table): ?array {
@@ -30,7 +32,8 @@ final class DSQL_Schema_Catalog {
             throw $e;
         }
         if (!$r) { return $this->cache[$table]=null; }
-        if (!hash_equals($r['fingerprint'],$this->fingerprint($table))) { throw new RuntimeException('DSQL schema differs from its restored metadata: '.$table); }
-        return $this->cache[$table]=json_decode($r['metadata'],true,512,JSON_THROW_ON_ERROR);
+        $metadata=json_decode($r['metadata'],true,512,JSON_THROW_ON_ERROR);
+        if (!hash_equals($r['fingerprint'],$this->fingerprint($table,$metadata['target_schema']??'public'))) { throw new RuntimeException('DSQL schema differs from its restored metadata: '.$table); }
+        return $this->cache[$table]=$metadata;
     }
 }
