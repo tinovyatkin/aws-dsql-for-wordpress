@@ -124,3 +124,8 @@ migration-aware schema upgrade; it is not enabled by this rehearsal.
 The live cutover and rollback boundaries remain those in
 [the backup/restore runbook](backup-restore-migration.md). A successful synthetic
 rehearsal is not permission to change the production connection.
+
+The adapter also has [structured SQL failure monitoring](sql-error-monitoring.md).
+The synthetic diagnostic checks cover actual DSQL failures and translator
+rejections, including plugin-suppressed errors, without exporting query values.
+HTTP regression checks recognize the structured events as failures too.

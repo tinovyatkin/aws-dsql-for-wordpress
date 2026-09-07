@@ -17,7 +17,7 @@ id=json.loads((root/'.local/full-demo/application-report.json').read_text())['po
 public=urllib.request.urlopen(base+'/?p='+str(id),timeout=90).read().decode();assert 'Full DSQL demo' in public and 'critical error' not in public.lower();print('PASS public migrated article',flush=True)
 if log.exists():
  with log.open('rb') as f:f.seek(offset);recent=f.read().decode()
- errors=[line for line in recent.splitlines() if 'WordPress database error' in line or 'PHP Fatal' in line]
+ errors=[line for line in recent.splitlines() if 'WordPress database error' in line or 'wordpress_dsql_error' in line or 'PHP Fatal' in line]
  assert not errors, '\n'.join(errors[:5])
 print('PASS no new database or fatal errors during HTTP checks',flush=True)
 (root/'.local/full-demo/http-report.json').write_text(json.dumps(report,indent=2))

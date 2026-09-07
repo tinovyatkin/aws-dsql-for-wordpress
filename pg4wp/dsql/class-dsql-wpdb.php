@@ -11,6 +11,7 @@ $autoload = defined('DSQL_AUTOLOAD') ? DSQL_AUTOLOAD : dirname(__DIR__, 2) . '/v
 require_once $autoload;
 require_once __DIR__ . '/class-dsql-sql.php';
 require_once __DIR__ . '/class-dsql-schema-catalog.php';
+require_once __DIR__ . '/class-dsql-diagnostics.php';
 
 class DSQL_WPDB extends wpdb {
     private DSQL_SQL $translator;
@@ -21,8 +22,11 @@ class DSQL_WPDB extends wpdb {
     private array $indexJobs = [];
     public bool $defer_index_wait = false;
     public array $dsql_errors = [];
+    public int $dsql_error_count = 0;
+    private int $queryRetries = 0;
 
     public function db_connect($allow_bail = true) {
+        $start = microtime(true);
         try {
             $profile = defined('DSQL_PROFILE') ? DSQL_PROFILE : null;
             $provider = null;
@@ -62,7 +66,9 @@ class DSQL_WPDB extends wpdb {
         } catch (Throwable $e) {
             $this->ready = false;
             $this->last_error = $e->getMessage();
-            if ($allow_bail) { throw $e; }
+            $event = $this->recordFailure($e, '', 'connect', $start);
+            // An uncaught PDO/SDK exception can contain credentials or SQL DETAIL.
+            if ($allow_bail) { throw new RuntimeException('DSQL connection failed; reference ' . $event['fingerprint']); }
             return false;
         }
     }
@@ -117,6 +123,8 @@ class DSQL_WPDB extends wpdb {
         $this->flush();
         $this->last_query = $query;
         $start = microtime(true);
+        $stage = 'metadata';
+        $this->queryRetries = 0;
         try {
             if (preg_match('/^\s*(?:ALTER\s+TABLE|DROP\s+TABLE)(?:\s+IF\s+EXISTS)?\s+[\x60"]?(\w+)/i', $query, $ddl)
                 && $this->schemaCatalog->get($ddl[1])) {
@@ -136,7 +144,10 @@ class DSQL_WPDB extends wpdb {
                 if (preg_match('/^\s*SET\s+(?:NAMES|(?:SESSION\s+)?sql_mode)\b/i', $query)) {
                     return true;
                 }
-                foreach ($this->translator->translate($query) as $sql) {
+                $stage = 'translate';
+                $statements = $this->translator->translate($query);
+                $stage = 'execute';
+                foreach ($statements as $sql) {
                     $stmt = $this->execute($sql);
                     $this->result = $stmt;
                     if (preg_match('/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\b/i', $sql)) {
@@ -154,6 +165,7 @@ class DSQL_WPDB extends wpdb {
                 if (!$this->defer_index_wait) { $this->wait_for_indexes(); }
             }
             $decodeValues=$this->valueCodec && $emulated===null;
+            $stage = 'decode';
             $this->last_result = array_map(static function ($row) use ($rowTypes,$decodeValues) {
                 foreach ($row as $field=>&$value) {
                     if (is_resource($value)) { $value=stream_get_contents($value); }
@@ -186,10 +198,25 @@ class DSQL_WPDB extends wpdb {
         } catch (Throwable $e) {
             $this->last_error = $e->getMessage();
             if (preg_match('/^\s*(INSERT|REPLACE)\b/i', $query)) { $this->insert_id = 0; }
-            $this->dsql_errors[] = ['sqlstate' => (string) $e->getCode(), 'message' => $this->last_error, 'query' => $query];
-            $this->print_error($this->last_error);
+            $this->recordFailure($e, $query, $stage, $start, $this->queryRetries);
             return false;
         }
+    }
+
+    private function recordFailure(Throwable $error, string $query, string $stage, float $started, int $retries = 0): array {
+        $event = DSQL_Diagnostics::event($error, $query, $stage, $started, $retries);
+        $this->dsql_error_count++;
+        // Retain bounded diagnostics for long-running WP-CLI/cron processes.
+        if (count($this->dsql_errors) >= 100) { array_shift($this->dsql_errors); }
+        $this->dsql_errors[] = $event;
+        DSQL_Diagnostics::emit($event);
+        return $event;
+    }
+
+    /** Never use wpdb's raw SQL/message HTML and error-log renderer. */
+    public function print_error($str = '') {
+        $this->recordFailure(new RuntimeException('Reported database failure'), (string) $this->last_query, 'reported', microtime(true));
+        return false;
     }
 
     public function wait_for_indexes(): void {
@@ -210,6 +237,7 @@ class DSQL_WPDB extends wpdb {
                 // Retry only known aborted, single-statement transactions.
                 // Never replay an ambiguous connection failure or part of a caller transaction.
                 if ($attempt >= 3 || $this->dbh->inTransaction() || !OCCRetry::isOccError($e)) { throw $e; }
+                $this->queryRetries++;
                 usleep(random_int(10000, 30000) * (2 ** $attempt));
             }
         }
