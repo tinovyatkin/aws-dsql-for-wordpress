@@ -193,7 +193,7 @@ RX;
         }
         if(!$after['columns']||count(array_unique(array_column($after['columns'],'Field')))!==count($after['columns']))throw new \RuntimeException('Invalid resulting column set');
         if(count(array_filter($after['columns'],static fn($c)=>str_contains($c['Extra'],'auto_increment')))>1)throw new \RuntimeException('MySQL permits only one AUTO_INCREMENT column');
-        $sequences=[];foreach($after['indexes'] as &$index){$index['Table']=$after['name'];$index['Seq_in_index']=$sequences[$index['Key_name']]=($sequences[$index['Key_name']]??0)+1;if(!in_array($index['Column_name'],array_column($after['columns'],'Field'),true))throw new \RuntimeException('Index refers to unknown column');}unset($index);
+        $sequences=[];foreach($after['indexes'] as &$index){$index['Table']=$after['name'];$index['Seq_in_index']=$sequences[$index['Key_name']]=($sequences[$index['Key_name']]??0)+1;if(!in_array($index['Column_name'],array_column($after['columns'],'Field'),true))throw new \RuntimeException('Index refers to unknown column');if(in_array($index['Key_name'],$after['omitted_indexes']??[],true)&&($index['Index_type']!=='FULLTEXT'||!(int)$index['Non_unique']))throw new \RuntimeException('Only optional nonunique FULLTEXT indexes may be omitted');}unset($index);
         foreach($after['columns'] as &$c){$c['Key']='';Plan::type($c);foreach($after['indexes'] as $index)if($index['Column_name']===$c['Field']){$c['Key']=$index['Key_name']==='PRIMARY'?'PRI':($index['Non_unique']?'MUL':'UNI');if($c['Key']==='PRI'){$c['Null']='NO';break;}}}unset($c);
         Plan::indexes($after);$after['mysql_ddl']=self::mysql($after);$after['mapping']=$mapping;return $after;
     }

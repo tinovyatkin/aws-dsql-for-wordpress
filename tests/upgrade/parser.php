@@ -19,4 +19,5 @@ $rejected=[
 ];
 foreach($rejected as $sql){try{(new Schema($sql))->parse();throw new LogicException('Unsupported SQL accepted');}catch(RuntimeException $expected){}}
 try{Schema::apply((new Schema('ALTER TABLE wp_check ADD UNIQUE KEY prefix_key(a(10))'))->parse(),$base,$options);throw new LogicException('Unique prefix accepted');}catch(RuntimeException $expected){}
+try{Schema::apply((new Schema('CREATE TABLE wp_bad (id bigint, UNIQUE KEY critical (id))'))->parse(),null,array_replace($options,['omit_fulltext_indexes'=>['wp_bad'=>['critical']]]));throw new LogicException('Unique index omission accepted');}catch(RuntimeException $expected){}
 echo "PASS parser: complete statements, quoting, positioning, metadata and rejection boundaries\n";
