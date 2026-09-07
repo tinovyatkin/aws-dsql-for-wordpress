@@ -56,6 +56,9 @@ class DSQL_WPDB extends wpdb {
             $this->dbh = AuroraDsql::connect($config, [
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
                 PDO::ATTR_STRINGIFY_FETCHES => true,
+                // libpq <17 uses SQL DEALLOCATE for named-statement cleanup,
+                // which can abort a DSQL transaction. Keep native binding unnamed.
+                (defined('Pdo\\Pgsql::ATTR_DISABLE_PREPARES')?constant('Pdo\\Pgsql::ATTR_DISABLE_PREPARES'):constant('PDO::PGSQL_ATTR_DISABLE_PREPARES')) => true,
             ]);
             $this->schema=defined('DSQL_SCHEMA')?DSQL_SCHEMA:'public';
             if(!in_array($this->schema,['public','wp_live'],true)) throw new RuntimeException('Unsupported application schema');

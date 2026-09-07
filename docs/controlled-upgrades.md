@@ -85,6 +85,11 @@ A named AWS profile can be used instead of `credentials_file`. The WordPress
 connection, prefix and single-site status are inspected with SHORTINIT and must
 match. The live AWS cluster purpose must match the data classification.
 
+Set the connector's TLS trust bundle for standalone controller commands. On the
+Debian origin use `PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt` (including
+through `sudo env`). On a libpq 17+ development host, `PGSSLROOTCERT=system` is
+also supported. Certificate verification stays enabled.
+
 ## Run an upgrade
 
 First pause and drain **all writers**, including editors/HTTP writes, cron,

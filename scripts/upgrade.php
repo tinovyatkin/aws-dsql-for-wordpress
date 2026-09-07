@@ -13,7 +13,7 @@ function connection(array $t): PDO {
     $sdk=new Aws\DSQL\DSQLClient($config);$cluster=$sdk->getCluster(['identifier'=>explode('.',$t['endpoint'])[0]]);
     $purpose=($t['classification']??'')==='production'?'wordpress-dsql-production-migration':'synthetic-wordpress-migration';
     if(($cluster['tags']['Purpose']??'')!==$purpose)throw new RuntimeException('Cluster classification mismatch');
-    return Aws\AuroraDsql\PdoPgsql\AuroraDsql::connect(new Aws\AuroraDsql\PdoPgsql\DsqlConfig(host:$t['endpoint'],user:$t['user'],region:$t['region'],credentialsProvider:static fn()=>$sdk->getCredentials()),[PDO::ATTR_STRINGIFY_FETCHES=>true]);
+    return Aws\AuroraDsql\PdoPgsql\AuroraDsql::connect(new Aws\AuroraDsql\PdoPgsql\DsqlConfig(host:$t['endpoint'],user:$t['user'],region:$t['region'],credentialsProvider:static fn()=>$sdk->getCredentials()),[PDO::ATTR_STRINGIFY_FETCHES=>true,(defined('Pdo\\Pgsql::ATTR_DISABLE_PREPARES')?constant('Pdo\\Pgsql::ATTR_DISABLE_PREPARES'):constant('PDO::PGSQL_ATTR_DISABLE_PREPARES'))=>true]);
 }
 function wpBinary(string $path): array {
     if(!str_contains($path,'/'))foreach(explode(PATH_SEPARATOR,getenv('PATH')) as $dir)if(is_file($dir.'/'.$path)){$path=$dir.'/'.$path;break;}

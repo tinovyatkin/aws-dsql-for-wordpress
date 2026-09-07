@@ -10,7 +10,7 @@ final class Restore {
         $purpose=$classification==='production'?'wordpress-dsql-production-migration':'synthetic-wordpress-migration';
         if (($cluster['tags']['Purpose']??'')!==$purpose) { throw new \RuntimeException('Target cluster purpose does not match backup classification'); }
         if ($cluster['status']!=='ACTIVE') { throw new \RuntimeException('Target cluster is not active'); }
-        return \Aws\AuroraDsql\PdoPgsql\AuroraDsql::connect(new \Aws\AuroraDsql\PdoPgsql\DsqlConfig(host:$settings['endpoint'],user:$settings['user']??'admin',credentialsProvider:static fn()=>$sdk->getCredentials(),occMaxRetries:3),[\PDO::ATTR_STRINGIFY_FETCHES=>true]);
+        return \Aws\AuroraDsql\PdoPgsql\AuroraDsql::connect(new \Aws\AuroraDsql\PdoPgsql\DsqlConfig(host:$settings['endpoint'],user:$settings['user']??'admin',credentialsProvider:static fn()=>$sdk->getCredentials(),occMaxRetries:3),[\PDO::ATTR_STRINGIFY_FETCHES=>true,(defined('Pdo\\Pgsql::ATTR_DISABLE_PREPARES')?constant('Pdo\\Pgsql::ATTR_DISABLE_PREPARES'):constant('PDO::PGSQL_ATTR_DISABLE_PREPARES'))=>true]);
     }
     public static function run(\PDO $p,string $directory,array $manifest,string $expectedHost): array {
         $plan=Plan::inspect($directory,$manifest);
