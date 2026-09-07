@@ -2,7 +2,9 @@
 
 The migration tool creates a portable **logical backup**, restores it into a
 fresh DSQL cluster, and checks every restored table before any WordPress
-connection is changed. A MySQL SQL dump is retained separately for rollback;
+connection is changed. This is a database migration: the existing WordPress
+code, plugins, theme, media, and server configuration must be retained separately.
+A MySQL SQL dump is retained separately for rollback;
 it is not executed against DSQL.
 
 This tooling does **not** perform production cutover. Its plan and verification
@@ -164,6 +166,6 @@ a separate synthetic DSQL cluster. Fourteen tables and 145 rows verified exactly
 including serialized WordPress content, binary data, a high-precision decimal,
 and duplicate rows in a table without a primary key. Eleven restored-WordPress
 checks passed, including unchanged login, imported IDs, new identity allocation,
-literal zero/year-1 text, and zero `dbDelta` differences. Six rejection-path
+literal zero/year-1 text, and zero `dbDelta` differences. Seven rejection-path
 checks covered overwrite, corruption, production/synthetic separation, unsupported
-schema, nonempty targets, and remote MySQL TLS. No production data was restored.
+schema, nonempty targets, remote MySQL TLS, and byte-exact source NUL detection. No production data was restored.
