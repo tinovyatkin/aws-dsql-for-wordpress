@@ -6,8 +6,8 @@ An **experimental, working WordPress-on-Aurora-DSQL proof of concept**, forked f
 WordPress uses its official `wp-content/db.php` extension point. The DSQL driver
 extends the installed core `wpdb` class and connects through AWS's
 [`awslabs/aurora-dsql-pdo-pgsql`](https://github.com/awslabs/aurora-dsql-php-pdo-pgsql)
-package. It does not rewrite or patch WordPress core. The original PG4WP driver
-is retained and can be selected with `DB_DRIVER=pgsql`.
+package. It does not rewrite or patch WordPress core. Aurora DSQL is the only
+supported database backend.
 
 The repository includes synthetic integration tests for installation, login,
 publishing, native comments, REST CRUD, and an independent Node.js comment
@@ -93,7 +93,7 @@ node tests/dsql/external-writer.mjs
 php tests/dsql/read-external.php
 python3 tests/dsql/http-smoke.py
 
-# The inherited PG4WP rewrite suite needs ext-pgsql as well.
+# Run the shared SQL translation regression suite (no database required).
 php tests/tools/phpunit.phar tests/
 wp core verify-checksums --version=7.1 --path=.local/wordpress
 ```
@@ -187,10 +187,6 @@ scope, and remaining limitations.
   persistent-cache configuration, or validate heavy concurrency, failover, or
   production load.
 
-## Upstream and license
+## License
 
-Original PG4WP work is credited to Hawk__, kevinoid, mattbucci, and the
-[PG4WP contributors](https://github.com/PostgreSQL-For-Wordpress/postgresql-for-wordpress).
-Their original driver and unit tests are retained. Source is GPL-2.0-or-later;
-see [license.md](license.md). AWS connector dependencies retain their own
-Apache-2.0 notices and are installed with Composer/npm, not vendored into Git.
+Licensed under GPL-2.0-or-later; see [license.md](license.md).

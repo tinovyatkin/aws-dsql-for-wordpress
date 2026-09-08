@@ -4,7 +4,7 @@
  * This is a compatibility prototype, not a complete MySQL implementation.
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-require_once dirname(__DIR__) . '/driver_pgsql_rewrite.php';
+require_once dirname(__DIR__) . '/rewriters/bootstrap.php';
 require_once __DIR__.'/class-dsql-value-codec.php';
 
 class DSQL_SelectSQLRewriter extends SelectSQLRewriter {

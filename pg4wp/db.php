@@ -12,7 +12,7 @@ License: GPLv2 or newer.
 if(!defined('PG4WP_BOOTSTRAPPED')) {
     define('PG4WP_BOOTSTRAPPED', true);
 
-    // You can choose the driver to load here
+    // DSQL is the only supported driver.
     if (!defined('DB_DRIVER')) {
         define('DB_DRIVER', 'dsql');
     }

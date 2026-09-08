@@ -3,16 +3,6 @@
 declare(strict_types=1);
 use PHPUnit\Framework\TestCase;
 
-if (!defined('ABSPATH')) {
-    define('ABSPATH', __DIR__ . "/../");
-}
-
-if (!defined('WPINC')) {
-    define('WPINC', 'wp-includes');
-}
-
-require_once __DIR__ . "/../pg4wp/db.php";
-
 final class rewriteTest extends TestCase
 {
     public function test_it_can_rewrite_users_admin_query()
@@ -20,7 +10,7 @@ final class rewriteTest extends TestCase
 
         $sql = 'SELECT COUNT(NULLIF(`meta_value` LIKE \'%"administrator"%\', false)), COUNT(NULLIF(`meta_value` = \'a:0:{}\', false)), COUNT(*) FROM wp_usermeta INNER JOIN wp_users ON user_id = ID WHERE meta_key = \'wp_capabilities\'';
         $expected = 'SELECT COUNT(NULLIF(meta_value ILIKE \'%"administrator"%\', false)) AS count0, COUNT(NULLIF(meta_value = \'a:0:{}\', false)) AS count1, COUNT(*) FROM wp_usermeta INNER JOIN wp_users ON user_id = "ID" WHERE meta_key = \'wp_capabilities\'';
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -30,7 +20,7 @@ final class rewriteTest extends TestCase
 
         $sql = 'SELECT COUNT(id), username FROM users';
         $expected = 'SELECT COUNT(id) AS count0, username FROM users GROUP BY username';
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -70,7 +60,7 @@ final class rewriteTest extends TestCase
             );
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -92,7 +82,7 @@ final class rewriteTest extends TestCase
             );
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -116,7 +106,7 @@ final class rewriteTest extends TestCase
             );
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -144,7 +134,7 @@ final class rewriteTest extends TestCase
         CREATE UNIQUE INDEX IF NOT EXISTS wp_itsec_dashboard_lockouts_ip__time ON wp_itsec_dashboard_lockouts (ip, time);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -186,7 +176,7 @@ final class rewriteTest extends TestCase
         CREATE INDEX IF NOT EXISTS wp_itsec_vulnerabilities_last_seen ON wp_itsec_vulnerabilities (last_seen);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -214,7 +204,7 @@ final class rewriteTest extends TestCase
         CREATE UNIQUE INDEX IF NOT EXISTS wp_itsec_dashboard_lockouts_ip__time ON wp_itsec_dashboard_lockouts (ip, time);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -259,7 +249,7 @@ final class rewriteTest extends TestCase
             );
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -299,7 +289,7 @@ final class rewriteTest extends TestCase
         CREATE INDEX IF NOT EXISTS wp_statistics_pages_uri ON wp_statistics_pages (uri,count,id);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -322,7 +312,7 @@ final class rewriteTest extends TestCase
             );
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -353,7 +343,7 @@ final class rewriteTest extends TestCase
         CREATE INDEX IF NOT EXISTS wp_usermeta_meta_key ON wp_usermeta (meta_key);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -401,7 +391,7 @@ final class rewriteTest extends TestCase
         CREATE INDEX IF NOT EXISTS wp_blogs_lang_id ON wp_blogs (lang_id);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -434,7 +424,7 @@ final class rewriteTest extends TestCase
             ((wp_posts.post_type = 'post' AND (wp_posts.post_status = 'publish' OR wp_posts.post_status = 'future' OR wp_posts.post_status = 'draft' OR wp_posts.post_status = 'pending' OR wp_posts.post_status = 'private')))
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -460,7 +450,7 @@ final class rewriteTest extends TestCase
             UPDATE object_id=VALUES(object_id), object_lang=VALUES(object_lang), source_id=VALUES(source_id) RETURNING *;
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -469,7 +459,7 @@ final class rewriteTest extends TestCase
         $sql = "REPLACE INTO test2 (column1, column2, column3) VALUES (1, 'Old', '2014-08-20 18:47:00')";
         $expected = "INSERT INTO test2 (column1, column2, column3) VALUES (1, 'Old', '2014-08-20 18:47:00') ON CONFLICT (column1) DO UPDATE SET column2 = EXCLUDED.column2, column3 = EXCLUDED.column3 RETURNING *";
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -491,7 +481,7 @@ final class rewriteTest extends TestCase
             AND p.post_password != '' ORDER BY p.post_date_gmt ASC LIMIT 20 OFFSET 0
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -505,7 +495,7 @@ final class rewriteTest extends TestCase
             CREATE INDEX IF NOT EXISTS wp_e_events_created_at_index ON wp_e_events (created_at)
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
 
     }
@@ -520,7 +510,7 @@ final class rewriteTest extends TestCase
             CREATE UNIQUE INDEX IF NOT EXISTS wp_e_events_created_at_index ON wp_e_events (created_at)
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -542,7 +532,7 @@ final class rewriteTest extends TestCase
             );
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -582,7 +572,7 @@ final class rewriteTest extends TestCase
         CREATE INDEX IF NOT EXISTS wp_statistics_pages_uri ON wp_statistics_pages (uri,count,id);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
     
@@ -597,7 +587,7 @@ final class rewriteTest extends TestCase
             SELECT COUNT(*) FROM wp_comments WHERE user_id = 5 AND comment_approved = '1'
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -650,7 +640,7 @@ final class rewriteTest extends TestCase
             <!-- /wp:gallery -->";}}', 'no') ON CONFLICT ("option_name") DO UPDATE SET "option_value" = EXCLUDED."option_value", "autoload" = EXCLUDED."autoload" RETURNING * 
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -706,7 +696,7 @@ final class rewriteTest extends TestCase
                 );
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -739,7 +729,7 @@ final class rewriteTest extends TestCase
             ORDER BY CAST(wp_postmeta.meta_value AS INTEGER) DESC, wp_posts.post_date DESC
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -753,7 +743,7 @@ final class rewriteTest extends TestCase
             SELECT DISTINCT meta_key FROM wp_gf_entry_meta WHERE form_id=2 AND meta_key ~ '^[0-9]+(\.[0-9]+)?$'
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -767,7 +757,7 @@ final class rewriteTest extends TestCase
             INSERT INTO wp_gf_form(title, date_created) VALUES('Test', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') RETURNING *
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -781,7 +771,7 @@ final class rewriteTest extends TestCase
             SELECT CURRENT_TIMESTAMP AT TIME ZONE 'UTC'
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
 
@@ -841,7 +831,7 @@ final class rewriteTest extends TestCase
         CREATE INDEX IF NOT EXISTS wp_aioseo_notifications_ndx_aioseo_notifications_dismissed ON wp_aioseo_notifications (dismissed);
         SQL;
 
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertSame(trim($expected), trim($postgresql));
     }
    
@@ -855,6 +845,8 @@ final class rewriteTest extends TestCase
             public $prefix = "wp_";
             public $options = "wp_options";
             public $sitemeta = "wp_sitemeta";
+            public $posts = "wp_posts";
+            public $postmeta = "wp_postmeta";
         };
     }
     
@@ -871,26 +863,26 @@ final class rewriteTest extends TestCase
         
         // Test DELETE with options table
         $sql = "DELETE a, b FROM custom_options a, custom_options b WHERE a.option_name = '_transient_timeout_something' AND b.option_name = '_transient_something' AND b.option_value < 12345678";
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertStringContainsString("DELETE FROM custom_options a USING custom_options b", $postgresql);
         $this->assertStringNotContainsString("wp_options", $postgresql);
         
         // Test DELETE with sitemeta table
         $sql = "DELETE a, b FROM custom_sitemeta a, custom_sitemeta b WHERE a.meta_key = '_site_transient_timeout_something' AND b.meta_key = '_site_transient_something' AND b.meta_value < 12345678";
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertStringContainsString("DELETE FROM custom_sitemeta a USING custom_sitemeta b", $postgresql);
         $this->assertStringNotContainsString("wp_sitemeta", $postgresql);
         
         // Test general pattern DELETE with any tables
         $sql = "DELETE p, pm FROM custom_posts p, custom_postmeta pm WHERE p.ID = pm.post_id AND p.post_type = 'revision'";
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertStringContainsString("DELETE FROM custom_posts p USING custom_postmeta pm", $postgresql);
         $this->assertStringNotContainsString("wp_posts", $postgresql);
         $this->assertStringNotContainsString("wp_postmeta", $postgresql);
         
         // Test with tables that don't exist as $wpdb properties
         $sql = "DELETE a, b FROM custom_mytable a, custom_anothertable b WHERE a.id = b.ref_id";
-        $postgresql = pg4wp_rewrite($sql);
+        $postgresql = rewrite_fixture_sql($sql);
         $this->assertStringContainsString("DELETE FROM custom_mytable a USING custom_anothertable b", $postgresql);
         
         // Restore the original prefix for other tests
