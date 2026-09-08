@@ -77,7 +77,7 @@ Example upgrade target (no access keys in this JSON):
   "classification": "production",
   "user": "wp_upgrader",
   "credentials_file": "/private/upgrade-credentials",
-  "backup_vault": "blonde-travel-dsql"
+  "backup_vault": "YOUR-BACKUP-VAULT"
 }
 ```
 
@@ -85,8 +85,8 @@ A named AWS profile can be used instead of `credentials_file`. The WordPress
 connection, prefix and single-site status are inspected with SHORTINIT and must
 match. The live AWS cluster purpose must match the data classification.
 
-Set the connector's TLS trust bundle for standalone controller commands. On the
-Debian origin use `PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt` (including
+Set the connector's TLS trust bundle for standalone controller commands. On
+Debian-based systems use `PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt` (including
 through `sudo env`). On a libpq 17+ development host, `PGSSLROOTCERT=system` is
 also supported. Certificate verification stays enabled.
 
@@ -99,8 +99,8 @@ guard cannot stop independent direct SQL clients. The runner validates a complet
 backup for the exact cluster from the last 24 hours. Synthetic fixtures alone
 can use `--backup-reference=synthetic-fixture`.
 
-Use an existing private parent directory outside WordPress. On the origin the
-CLI operator is root, allowing access to the separate root-only upgrade key.
+Use an existing private parent directory outside WordPress. The CLI operator
+must have access to the separate upgrade credentials and the WordPress files.
 
 ```sh
 php scripts/upgrade.php begin \

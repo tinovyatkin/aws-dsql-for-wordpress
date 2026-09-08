@@ -9,12 +9,11 @@ extends the installed core `wpdb` class and connects through AWS's
 package. It does not rewrite or patch WordPress core. The original PG4WP driver
 is retained and can be selected with `DB_DRIVER=pgsql`.
 
-**Verified on 7 September 2026:** a fresh WordPress 7.1 installation on real
-Aurora DSQL in Frankfurt, PHP 8.5.10, and the stock Twenty Twenty-Five theme.
-Installation, login, publishing, native comments, REST CRUD, and a separate
-Node.js process writing a comment into the same database all work. See the
-[verification report](docs/verification-2026-09-07.md) for the exact scope and
-remaining gaps. This is not a production-ready MySQL replacement.
+The repository includes synthetic integration tests for installation, login,
+publishing, native comments, REST CRUD, and an independent Node.js comment
+writer. Migration and controlled-upgrade tests cover data verification and
+recovery from interrupted schema changes. Compatibility must be evaluated for
+each site's plugins, schema, and workload; this is not a drop-in MySQL replacement.
 
 ## Architecture
 
@@ -147,26 +146,32 @@ Do not activate this as an ordinary plugin or point it at an existing MySQL
 site expecting data to migrate automatically. A DSQL cluster contains the
 built-in `postgres` database; this prototype uses its `public` schema.
 
-## Full-schema rehearsal
-
-A production-shaped rehearsal now covers all 61 schema tables, 8,369 synthetic
-rows, the active plugin versions, Olga, and Redis. It uses an explicit archive
-policy, a reversible NUL text codec, and a non-admin database role. See the
-[full migration demo report](docs/full-migration-demo.md).
-
 ## Backup and restore migration
 
-The fork now includes a logical MySQL backup, DSQL preflight, empty-target restore,
+The fork includes a logical MySQL backup, DSQL preflight, empty-target restore,
 and full-table verification CLI. Restored tables retain their original MySQL
 schema metadata; the unchanged core schema passes dbDelta without false changes.
+An explicit migration policy controls table archival and supported index
+omissions. An opt-in reversible codec preserves NUL bytes in eligible text
+columns, and application access can use a non-admin database role.
 See [the migration workflow and rollback boundary](docs/backup-restore-migration.md).
 The CLI never changes the live WordPress connection.
 
+## Controlled schema upgrades
+
+Version 0.4 adds a CLI-only upgrade runner with schema planning, verified table
+rebuilds, synchronized MySQL metadata, retained originals, separate upgrade
+credentials, and recovery from interrupted DDL. Core/plugin versions must be
+pinned, and all writers must be paused before an upgrade. See
+[controlled upgrades](docs/controlled-upgrades.md) for setup, commands, tested
+scope, and remaining limitations.
+
 ## Known limits
 
-- **Automatic schema upgrades remain incomplete.** Migrated tables use a verified
-  MySQL metadata catalog, so unchanged schemas compare correctly. ALTER/DROP on
-  those tables is deliberately blocked until migration-aware upgrades are implemented.
+- **Unattended schema upgrades are not supported.** Migrated tables use a verified
+  MySQL metadata catalog, so unchanged schemas compare correctly. Schema changes
+  on those tables require the controlled CLI runner; ordinary requests cannot
+  perform them. Keep automatic core/plugin updates disabled.
   Fresh tables created outside the restore path still have partial introspection.
 - The reused SQL rewrite rules are not a complete MySQL grammar or complete
   MySQL behavior emulation. Arbitrary plugin SQL, multisite, MySQL collations,
@@ -178,8 +183,9 @@ The CLI never changes the live WordPress connection.
   Other NUL uses and SQL pattern searches inside encoded payloads remain unsupported.
 - DSQL limits on transactions, rows, index keys, and connection lifetime still apply.
   Manual multi-statement transactions need whole-transaction retry at their owner.
-- The tests do not establish compatibility with a production site's full plugin
-  set, persistent Redis cache, heavy concurrency, failover behavior, or load.
+- Synthetic tests do not establish compatibility with every plugin, theme, or
+  persistent-cache configuration, or validate heavy concurrency, failover, or
+  production load.
 
 ## Upstream and license
 
@@ -188,11 +194,3 @@ Original PG4WP work is credited to Hawk__, kevinoid, mattbucci, and the
 Their original driver and unit tests are retained. Source is GPL-2.0-or-later;
 see [license.md](license.md). AWS connector dependencies retain their own
 Apache-2.0 notices and are installed with Composer/npm, not vendored into Git.
-# Controlled schema upgrades
-
-Version 0.4 adds a CLI-only upgrade runner with schema planning, verified table
-rebuilds, synchronized MySQL metadata, retained originals, separate upgrade
-credentials and recovery from interrupted DDL. Core/plugin versions must be
-pinned; automatic updates remain disabled. See
-[controlled upgrades](docs/controlled-upgrades.md) for setup, commands, tested
-scope and the remaining limitations.
