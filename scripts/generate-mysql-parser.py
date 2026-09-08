@@ -48,5 +48,5 @@ for path in output.iterdir():
     if path.suffix in {'.interp', '.tokens'}:
         path.unlink()
     elif path.suffix == '.php':
-        path.write_text('\n'.join(line.rstrip() for line in path.read_text().splitlines()) + '\n')
+        path.write_text('\n'.join(re.sub(r'^[ \t]+', lambda m: m.group(0).expandtabs(4), line.rstrip()) for line in path.read_text().splitlines()) + '\n')
 print('Generated PHP lexer, parser, and visitors.')
