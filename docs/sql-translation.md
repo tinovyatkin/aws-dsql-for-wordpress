@@ -1,6 +1,6 @@
 # MySQL translation and caching
 
-Adapter **0.8.0** uses WordPress's standalone MySQL parse tree for ordinary SQL
+Adapter **0.9.0** uses WordPress's standalone MySQL parse tree for ordinary SQL
 translation. The old PG4WP regex rewriters have been removed. Metadata requests
 use AST dispatch and the shared logical MySQL catalog. Controlled schema
 changes derive supported operations from the MySQL AST and use the migration-aware schema
@@ -140,6 +140,10 @@ Deploy the complete release, including `engine/`, `schema/`, `parser/mysql/`, `p
 `mbstring` and `pdo_pgsql` remain required by the adapter. No Java, ANTLR runtime,
 or Rust extension is needed. Release fingerprints isolate plans from the
 previous parser and compiler versions.
+
+See [core compatibility additions](core-compatibility.md) for calendar functions,
+explicit binary comparisons, self-join deletion and numeric DATE_FORMAT comparisons
+added in 0.9.
 
 ## Verification and measurement
 

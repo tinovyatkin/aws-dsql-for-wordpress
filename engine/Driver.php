@@ -265,7 +265,7 @@ final class Driver {
     private function metadataQuery(string $query): ?array {
         if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?autocommit\s*;?\s*$/i',$query)) return [['autocommit'=>$this->pdo->inTransaction()?'0':'1']];
         if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode\s*;?\s*$/i',$query)) return [['sql_mode'=>$this->translator->sqlMode()]];
-        if(in_array($this->operation,['SHOW','DESCRIBE','DESC'],true)||($this->operation==='SELECT'&&preg_match('/\binformation_schema\s*\./i',$query))) {
+        if(in_array($this->operation,['SHOW','DESCRIBE','DESC','CHECK','REPAIR','OPTIMIZE','ANALYZE'],true)||($this->operation==='SELECT'&&preg_match('/\binformation_schema\s*\./i',$query))) {
             return $this->introspection->query($query,$this->translator->sqlMode());
         }
         return null;

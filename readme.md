@@ -190,7 +190,10 @@ and [parser sources, maintenance, and the Rust evaluation](docs/mysql-parser.md)
 
 The [WordPress 7.1 source audit](docs/wordpress-core-sql-audit.md) inventories
 core database calls, checks a maintenance-branch snapshot, and records concrete
-translation gaps with reproducible probes. Static source coverage is separate
+translation gaps with reproducible probes. Version 0.9 implements the confirmed
+[core compatibility additions](docs/core-compatibility.md): Site Health metadata,
+calendar filters, explicit binary comparisons, and bounded legacy maintenance
+and upgrade behavior. Static source coverage is separate
 from live execution and MySQL result-equivalence testing.
 
 ## Known limits

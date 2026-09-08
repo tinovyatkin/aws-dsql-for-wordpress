@@ -94,11 +94,15 @@ final class Renderer {
             $v=$shape->slots[$node['index']]['value'];preg_match('/^[\s]*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?/',$v,$m);
             return 'CAST('.$this->bind(trim($m[0]??'0')).' AS numeric)';
         }
-        if(is_array($node)&&in_array($node['op']??'',['compare','logical','like','in','between','boolean_sql','is_truth'],true))return '(CASE WHEN '.$this->emit($node,$shape).' THEN 1 ELSE 0 END)';
+        if(is_array($node)&&$node['op']==='function'&&$node['name']==='DATE_FORMAT'){
+            $pattern="'^[[:space:]]*([+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?)'";
+            return '(SELECT CASE WHEN v IS NULL THEN NULL WHEN v ~ '.$pattern.' THEN CAST(substring(v FROM '.$pattern.') AS numeric) ELSE 0 END FROM (SELECT '.$this->emit($node,$shape).' AS v) AS _wpd_numeric)';
+        }
+        if(is_array($node)&&in_array($node['op']??'',['compare','regex','logical','like','in','between','boolean_sql','is_truth'],true))return '(CASE WHEN '.$this->emit($node,$shape).' THEN 1 ELSE 0 END)';
         return $this->emit($node,$shape);
     }
     private function truth(array|string $node,Shape $shape):string {
-        if(is_array($node)&&in_array($node['op']??'',['compare','logical','like','in','between','boolean_sql','is_truth'],true))return $this->emit($node,$shape);
+        if(is_array($node)&&in_array($node['op']??'',['compare','regex','logical','like','in','between','boolean_sql','is_truth'],true))return $this->emit($node,$shape);
         if(is_string($node)&&in_array(strtoupper($node),['TRUE','FALSE','NULL'],true))return $node;
         if(is_array($node)&&$node['op']==='sql') { // Parenthesized boolean expressions preserve their type.
             $parts=$node['parts'];if(count($parts)===3&&$parts[0]==='('&&$parts[2]===')')return '('.$this->truth($parts[1],$shape).')';
@@ -107,6 +111,10 @@ final class Renderer {
     }
     private function compare(array $n,Shape $shape):string {
         $a=$n['left'];$b=$n['right'];$op=match($n['operator']){'<=>'=>'IS NOT DISTINCT FROM','!='=>'<>',default=>$n['operator']};
+        if($this->binary($a)||$this->binary($b))return '('.$this->binaryValue($a,$shape).' '.$op.' '.$this->binaryValue($b,$shape).')';
+        $formatted=static fn($n)=>is_array($n)&&$n['op']==='function'&&$n['name']==='DATE_FORMAT';
+        $number=static fn($n)=>is_array($n)&&$n['op']==='slot'&&$n['kind']==='number';
+        if(($formatted($a)&&$number($b))||($formatted($b)&&$number($a)))return '('.$this->numeric($a,$shape).' '.$op.' '.$this->numeric($b,$shape).')';
         $col=is_array($a)&&$a['op']==='column'?$a:null;$other=is_array($b)&&$b['op']==='slot'?$b:null;
         if($col&&$other) {
             $info=$this->info($col);
@@ -120,6 +128,9 @@ final class Renderer {
         }
         return '('.$this->emit($a,$shape).' '.$op.' '.$this->emit($b,$shape).')';
     }
+    private function binary(array|string $n): bool {return is_array($n)&&$n['op']==='cast'&&$n['type']==='binary';}
+    private function binaryValue(array|string $n,Shape $s): string {return "CONVERT_TO(CAST(".$this->emit($this->binary($n)?$n['value']:$n,$s)." AS text),'UTF8')";}
+    private function regexValue(array|string $n,Shape $s): string {return $this->emit($this->binary($n)?$n['value']:$n,$s);}
     private function assignmentValue(array|string $n,array $field,Shape $shape):string {
         return is_array($n)&&$n['op']==='slot'?$this->value($n,$shape,$field,true):$this->emit($n,$shape);
     }
@@ -160,19 +171,27 @@ final class Renderer {
             case 'compare':return $this->compare($n,$s);
             case 'logical':return '('.$this->truth($n['left'],$s).' '.($n['operator']==='XOR'?'<>':$n['operator']).' '.$this->truth($n['right'],$s).')';
             case 'in':
+                if($this->binary($n['left'])){if($n['values']===null)throw new \RuntimeException('Binary IN subquery requires explicit support');return '('.$this->binaryValue($n['left'],$s).($n['not']?' NOT IN (':' IN (').implode(',',array_map(fn($v)=>$this->binaryValue($v,$s),$n['values'])).'))';}
                 $left=$this->emit($n['left'],$s);$column=is_array($n['left'])&&$n['left']['op']==='column'?$n['left']:null;
                 if($n['values']!==null){$values=[];foreach($n['values'] as $value)$values[]=is_array($value)&&$value['op']==='slot'&&$column?$this->value($value,$s,$column):$this->emit($value,$s);$rhs='('.implode(',',$values).')';}else $rhs=$this->emit($n['subquery'],$s);
                 return '('.$left.($n['not']?' NOT IN ':' IN ').$rhs.')';
             case 'between':
+                if($this->binary($n['left']))return '('.$this->binaryValue($n['left'],$s).($n['not']?' NOT BETWEEN ':' BETWEEN ').$this->binaryValue($n['low'],$s).' AND '.$this->binaryValue($n['high'],$s).')';
                 $column=is_array($n['left'])&&$n['left']['op']==='column'?$n['left']:null;
                 $bound=fn($v)=>$column&&is_array($v)&&$v['op']==='slot'?$this->value($v,$s,$column):$this->emit($v,$s);
                 return '('.$this->emit($n['left'],$s).($n['not']?' NOT BETWEEN ':' BETWEEN ').$bound($n['low']).' AND '.$bound($n['high']).')';
-            case 'like':return '('.$this->emit($n['left'],$s).($n['not']?' NOT ILIKE ':' ILIKE ').$this->emit($n['right'],$s).($n['escape']?' ESCAPE '.$this->emit($n['escape'],$s):'').')';
+            case 'regex':return '('.$this->regexValue($n['left'],$s).($n['not']?' !~ ':' ~ ').$this->regexValue($n['right'],$s).')';
+            case 'delete_self_join':
+                $key=null;foreach($this->keys($n['table']) as $k)if($k['primary']){$key=$k['columns'];break;}if(!$key)throw new \RuntimeException('Self-join DELETE requires a primary key');
+                $columns=implode(',',array_map(self::qi(...),$key));$target=count($key)>1?'('.$columns.')':$columns;
+                $selected=implode(',',array_map(fn($c)=>self::qi($n['target']).'.'.self::qi($c),$key));
+                return 'DELETE FROM '.self::qi($n['table']).' WHERE '.$target.' IN (SELECT '.$selected.' FROM '.$this->emit($n['from'],$s).' '.$this->emit($n['where'],$s).')';
+            case 'like':if($this->binary($n['left'])||$this->binary($n['right'])){if($n['escape'])throw new \RuntimeException('Binary LIKE ESCAPE requires explicit support');return '('.$this->binaryValue($n['left'],$s).($n['not']?' NOT LIKE ':' LIKE ').$this->binaryValue($n['right'],$s).')';}return '('.$this->emit($n['left'],$s).($n['not']?' NOT ILIKE ':' ILIKE ').$this->emit($n['right'],$s).($n['escape']?' ESCAPE '.$this->emit($n['escape'],$s):'').')';
             case 'arithmetic':
                 $a=$this->numeric($n['left'],$s);$b=$this->numeric($n['right'],$s);$op=match($n['operator']){'DIV'=>'/','MOD'=>'%','^'=>'#',default=>$n['operator']};
                 return $n['operator']==='DIV'?'TRUNC('.$a.' / NULLIF('.$b.',0))':'('.$a.' '.$op.' '.$b.')';
             case 'unary':return '('.$n['operator'].$this->numeric($n['value'],$s).')';
-            case 'cast':return 'CAST('.($n['type']==='bigint'||$n['type']==='numeric(20)'?$this->numeric($n['value'],$s):$this->emit($n['value'],$s)).' AS '.$this->emit($n['type'],$s).')';
+            case 'cast':if($n['type']==='binary')return $this->binaryValue($n,$s);return 'CAST('.($n['type']==='bigint'||$n['type']==='numeric(20)'?$this->numeric($n['value'],$s):$this->emit($n['value'],$s)).' AS '.$this->emit($n['type'],$s).')';
             case 'function':return $this->function($n,$s);
             case 'aggregate':
                 $name=match($n['name']){'STD'=>'STDDEV_POP','VARIANCE'=>'VAR_POP',default=>$n['name']};
@@ -212,6 +231,11 @@ final class Renderer {
         if($name==='NULLIF'&&count($a)===2&&is_string($a[1])&&in_array(strtoupper($a[1]),['TRUE','FALSE'],true))return 'NULLIF('.$this->truth($a[0],$s).','.$a[1].')';
         if($name==='FIELD') {
             if(count($a)<2)throw new \RuntimeException('FIELD requires comparands');$sql='CASE';foreach(array_slice($a,1) as $i=>$b)$sql.=' WHEN '.$this->compare(['left'=>$a[0],'right'=>$b,'operator'=>'='],$s).' THEN '.($i+1);return '('.$sql.' ELSE 0 END)';
+        }
+        if(in_array($name,['WEEK','DAYOFYEAR','DAYOFWEEK','WEEKDAY'],true)){
+            if(count($a)<1||count($a)>($name==='WEEK'?2:1))throw new \RuntimeException('Invalid calendar function arity');
+            $mode=0;if(isset($a[1])){if(!is_array($a[1])||$a[1]['op']!=='slot'||$a[1]['kind']!=='number')throw new \RuntimeException('Literal WEEK mode required');$raw=$s->slots[$a[1]['index']]['value'];if(!preg_match('/^[0-7]$/D',$raw))throw new \RuntimeException('WEEK mode must be between 0 and 7');$mode=(int)$raw;}
+            return Calendar::sql($name,$emit(0),$mode);
         }
         if(in_array($name,['YEAR','MONTH','DAY','DAYOFMONTH','HOUR','MINUTE','SECOND'],true))return 'EXTRACT('.($name==='DAYOFMONTH'?'DAY':$name).' FROM '.$emit(0).')';
         if($name==='UNIX_TIMESTAMP')return 'EXTRACT(EPOCH FROM '.($a?$emit(0):'CURRENT_TIMESTAMP').')';

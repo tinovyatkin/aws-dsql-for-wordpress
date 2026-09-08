@@ -143,6 +143,14 @@ final class Ddl {
     }
     private function alter(Node $node,string $table): array {
         $words=Ast::words($node);$first=$words[0];$ids=$node->get_child_nodes('ident');
+        if($first==='CONVERT'){
+            Ast::shape($node,['character_set','charset_name','opt_collate'],['CONVERT','TO']);
+            $charset=Ast::nodes($node,'charset_name')[0]??throw new \RuntimeException('Charset required');
+            if(strtolower(Ast::tokens($charset)[0]->get_value())!=='utf8mb4')throw new \RuntimeException('Only UTF-8 widening is supported; other charset conversion requires an explicit migration');
+            $collate=Ast::nodes($node,'collation_name');
+            if(count($collate)!==1)throw new \RuntimeException('UTF-8 widening requires an explicit unchanged collation family');
+            return [['op'=>'utf8mb4_upgrade','collation'=>strtolower(Ast::tokens($collate[0])[0]->get_value())]];
+        }
         if(in_array($first,['ADD','CHANGE','MODIFY'],true)){
             Ast::shape($node,['opt_column','ident','field_def','opt_place','table_constraint_def'],['ADD','CHANGE','MODIFY']);
             if($index=Ast::child($node,'table_constraint_def'))return [['op'=>'add_index','indexes'=>$this->index($index,$table)]];

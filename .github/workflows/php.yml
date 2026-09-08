@@ -34,6 +34,7 @@ jobs:
         php tests/mysql-parser/helpers.php
         php tests/mysql-parser/corpus.php
         php tests/upgrade/parser.php
+        php tests/core-sql/audit.php --require-supported
 
     - name: Check pinned parser sources
       run: |

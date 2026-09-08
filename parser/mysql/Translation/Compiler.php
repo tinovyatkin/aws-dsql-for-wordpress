@@ -107,7 +107,7 @@ final class Compiler {
         if(in_array($tag,['Identifier','PureIdentifier'],true))return ['op'=>'identifier','name'=>self::id($ctx->getText())];
         if($tag==='ColumnRef'||$tag==='FieldIdentifier')return $this->column($ctx);
         if($tag==='TableRef')return ['op'=>'identifier','name'=>$this->tableName($ctx)];
-        if(in_array($tag,['IndexHintList','IntoClause','LockingClauseList','SimpleExprMatch','SimpleExprUserVariableAssignment','SimpleExpressionRValue','SimpleExprParamMarker','SimpleExprOdbc','SimpleExprCollate','SimpleExprConvertUsing','SimpleExprCastTime','SimpleExprBinary','JsonOperator'],true))throw new \RuntimeException('Unsupported DSQL construct: '.$tag);
+        if(in_array($tag,['IndexHintList','IntoClause','LockingClauseList','SimpleExprMatch','SimpleExprUserVariableAssignment','SimpleExpressionRValue','SimpleExprParamMarker','SimpleExprOdbc','SimpleExprCollate','SimpleExprConvertUsing','SimpleExprCastTime','JsonOperator'],true))throw new \RuntimeException('Unsupported DSQL construct: '.$tag);
         if($tag==='SelectOption') {
             $option=strtoupper($ctx->getText());
             if($option==='SQL_CALC_FOUND_ROWS'){$this->calc=true;return '';}
@@ -190,7 +190,7 @@ final class Compiler {
             if($kind==='PredicateExprIn')return ['op'=>'in','left'=>$left,'not'=>$neg,'values'=>$op->exprList()?array_map(fn($e)=>$this->render($e),$op->exprList()->expr()):null,'subquery'=>$op->subquery()?$this->render($op->subquery()):null];
             if($kind==='PredicateExprBetween')return ['op'=>'between','left'=>$left,'not'=>$neg,'low'=>$this->render($op->bitExpr()),'high'=>$this->render($op->predicate())];
             if($kind==='PredicateExprLike'){$args=$op->simpleExpr();return ['op'=>'like','left'=>$left,'right'=>$this->render($args[0]),'escape'=>isset($args[1])?$this->render($args[1]):null,'not'=>$neg];}
-            if($kind==='PredicateExprRegex')return ['op'=>'boolean_sql','value'=>self::sql(['(',$left,$neg?'!~':'~',$this->render($op->bitExpr()),')'])];
+            if($kind==='PredicateExprRegex')return ['op'=>'regex','left'=>$left,'right'=>$this->render($op->bitExpr()),'not'=>$neg];
             return ['op'=>'boolean_sql','value'=>self::sql([$left,$neg?'NOT':'',$this->render($op)])];
         }
         if($tag==='Predicate'&&count($this->kids($ctx))>1)throw new \RuntimeException('Unsupported predicate');
@@ -202,6 +202,7 @@ final class Compiler {
         if($tag==='SimpleExprConcat')return ['op'=>'function','name'=>'CONCAT','args'=>array_map(fn($n)=>$this->render($n),$ctx->simpleExpr())];
         if($tag==='SimpleExprSubQuery'&&$this->has($ctx,'EXISTS'))return ['op'=>'boolean_sql','value'=>$this->renderChildren($ctx)];
         if($tag==='SimpleExprUnary')return ['op'=>'unary','operator'=>$ctx->op->getText(),'value'=>$this->render($ctx->simpleExpr())];
+        if($tag==='SimpleExprBinary')return ['op'=>'cast','value'=>$this->render($ctx->simpleExpr()),'type'=>'binary'];
         if($tag==='SimpleExprCast'||$tag==='SimpleExprConvert')return ['op'=>'cast','value'=>$this->render($ctx->expr()),'type'=>$this->castType($ctx->castType())];
         if($tag==='SimpleExprValues') {
             if(!$this->upsert)throw new \RuntimeException('VALUES() is supported only in an upsert assignment');
@@ -236,6 +237,7 @@ final class Compiler {
     }
     private function castType(object $ctx):array|string {
         $name=strtoupper($this->kids($ctx)[0]->getText());
+        if($name==='BINARY'){if(count($this->kids($ctx))!==1)throw new \RuntimeException('Sized binary casts require explicit support');return 'binary';}
         return match($name){'SIGNED'=>'bigint','UNSIGNED'=>'numeric(20)','CHAR','NCHAR'=>'text','DATETIME'=>'timestamp','DATE'=>'date','TIME'=>'time','JSON'=>'json','DECIMAL'=>self::sql(array_merge(['numeric'],array_map(fn($c)=>$this->render($c),array_slice($this->kids($ctx),1)))),'DOUBLE','REAL'=>'double precision','FLOAT'=>'real',default=>throw new \RuntimeException('Unsupported CAST type')};
     }
     private function functionArgs(object $ctx):array {
@@ -257,7 +259,7 @@ final class Compiler {
             $unit=$this->contexts($ctx,'Interval');if(!$unit)throw new \RuntimeException('DATE arithmetic requires an explicit interval');
             return ['op'=>'date_math','subtract'=>in_array($name,['DATE_SUB','SUBDATE'],true),'date'=>$args[0],'amount'=>$args[1],'unit'=>strtolower($unit[0]->getText())];
         }
-        $allowed=['VERSION','CURRENT_USER','SESSION_USER','USER','CURRENT_DATABASE','COALESCE','NULLIF','LOWER','UPPER','CONCAT','CONCAT_WS','IF','IFNULL','FIELD','RAND','NOW','CURRENT_TIMESTAMP','CURDATE','CURTIME','SYSDATE','YEAR','MONTH','DAY','DAYOFMONTH','HOUR','MINUTE','SECOND','UNIX_TIMESTAMP','ABS','ROUND','CEIL','CEILING','FLOOR','LENGTH','CHAR_LENGTH','CHARACTER_LENGTH','SUBSTRING','SUBSTR','TRIM','LTRIM','RTRIM','REPLACE','LEFT','RIGHT','MOD','MD5','REVERSE','DATE_FORMAT','GREATEST','LEAST'];
+        $allowed=['VERSION','CURRENT_USER','SESSION_USER','USER','CURRENT_DATABASE','COALESCE','NULLIF','LOWER','UPPER','CONCAT','CONCAT_WS','IF','IFNULL','FIELD','RAND','NOW','CURRENT_TIMESTAMP','CURDATE','CURTIME','SYSDATE','YEAR','MONTH','DAY','DAYOFMONTH','DAYOFYEAR','DAYOFWEEK','WEEKDAY','WEEK','HOUR','MINUTE','SECOND','UNIX_TIMESTAMP','ABS','ROUND','CEIL','CEILING','FLOOR','LENGTH','CHAR_LENGTH','CHARACTER_LENGTH','SUBSTRING','SUBSTR','TRIM','LTRIM','RTRIM','REPLACE','LEFT','RIGHT','MOD','MD5','REVERSE','DATE_FORMAT','GREATEST','LEAST'];
         if(!in_array($name,$allowed,true))throw new \RuntimeException('Unsupported MySQL function: '.$name);
         return ['op'=>'function','name'=>$name,'args'=>$args];
     }
@@ -306,11 +308,13 @@ final class Compiler {
         $this->tables=[];$this->unqualified=[];
         if($ctx->tableReferenceList()) {
             $this->bindTables($ctx->tableReferenceList());$singles=$this->contexts($ctx->tableReferenceList(),'SingleTable');
-            if(count($singles)!==2||$this->contexts($ctx,'JoinedTable'))throw new \RuntimeException('Unsupported multi-table DELETE');
+            if(count($singles)!==2)throw new \RuntimeException('Unsupported multi-table DELETE');
             $tables=array_map(fn($s)=>$this->tableName($s->tableRef()),$singles);
             if($tables[0]!==$tables[1])throw new \RuntimeException('Deleting from different physical tables requires an explicit transaction');
             $aliases=array_map(fn($s)=>$s->tableAlias()?self::id($s->tableAlias()->identifier()->getText()):null,$singles);
             $targets=$this->names($ctx->tableAliasRefList());if(in_array(null,$aliases,true)||array_diff($targets,$aliases))throw new \RuntimeException('Unsupported DELETE target aliases');
+            if(count($targets)===1)return ['op'=>'delete_self_join','table'=>$tables[0],'target'=>$targets[0],'from'=>$this->render($ctx->tableReferenceList()),'where'=>$ctx->whereClause()?$this->render($ctx->whereClause()):''];
+            if($this->contexts($ctx,'JoinedTable'))throw new \RuntimeException('Joined DELETE with multiple targets requires explicit support');
             return ['op'=>'delete_join','table'=>$tables[0],'aliases'=>$aliases,'targets'=>$targets,'where'=>$this->render($ctx->whereClause()->expr())];
         }
         $table=$this->tableName($ctx->tableRef());$alias=$ctx->tableAlias()?self::id($ctx->tableAlias()->identifier()->getText()):null;$this->tables=[$table=>$table];$this->unqualified=[$table];if($alias)$this->tables[$alias]=$table;

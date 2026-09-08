@@ -126,9 +126,14 @@ tables. A table-name equality predicate avoids loading every table's metadata.
 Metadata predicates support comparisons, AND/OR/NOT, literal IN/NOT IN lists
 (including the WordPress update-check query), LIKE, IS NULL and IS NOT
 NULL, with SQL null/truth behavior. This is deliberately a bounded metadata
-interpreter: joins, grouping, unions, subqueries, arbitrary functions, duplicate
+interpreter: joins, general grouping, unions, subqueries, arbitrary functions, duplicate
 output labels and unsupported clauses fail instead of being ignored. It is not
 an implementation of every MySQL collation or coercion rule.
+
+Version 0.9 additionally handles the core Site Health statistics query grouped
+by the unique TABLE_NAME, exact row counts, unknown physical sizes, SHOW TABLE
+STATUS and missing MySQL variables. See [core compatibility](core-compatibility.md)
+for the supported projection and maintenance boundaries.
 
 DESCRIBE of a missing table returns an empty result for dbDelta's creation probe,
 retaining the adapter's prior behavior without poisoning a controlled session.

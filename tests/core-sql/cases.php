@@ -21,6 +21,7 @@ return [
     'site_health_table_status' => ['wp-admin/includes/class-wp-debug-data.php:1923', 'SHOW TABLE STATUS'],
     'repair_check' => ['wp-admin/maint/repair.php:111', 'CHECK TABLE wp_posts'],
     'repair_repair' => ['wp-admin/maint/repair.php:121', 'REPAIR TABLE wp_posts'],
+    'repair_analyze' => ['wp-admin/maint/repair.php:134', 'ANALYZE TABLE wp_posts'],
     'repair_optimize' => ['wp-admin/maint/repair.php:143', 'OPTIMIZE TABLE wp_posts'],
     'legacy_duplicate_options' => ['wp-admin/includes/upgrade.php:3736', 'DELETE o1 FROM wp_options AS o1 JOIN wp_options AS o2 USING (option_name) WHERE o2.option_id > o1.option_id'],
     'legacy_charset_conversion' => ['wp-admin/includes/upgrade.php:2826', 'ALTER TABLE wp_posts CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'],

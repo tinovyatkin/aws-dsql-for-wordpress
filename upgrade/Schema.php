@@ -50,6 +50,21 @@ final class Schema {
                     $after['indexes']=array_merge($after['indexes'],$change['indexes']);
                 }
                 elseif($op==='drop_index') {$name=$change['name'];if(!in_array($name,array_column($after['indexes'],'Key_name'),true))throw new \RuntimeException('Unknown index');$after['indexes']=array_values(array_filter($after['indexes'],static fn($x)=>$x['Key_name']!==$name));}
+                elseif($op==='utf8mb4_upgrade') {
+                    $charset=strtolower($after['table_options']['charset']??'');
+                    if(!in_array($charset,['utf8','utf8mb3','utf8mb4'],true))throw new \RuntimeException('Only existing UTF-8 data may be widened');
+                    $target=$change['collation'];$canonical=static fn($c)=>preg_replace('/^utf8(?:mb3|mb4)?_/','utf8_',strtolower((string)$c));
+                    if(!preg_match('/^utf8mb4_[a-z0-9_]+$/D',$target))throw new \RuntimeException('Invalid UTF-8 target collation');
+                    $source=$after['table_options']['collation']??null;
+                    if($source===null||$canonical($source)!==$canonical($target))throw new \RuntimeException('Changing collation semantics is unsupported');
+                    foreach($after['columns'] as &$c){
+                        if(!preg_match('/^(?:var)?char|^(?:tiny|medium|long)?text/i',$c['Type']))continue;
+                        $collation=$c['Collation']??$source;
+                        if($canonical($collation)!==$canonical($target))throw new \RuntimeException('Column collation semantics would change');
+                        $c['Collation']=$target;
+                    }unset($c);
+                    $after['table_options']['charset']='utf8mb4';$after['table_options']['collation']=$target;
+                }
                 elseif($op==='rename') {$after['name']=$change['name'];if(!str_starts_with($after['name'],$options['table_prefix'])||str_starts_with($after['name'],'__'))throw new \RuntimeException('Invalid table rename destination');}
             }
         }

@@ -3,6 +3,11 @@
 Source audit performed on 8 September 2026 against adapter `96c24bc` (runtime
 0.8.1). This audit changes no runtime behavior and makes no database connections.
 
+Version **0.9.0** implements the bounded findings below; see the
+[implementation, remaining boundaries and execution results](core-compatibility.md).
+The original findings are retained as the historical baseline. The current probe
+set adds ANALYZE TABLE and contains 27 handled cases.
+
 ## Source and scope
 
 - Released WordPress 7.1: [WordPress/WordPress, b998fef](https://github.com/WordPress/WordPress/tree/b998fef9238af183f9523b3df71618e6e57498b6).
@@ -136,12 +141,11 @@ index behavior, locking or transaction behavior.
 
 ## Next coverage work
 
-Prioritize the concrete Site Health queries and date functions, then binary
-meta-query options. Add source-derived tests that compare results and write
-effects on disposable MySQL and DSQL fixtures. Exercise real WP_Query,
-WP_Meta_Query and WP_Date_Query parameter combinations, administrative routes,
-and version-gated upgrade routines. Re-run the inventory and query-builder diff
-for each proposed core upgrade.
+Version 0.9 covers the concrete Site Health cases, date functions and binary
+meta-query options with source-derived MySQL/DSQL comparisons. Continue expanding
+real WP_Query, WP_Meta_Query and WP_Date_Query parameter combinations and
+version-gated upgrade coverage. Re-run the inventory and query-builder diff for
+each proposed core upgrade. Collation emulation remains deferred.
 
 There is no finite static list of every possible core-generated query: arguments,
 meta/taxonomy combinations, nested queries and filters construct SQL dynamically.

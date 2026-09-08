@@ -7,6 +7,11 @@ final class Expression {
     public static function compile(Node $node,array $columns,string $database): array {
         $rule=$node->rule_name;$children=$node->get_child_nodes();$words=Ast::words($node);
         $directWords=array_map(fn($c)=>$c instanceof Node?null:strtoupper($c->get_bytes()),$node->get_children());
+        if($rule==='bit_expr'&&count($children)===2&&in_array('+',$directWords,true))return ['+',self::compile($children[0],$columns,$database),self::compile($children[1],$columns,$database)];
+        if($rule==='sum_expr'&&($directWords[0]??null)==='SUM'){
+            Ast::shape($node,['in_sum_expr'],['SUM','(',')']);
+            return ['sum',self::compile(Ast::child(Ast::child($node,'in_sum_expr'),'expr'),$columns,$database)];
+        }
         if($rule==='simple_ident'){
             $tokens=Ast::tokens($node);$name=implode('',array_map(fn($t)=>$t->get_value(),$tokens));
             foreach($columns as $column)if(strcasecmp($column,$name)===0)return ['column',str_contains($column,'.')?substr($column,strrpos($column,'.')+1):$column];
@@ -48,7 +53,7 @@ final class Expression {
         throw new \RuntimeException('Unsupported metadata expression: '.$rule);
     }
     public static function evaluate(array $expr,array $row): mixed {
-        $op=$expr[0];if($op==='column')return $row[$expr[1]]??null;if($op==='literal')return $expr[1];
+        $op=$expr[0];if($op==='sum')return self::evaluate($expr[1],$row);if($op==='column')return $row[$expr[1]]??null;if($op==='literal')return $expr[1];
         $a=self::evaluate($expr[1],$row);
         if($op==='not')return $a===null?null:!self::truth($a);if($op==='is_null')return $a===null;if($op==='is_not_null')return $a!==null;
         if($op==='in'){
@@ -62,7 +67,10 @@ final class Expression {
         if($op==='<=>')return $a===null||$b===null?$a===$b:self::compare($a,$b)===0;
         if($a===null||$b===null)return null;
         $cmp=self::compare($a,$b);
-        return match($op){'='=>$cmp===0,'<>','!='=>$cmp!==0,'<'=>$cmp<0,'>'=>$cmp>0,'<='=>$cmp<=0,'>='=>$cmp>=0,'like'=>self::like((string)$a,(string)$b),'xor'=>self::truth($a)!==self::truth($b),default=>throw new \RuntimeException('Unsupported catalog operation')};
+        return match($op){'='=>$cmp===0,'<>','!='=>$cmp!==0,'<'=>$cmp<0,'>'=>$cmp>0,'<='=>$cmp<=0,'>='=>$cmp>=0,'+'=>$a+$b,'like'=>self::like((string)$a,(string)$b),'xor'=>self::truth($a)!==self::truth($b),default=>throw new \RuntimeException('Unsupported catalog operation')};
+    }
+    public static function contains(array $expr,string $value): bool {
+        foreach($expr as $part)if(is_array($part)?self::contains($part,$value):$part===$value)return true;return false;
     }
     public static function compare(mixed $a,mixed $b): int {if($a===null||$b===null)return $a===$b?0:($a===null?-1:1);return is_numeric($a)&&is_numeric($b)?($a<=>$b):strcasecmp((string)$a,(string)$b);}
     public static function truth(mixed $value): ?bool {

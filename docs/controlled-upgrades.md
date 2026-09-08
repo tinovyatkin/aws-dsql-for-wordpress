@@ -203,10 +203,14 @@ to another cluster requires explicit connection/IAM changes and fresh validation
 
 Unsupported cases remain explicit failures: schema DDL inside an application
 transaction, populated rebuilds without a primary key, CHECK/foreign-key or
-generated-column upgrades, collation conversion, and arbitrary/lossy type
+generated-column upgrades, collation-semantic conversion, and arbitrary/lossy type
 conversions. The initial migration's broader MySQL collation/unsigned limitations
 are not removed by this milestone. New NOT NULL columns in populated tables
 need an explicit default or a reviewed backfill. Automatic updates remain paused.
+
+Version 0.9 permits metadata-only UTF-8 widening within an unchanged collation
+family through this same runner. It does not implement collation emulation. See
+[the core compatibility boundaries and recovery checks](core-compatibility.md).
 
 ## Logical catalog migration
 
