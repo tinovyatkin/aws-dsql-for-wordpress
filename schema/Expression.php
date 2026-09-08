@@ -6,6 +6,7 @@ use WPDSQL\MySQL\WordPress\WP_Parser_Node as Node;
 final class Expression {
     public static function compile(Node $node,array $columns,string $database): array {
         $rule=$node->rule_name;$children=$node->get_child_nodes();$words=Ast::words($node);
+        $directWords=array_map(fn($c)=>$c instanceof Node?null:strtoupper($c->get_bytes()),$node->get_children());
         if($rule==='simple_ident'){
             $tokens=Ast::tokens($node);$name=implode('',array_map(fn($t)=>$t->get_value(),$tokens));
             foreach($columns as $column)if(strcasecmp($column,$name)===0)return ['column',str_contains($column,'.')?substr($column,strrpos($column,'.')+1):$column];
@@ -25,7 +26,16 @@ final class Expression {
             }
             if(($words[0]??'')==='NOT'&&count($children)===2)return ['not',self::compile($children[1],$columns,$database)];
         }
-        if($rule==='predicate'&&in_array('LIKE',$words,true)){
+        if($rule==='predicate'&&in_array('IN',$directWords,true)){
+            Ast::shape($node,['bit_expr','not','expr','expr_list'],['IN','(',')',',']);
+            $values=$node->get_child_nodes('expr');
+            if($list=Ast::child($node,'expr_list'))$values=array_merge($values,Ast::nodes($list,'expr'));
+            if(!$values)throw new \RuntimeException('Literal metadata IN list required');
+            $items=[];foreach($values as $value){$literal=Ast::literal($value);if($literal['expression'])throw new \RuntimeException('Literal metadata IN list required');$items[]=['literal',$literal['value']];}
+            $expr=['in',self::compile(Ast::child($node,'bit_expr'),$columns,$database),$items];
+            return Ast::child($node,'not')?['not',$expr]:$expr;
+        }
+        if($rule==='predicate'&&in_array('LIKE',$directWords,true)){
             $nodes=array_values(array_filter($children,fn($c)=>$c->rule_name!=='not'));
             if(count($nodes)!==2||in_array('ESCAPE',$words,true))throw new \RuntimeException('Unsupported metadata LIKE');
             $expr=['like',self::compile($nodes[0],$columns,$database),self::compile($nodes[1],$columns,$database)];return in_array('NOT',$words,true)?['not',$expr]:$expr;
@@ -41,6 +51,11 @@ final class Expression {
         $op=$expr[0];if($op==='column')return $row[$expr[1]]??null;if($op==='literal')return $expr[1];
         $a=self::evaluate($expr[1],$row);
         if($op==='not')return $a===null?null:!self::truth($a);if($op==='is_null')return $a===null;if($op==='is_not_null')return $a!==null;
+        if($op==='in'){
+            if($a===null)return null;$unknown=false;
+            foreach($expr[2] as $item){$value=self::evaluate($item,$row);if($value===null){$unknown=true;continue;}if(self::compare($a,$value)===0)return true;}
+            return $unknown?null:false;
+        }
         $b=self::evaluate($expr[2],$row);
         if($op==='and')return self::truth($a)===false||self::truth($b)===false?false:($a===null||$b===null?null:true);
         if($op==='or')return self::truth($a)===true||self::truth($b)===true?true:($a===null||$b===null?null:false);

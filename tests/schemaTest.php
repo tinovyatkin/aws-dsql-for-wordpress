@@ -57,6 +57,21 @@ final class schemaTest extends TestCase {
         $meta=Model::columnDescriptor($table,$table['columns'][1],['name'=>'alias_a','table'=>'wp_t','native_type'=>'varchar'],'postgres');
         self::assertSame('VAR_STRING',$meta['native_type']);self::assertSame(253,$meta['mysqli:type']);self::assertSame('a',$meta['mysqli:orgname']);self::assertSame(160,$meta['len']);self::assertSame(4,$meta['mysqli:flags']);
     }
+    public function test_wordpress_update_check_metadata_in_predicate(): void {
+        $query=WPDSQL\MySQL\SqlParser::parse("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='postgres' AND TABLE_NAME IN ('wp_posts','wp_options') AND ENGINE='MyISAM'");
+        $where=Ast::nodes($query->tree,'where_clause')[0];$expr=Expression::compile(Ast::child($where,'expr'),['TABLE_SCHEMA','TABLE_NAME','ENGINE'],'postgres');
+        self::assertTrue(Expression::evaluate($expr,['TABLE_SCHEMA'=>'postgres','TABLE_NAME'=>'wp_posts','ENGINE'=>'MyISAM']));
+        self::assertFalse(Expression::evaluate($expr,['TABLE_SCHEMA'=>'postgres','TABLE_NAME'=>'wp_posts','ENGINE'=>'InnoDB']));
+        self::assertFalse(Expression::evaluate($expr,['TABLE_SCHEMA'=>'postgres','TABLE_NAME'=>'wp_other','ENGINE'=>'MyISAM']));
+        $query=WPDSQL\MySQL\SqlParser::parse("SHOW COLUMNS FROM wp_t WHERE (Field IN ('a','b')) AND (Field LIKE 'a%')");$where=Ast::nodes($query->tree,'where_clause')[0];
+        $expr=Expression::compile(Ast::child($where,'expr'),['Field'],'postgres');self::assertTrue(Expression::evaluate($expr,['Field'=>'a']));
+    }
+    public function test_metadata_in_and_not_in_keep_null_semantics(): void {
+        foreach([['IN',"'a'",'a',true],['IN',"'a'",'b',false],['IN',"'a',NULL",'a',true],['IN',"'a',NULL",'b',null],['NOT IN',"'a'",'b',true],['NOT IN',"'a',NULL",'b',null],['IN',"'a'",null,null]] as [$operator,$values,$input,$expected]){
+            $query=WPDSQL\MySQL\SqlParser::parse("SHOW COLUMNS FROM wp_t WHERE Field $operator ($values)");$where=Ast::nodes($query->tree,'where_clause')[0];
+            $expr=Expression::compile(Ast::child($where,'expr'),['Field'],'postgres');self::assertSame($expected,Expression::evaluate($expr,['Field'=>$input]));
+        }
+    }
     public function test_catalog_truth_uses_sql_numeric_conversion(): void {
         self::assertTrue(Expression::truth('1'));self::assertFalse(Expression::truth('0'));self::assertFalse(Expression::truth('text'));self::assertNull(Expression::truth(null));
         self::assertFalse(Expression::evaluate(['and',['literal','text'],['literal',null]],[]));

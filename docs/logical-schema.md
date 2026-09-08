@@ -123,7 +123,8 @@ resolves to it. The physical application schema remains separately configured as
 `public` or `wp_live`. Internal catalog tables are not advertised as application
 tables. A table-name equality predicate avoids loading every table's metadata.
 
-Metadata predicates support comparisons, AND/OR/NOT, LIKE, IS NULL and IS NOT
+Metadata predicates support comparisons, AND/OR/NOT, literal IN/NOT IN lists
+(including the WordPress update-check query), LIKE, IS NULL and IS NOT
 NULL, with SQL null/truth behavior. This is deliberately a bounded metadata
 interpreter: joins, grouping, unions, subqueries, arbitrary functions, duplicate
 output labels and unsupported clauses fail instead of being ignored. It is not
@@ -151,10 +152,10 @@ protocol emulation remains outside this release.
 
 The implementation was checked with:
 
-- 45 PHPUnit tests / 171 assertions, including AST/model round trips, default and
+- 47 PHPUnit tests / 182 assertions, including AST/model round trips, default and
   comment preservation, unsupported grammar branches, version compatibility,
   catalog protection, pending-state checks and logical result descriptors;
-- 19 live synthetic schema/introspection checks, including cross-connection
+- 20 live synthetic schema/introspection checks, including cross-connection
   persistence and failure before installation publication;
 - 12 read-only restored WordPress column/result metadata checks;
 - five live catalog-migration checks: read-only legacy normalization, interruption,
