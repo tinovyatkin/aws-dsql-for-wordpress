@@ -1,6 +1,6 @@
 # Standalone MySQL-on-DSQL engine
 
-Adapter 0.7 implements the first milestone from the
+Adapter 0.7 introduced the first milestone from the
 [SQLite architecture review](sqlite-architecture-review.md): a standalone engine
 and explicit WordPress compatibility contracts. The existing parser, compiler,
 renderer, value codec, cache and controlled-upgrade algorithm remain in use.
@@ -64,7 +64,12 @@ The returned `Result` is buffered and independent of later queries. It supports:
 
 Values retain the adapter's string/null contract, temporal sentinel conversion
 and optional text-codec decoding. Metadata retains the existing native-column
-information; complete MySQL/mysqli type and flag reconstruction is not claimed.
+information; complete MySQL/mysqli type and flag reconstruction is not claimed. Version 0.8
+adds `Driver::columnMeta(Result, offset)` for logical MySQL metadata on direct
+column projections, including original names for aliases. WordPress
+`get_col_info()` uses that method; native `Result::getColumnMeta()` remains
+available and buffered results do not retain a PDO connection. Computed or
+unresolvable columns retain native metadata.
 Unsupported fetch modes fail explicitly.
 
 ## Ownership and state
@@ -142,11 +147,9 @@ Deploy this release as a complete artifact including `engine/`, updated Composer
 autoload files, `pg4wp/`, parser, migration and upgrade files. Do not copy only the
 WordPress shim. The implementation work does not deploy staging or production.
 
-## Next milestone
+## Logical schema adoption
 
-The schema model remains unchanged in this release. Next: replace the separate
-DDL tokenizer with schema operations derived from the standalone AST, unify
-installation/restoration metadata, and adopt the broader `SHOW` / supported
-`INFORMATION_SCHEMA` / column contracts from the SQLite project. Evolve the
-catalog through a versioned migration while retaining DSQL's controlled physical
-schema publication. Those changes are not prerequisites for using this engine.
+Version 0.8 implements the shared logical model, AST-derived DDL, catalog migration,
+metadata query support and WordPress column contracts described in
+[the logical-schema documentation](logical-schema.md). The installation, binding,
+retry and controlled-upgrade boundaries introduced here remain in place.

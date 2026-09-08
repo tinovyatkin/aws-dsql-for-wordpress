@@ -1,9 +1,9 @@
 # MySQL translation and caching
 
-Adapter **0.7.0** uses WordPress's standalone MySQL parse tree for ordinary SQL
+Adapter **0.8.0** uses WordPress's standalone MySQL parse tree for ordinary SQL
 translation. The old PG4WP regex rewriters have been removed. Metadata requests
-continue through the adapter's bounded MySQL catalog emulation. Controlled schema
-changes pass MySQL syntax validation and the existing migration-aware schema
+use AST dispatch and the shared logical MySQL catalog. Controlled schema
+changes derive supported operations from the MySQL AST and use the migration-aware schema
 planner; they are not cached as ordinary queries.
 
 ## Request flow
@@ -135,7 +135,7 @@ ceiling with an 83 MiB peak. The adapter no longer raises WordPress's memory lim
 when compiling a query. These figures describe the tested fixtures, not a memory
 limit guaranteed to fit every site.
 
-Deploy the complete release, including `engine/`, `parser/mysql/`, `pg4wp/`, `upgrade/`,
+Deploy the complete release, including `engine/`, `schema/`, `parser/mysql/`, `pg4wp/`, `upgrade/`,
 `migration/`, scripts, Composer files, and installed dependencies. Native
 `mbstring` and `pdo_pgsql` remain required by the adapter. No Java, ANTLR runtime,
 or Rust extension is needed. Release fingerprints isolate plans from the

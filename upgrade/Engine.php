@@ -41,7 +41,6 @@ final class Engine {
         if($this->pdo->inTransaction())throw new \RuntimeException('Schema changes inside application transactions require a dedicated migration');
         $this->session->assertActive();if($this->session->operation())throw new \RuntimeException('Pending DDL must be recovered first');
 
-        \WPDSQL\MySQL\SqlParser::parse($sql);
         $ddl=(new Schema($sql))->parse();$before=$this->metadata($ddl['table']);$oid=$this->oid($ddl['table']);
         if($oid&&!$before)throw new \RuntimeException('Existing table is not in the migration catalog');
         if(!$oid&&$before)throw new \RuntimeException('Catalogued table is missing');
@@ -66,6 +65,7 @@ final class Engine {
     }
     public function recover(): void {
         $this->session->data['failed']=false;$this->session->save();$this->session->assertActive();
+        if($this->session->data['catalog_migration']??false){$this->migrateCatalog();return;}
         if($op=$this->session->operation())$this->run($op);
     }
     public function cancel(): void {
@@ -241,9 +241,20 @@ final class Engine {
         foreach($rows as $row){$parts=[];foreach($row as $i=>$v){$binary=Plan::type($columns[$i])==='bytea';$parts[]=$binary?"decode(?,'base64')":'?';$params[]=$binary&&$v!==null?base64_encode($v):$v;}$values[]='('.implode(',',$parts).')';}
         $s=$this->pdo->prepare('INSERT INTO '.self::table($table).' ('.implode(',',array_map(static fn($c)=>self::q($c['Field']),$columns)).') VALUES '.implode(',',$values));$s->execute($params);
     }
+    public function migrateCatalog(): array {
+        $this->session->assertActive();
+        if($this->session->operation())throw new \RuntimeException('Recover pending schema changes before catalog migration');
+        $this->session->data['verified']=false;$this->session->data['catalog_migration']=2;$this->session->save();
+        $count=$this->catalog->migrate($this->session->directory,function(){
+            if(($this->session->data['target']['classification']??'')==='synthetic'&&getenv('DSQL_UPGRADE_FAULT')==='catalog-after-write'){$this->session->fail();exit(86);}
+        });
+        unset($this->session->data['catalog_migration']);$this->session->save();
+        return ['schema_version'=>2,'migrated_tables'=>$count];
+    }
     public function verify(): array {
+        if($this->session->data['catalog_migration']??false)throw new \RuntimeException('Recover the incomplete catalog migration before verification');
         $this->session->assertActive();if($this->session->operation())throw new \RuntimeException('Pending schema operation');
-        $tables=$this->pdo->query("SELECT table_name FROM wp_live.__wp_dsql_schema")->fetchAll(\PDO::FETCH_COLUMN);$count=0;
+        $tables=$this->catalog->names();$count=0;
         foreach($tables as $table){$this->catalog->get($table);$count++;}
         return ['catalogued_tables'=>$count,'pending_operations'=>0];
     }

@@ -11,7 +11,11 @@ final class Result {
         public readonly string $operation,
         public readonly bool $command = false,
         public readonly int $insertId = 0,
+        private readonly string $sourceSql = '',
+        private readonly string $sourceMode = '',
     ) {}
+    public function sourceQuery(): string {return $this->sourceSql;}
+    public function sourceSqlMode(): string {return $this->sourceMode;}
     public function rowCount(): int { return $this->affectedRows; }
     public function columnCount(): int { return count($this->columns); }
     public function getColumnMeta(int $column): array|false { return $this->columns[$column] ?? false; }

@@ -20,6 +20,8 @@ final class EngineTestPdo extends PDO {
     }
     public function run(string $sql, array $params): array {
         $this->calls[] = [$sql, $params];
+        if(str_contains($sql,'AS catalog_exists'))return ['rows'=>[]];
+        if(str_contains($sql,"WHERE fingerprint='pending'"))return ['rows'=>[]];
         if ($this->handler) { return ($this->handler)($sql, $params); }
         if (str_contains($sql, '__wp_dsql_schema')) { throw new PDOException('SQLSTATE[42P01]: missing catalog'); }
         if (preg_match('/^(BEGIN|COMMIT|ROLLBACK)$/', trim($sql), $m)) {

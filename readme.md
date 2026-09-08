@@ -28,9 +28,11 @@ wp-content/db.php → DSQL_WPDB → standalone MySQL-on-DSQL engine
 AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent worker
 ```
 
-Version 0.7 separates the WordPress shim from a standalone engine that owns
-connection renewal, SQL execution, session state, retries and buffered results.
-See [the engine API and compatibility tests](docs/standalone-engine.md).
+Version 0.8 adds one logical MySQL schema model for installation, restored
+metadata, AST-derived DDL and introspection. The standalone engine owns connection
+renewal, SQL execution, session state, retries and buffered results. See
+[the engine API](docs/standalone-engine.md) and
+[the logical schema and catalog migration](docs/logical-schema.md).
 
 The DSQL implementation:
 
@@ -189,7 +191,9 @@ and [parser sources, maintenance, and the Rust evaluation](docs/mysql-parser.md)
   MySQL metadata catalog, so unchanged schemas compare correctly. Schema changes
   on those tables require the controlled CLI runner; ordinary requests cannot
   perform them. Keep automatic core/plugin updates disabled.
-  Fresh tables created outside the restore path still have partial introspection.
+  New installations retain logical MySQL metadata. Older tables without a saved
+  catalog use explicitly inferred PostgreSQL metadata until a verified source
+  definition is provided.
 - The DSQL emitter supports a tested subset of the MySQL grammar and fails on
   unimplemented constructs. Arbitrary plugin SQL, multisite, MySQL collations,
   unsigned integer semantics, and unusual schema changes need separate work

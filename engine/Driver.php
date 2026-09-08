@@ -25,6 +25,9 @@ final class Driver {
     private float $connectedAt = 0;
     private bool $closed = false;
     private array $indexJobs = [];
+    private array $pendingTables = [];
+    private bool $catalogChecked = false;
+    private \WPDSQL\Schema\Introspection $introspection;
     private int $queries = 0;
     private int $retries = 0;
     private string $stage = 'connect';
@@ -55,6 +58,8 @@ final class Driver {
             }
             $this->pdo = $pdo;
             $this->schemaCatalog = new DSQL_Schema_Catalog($pdo);
+            $this->introspection = new \WPDSQL\Schema\Introspection($pdo,$this->schemaCatalog,$this->schema,$this->config->database);
+            $this->catalogChecked=false;
             $this->schemaUpgrade = $upgrade;
             $this->connectedAt = ($this->clock)();
         } catch (\Throwable $error) {
@@ -78,7 +83,7 @@ final class Driver {
             $this->closed = true;
             $this->schemaUpgrade = null;
             $this->upgradeSession = null;
-            unset($this->translator, $this->schemaCatalog);
+            unset($this->translator, $this->schemaCatalog, $this->introspection);
             $this->pdo = null;
             $this->indexJobs = [];
         }
@@ -118,6 +123,8 @@ final class Driver {
                     throw new RuntimeException('Schema changes on restored tables require the controlled DSQL upgrade runner');
                 }
             }
+            if(!$this->isDdl()&&($this->indexJobs||$this->pendingTables))$this->waitForIndexes();
+            if(!$this->isDdl()&&!$this->catalogChecked){$this->schemaCatalog->assertReadable($this->config->tablePrefix);$this->catalogChecked=true;}
             $emulated = $this->metadataQuery($query);
             $rows = [];
             $columns = [];
@@ -134,6 +141,8 @@ final class Driver {
                 }
                 $this->stage = 'translate';
                 $statements = $this->translator->translate($query);
+                $logical=$statements[0]['logical_table']??null;
+                if($logical)$this->schemaCatalog->beginInstallation($logical);
                 $this->stage = 'execute';
                 $atomic = !empty($statements[0]['atomic']);
                 $outerTransaction = $this->pdo->inTransaction();
@@ -164,6 +173,10 @@ final class Driver {
                         usleep(random_int(10000, 30000) * (2 ** $attempt));
                     }
                 }
+                if($logical)$this->pendingTables[$logical['name']]=$logical;
+                if(isset($statements[0]['logical_drop'])&&$this->schemaCatalog->exists()){
+                    $this->schemaCatalog->remove($statements[0]['logical_drop']);unset($this->pendingTables[$statements[0]['logical_drop']]);
+                }
                 if (!$deferIndexWait) { $this->waitForIndexes(); }
             }
             $this->stage = 'decode';
@@ -183,21 +196,26 @@ final class Driver {
             }
             unset($row);
             return new Result($rows, $columns, $affected, $operation,
-                in_array($operation, ['CREATE','ALTER','DROP','RENAME','TRUNCATE','BEGIN','START','COMMIT','ROLLBACK'], true), $insertId);
+                in_array($operation, ['CREATE','ALTER','DROP','RENAME','TRUNCATE','BEGIN','START','COMMIT','ROLLBACK'], true), $insertId, $query, $this->translator->sqlMode());
         } catch (\Throwable $error) {
-            if ($this->upgradeSession) {
-                $this->upgradeSession->fail();
-                file_put_contents($this->upgradeSession->directory.'/failure.txt', $error->getMessage());
-                chmod($this->upgradeSession->directory.'/failure.txt', 0600);
-            }
-            if ($error instanceof QueryException) { throw $error; }
-            throw new QueryException($error, $this->stage, $this->operation, $this->retries, $this->upgradeSession !== null);
+            $this->fail($error,$this->stage,$this->operation,$this->retries);
         } finally {
             if ($this->isDdl() && isset($this->translator)) {
+                $this->catalogChecked=false;
                 $this->schemaCatalog->clear();
                 $this->translator->refreshSchemaMetadata();
+                $this->introspection->clear();
             }
         }
+    }
+    private function fail(\Throwable $error,string $stage,string $operation,int $retries=0): never {
+        if($error instanceof QueryException){$stage=$error->stage;$operation=$error->operation;$retries=$error->retries;$error=$error->nativeFailure();}
+        if($this->upgradeSession){
+            $this->upgradeSession->fail();
+            file_put_contents($this->upgradeSession->directory.'/failure.txt',$error->getMessage());
+            chmod($this->upgradeSession->directory.'/failure.txt',0600);
+        }
+        throw new QueryException($error,$stage,$operation,$retries,$this->upgradeSession!==null);
     }
     private function isDdl(): bool { return in_array($this->operation, ['CREATE','ALTER','DROP','RENAME','TRUNCATE'], true); }
     public function enableSchemaUpgrade(\WPDSQLUpgrade\Session $session): void {
@@ -217,12 +235,16 @@ final class Driver {
         $s->execute([$table, $column]);
     }
     public function waitForIndexes(): void {
+        if(!$this->indexJobs&&!$this->pendingTables)return;
         foreach ($this->indexJobs as $job) {
             $wait = $this->pdo->prepare('CALL sys.wait_for_job(?)');
             $wait->execute([$job]);
             if (!$wait->fetchColumn()) { throw new RuntimeException('DSQL index build failed'); }
         }
         $this->indexJobs = [];
+        foreach($this->pendingTables as $table)$this->schemaCatalog->finishInstallation($table);
+        $this->pendingTables=[];
+        $this->introspection->clear();
     }
     private function execute(string $sql, array $params = []): PDOStatement {
         for ($attempt = 0; ; $attempt++) {
@@ -239,61 +261,39 @@ final class Driver {
             }
         }
     }
-    /** Emulate the metadata queries used by install/dbDelta and wpdb. */
+    /** Session variables remain local; schema metadata is dispatched through its AST. */
     private function metadataQuery(string $query): ?array {
-        // Core's update check asks whether any tables use the MyISAM engine.
-        // DSQL has no MyISAM tables.
-        if (preg_match('/^\s*SELECT\s+TABLE_NAME\s+FROM\s+information_schema\.TABLES\b/i', $query)
-            && preg_match('/\bENGINE\s*=\s*[\'"]MyISAM[\'"]/i', $query)) {
-            return [];
-        }
-        if (preg_match('/^\s*SELECT\s+COUNT\(\*\)\s+FROM\s+information_schema\.statistics\b/i',$query)
-            && preg_match('/index_type\s*=\s*[\'"]FULLTEXT[\'"]/i',$query)) { return [['count'=>'0']]; }
-        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?autocommit\s*;?\s*$/i',$query)) { return [['autocommit'=>$this->pdo->inTransaction()?'0':'1']]; }
-        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode\s*;?\s*$/i', $query)) { return [['sql_mode' => $this->translator->sqlMode()]]; }
-        if (preg_match('/^\s*SHOW\s+INDEX(?:ES)?\s+FROM\s+[\x60"]?(\w+)[\x60"]?\s*;?\s*$/i', $query, $m)) {
-            $saved = $this->schemaCatalog->get($m[1]);
-            if ($saved) { return $saved['indexes']; }
-            $stmt = $this->pdo->prepare("SELECT t.relname AS \"Table\",
-                CASE WHEN i.indisunique THEN 0 ELSE 1 END AS \"Non_unique\",
-                CASE WHEN i.indisprimary THEN 'PRIMARY' ELSE substr(idx.relname, length(t.relname)+2) END AS \"Key_name\",
-                k.ordinality AS \"Seq_in_index\", a.attname AS \"Column_name\",
-                NULL AS \"Sub_part\", 'BTREE' AS \"Index_type\", 'A' AS \"Collation\"
-                FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid
-                JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class idx ON idx.oid=i.indexrelid
-                CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
-                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum
-                WHERE t.relname=? AND n.nspname=? AND i.indisvalid
-                ORDER BY idx.relname, k.ordinality");
-            $stmt->execute([$m[1],$this->schema]);
-            return $stmt->fetchAll(PDO::FETCH_ASSOC);
-        }
-        if (preg_match('/^\s*SHOW\s+(?:FULL\s+)?TABLES(?:\s+LIKE\s+(.+))?/i', $query, $m)) {
-            $sql = "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = '".$this->schema."'";
-            if (isset($m[1])) { $sql .= ' AND tablename LIKE ' . $this->translator->quote_mysql_literal(rtrim(trim($m[1]), ';')); }
-            return $this->pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
-        }
-        if (preg_match('/^\s*(?:DESCRIBE|DESC|SHOW\s+(?:FULL\s+)?COLUMNS\s+FROM)\s+[\x60"]?(\w+)[\x60"]?\s*;?\s*$/i', $query, $m)) {
-            $saved = $this->schemaCatalog->get($m[1]);
-            if ($saved) { return $saved['columns']; }
-            $stmt = $this->pdo->prepare("SELECT column_name, data_type, is_nullable, column_default, character_maximum_length, is_identity
-                FROM information_schema.columns WHERE table_name = ? AND table_schema = ? ORDER BY ordinal_position");
-            $stmt->execute([$m[1],$this->schema]);
-            return array_map(static function ($r) {
-                $type = match ($r['data_type']) {
-                    'character varying' => 'varchar(' . $r['character_maximum_length'] . ')',
-                    'timestamp without time zone' => 'datetime', 'integer' => 'int', default => $r['data_type'],
-                };
-                $default = $r['column_default'];
-                if (is_string($default) && preg_match("/^'((?:[^']|'')*)'::/", $default, $value)) {
-                    $default = str_replace("''", "'", $value[1]);
-                    if ($default === '0001-01-01 00:00:00') { $default = '0000-00-00 00:00:00'; }
-                }
-                return ['Field' => $r['column_name'], 'Type' => $type, 'Null' => $r['is_nullable'], 'Key' => '',
-                    'Default' => $default, 'Extra' => $r['is_identity'] === 'YES' ? 'auto_increment' : '',
-                    'Collation' => 'utf8mb4_unicode_ci'];
-            }, $stmt->fetchAll(PDO::FETCH_ASSOC));
+        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?autocommit\s*;?\s*$/i',$query)) return [['autocommit'=>$this->pdo->inTransaction()?'0':'1']];
+        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode\s*;?\s*$/i',$query)) return [['sql_mode'=>$this->translator->sqlMode()]];
+        if(in_array($this->operation,['SHOW','DESCRIBE','DESC'],true)||($this->operation==='SELECT'&&preg_match('/\binformation_schema\s*\./i',$query))) {
+            return $this->introspection->query($query,$this->translator->sqlMode());
         }
         return null;
+    }
+    /** Logical metadata is requested explicitly; ordinary result fetching adds no catalog work. */
+    public function columnMeta(Result $result,int $position): array|false {
+        $native=$result->getColumnMeta($position);if(!$native||empty($native['table']))return $native;
+        $table=$this->logicalTable($native['table']);if(!$table)return $native;
+        $name=$native['name'];$sql=$result->sourceQuery();
+        if($sql!==''&&$result->operation==='SELECT'){
+            $parsed=\WPDSQL\MySQL\SqlParser::parse($sql,sqlMode:$result->sourceSqlMode());
+            $specs=\WPDSQL\Schema\Ast::nodes($parsed->tree,'query_specification');
+            if(count($specs)===1){
+                $items=\WPDSQL\Schema\Ast::nodes($specs[0],'select_item');
+                if(count($items)===$result->columnCount()&&isset($items[$position])){
+                    $expr=\WPDSQL\Schema\Ast::child($items[$position],'expr');
+                    $idents=$expr?\WPDSQL\Schema\Ast::nodes($expr,'simple_ident'):[];
+                    if(count($idents)===1&&\WPDSQL\Schema\Ast::text($expr)===\WPDSQL\Schema\Ast::text($idents[0])){
+                        $tokens=\WPDSQL\Schema\Ast::tokens($idents[0]);$name=end($tokens)->get_value();
+                    }
+                }
+            }
+        }
+        foreach($table['columns'] as $column)if(strcasecmp($column['Field'],$name)===0)return \WPDSQL\Schema\Model::columnDescriptor($table,$column,$native,$this->config->database);
+        return $native;
+    }
+    public function logicalTable(string $name): ?array {
+        try{$this->checkConnection();$this->waitForIndexes();return $this->introspection->qualifiedTable($name);}
+        catch(\Throwable $error){$this->fail($error,'metadata','SHOW');}
     }
 }

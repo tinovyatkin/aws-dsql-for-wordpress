@@ -75,7 +75,7 @@ final class DSQL_SQL {
     private function ddl(string $mysql):array {
         if((new DSQL_Schema_Catalog($this->pdo))->managed())throw new RuntimeException('Restored schema changes require the controlled upgrade runner');
         require_once dirname(__DIR__,2).'/upgrade/Engine.php';
-        $change=(new WPDSQLUpgrade\Schema($mysql))->parse();
+        $change=(new WPDSQLUpgrade\Schema($mysql,$this->schema,$this->mode))->parse();
         if($change['kind']==='create') {
             if($change['if_exists']){$exists=$this->pdo->prepare('SELECT 1 FROM pg_tables WHERE schemaname=? AND tablename=?');$exists->execute([$this->schema,$change['table']]);if($exists->fetchColumn())return [];}
             $table=WPDSQLUpgrade\Schema::apply($change,null,['table_prefix'=>$this->tablePrefix,'allow_destructive'=>false,'omit_fulltext_indexes'=>[]]);
@@ -85,6 +85,9 @@ final class DSQL_SQL {
         }elseif($change['kind']==='drop') {
             $sql=['DROP TABLE '.(($change['if_exists']??false)?'IF EXISTS ':'').Renderer::qi($change['table'])];
         }else throw new RuntimeException('Schema alteration requires the controlled upgrade runner');
-        return array_map(fn($q)=>['sql'=>$q,'params'=>[]],$sql);
+        $statements=array_map(fn($q)=>['sql'=>$q,'params'=>[]],$sql);
+        if($change['kind']==='create')$statements[0]['logical_table']=$table;
+        if($change['kind']==='drop')$statements[0]['logical_drop']=$change['table'];
+        return $statements;
     }
 }

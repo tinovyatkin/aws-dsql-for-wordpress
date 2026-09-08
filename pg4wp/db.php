@@ -3,7 +3,7 @@
 Plugin Name: AWS DSQL for WordPress
 Plugin URI: https://github.com/tinovyatkin/aws-dsql-for-wordpress
 Description: Experimental Aurora DSQL database drop-in, derived from PostgreSQL for WordPress.
-Version: 0.7.0
+Version: 0.8.0
 Author: tinovyatkin and PG4WP contributors
 License: GPLv2 or newer.
 */

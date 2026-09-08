@@ -50,7 +50,7 @@ function checkBackup(array $t,string $reference): void {
     if(time()-$r['CreationDate']->getTimestamp()>86400)throw new RuntimeException('Use a fresh backup from the last 24 hours');
 }
 try {
-    if($action==='help'){echo "upgrade.php begin|exec|recover|cancel|verify|finish|status --session=/private/run [options] [-- WP-CLI command]\nSee docs/controlled-upgrades.md.\n";exit;}
+    if($action==='help'){echo "upgrade.php begin|exec|recover|cancel|catalog-migrate|verify|finish|status --session=/private/run [options] [-- WP-CLI command]\nSee docs/controlled-upgrades.md.\n";exit;}
     $directory=$args['session']??throw new RuntimeException('Session path required');
     if($action==='begin') {
         if(($args['writers-frozen']??'')!=='yes')throw new RuntimeException('Pause and drain all external writers before beginning');
@@ -93,21 +93,21 @@ try {
     }
     $session=new Session($directory,false);
     $controller=fopen($directory.'/controller.lock','c');if(!flock($controller,LOCK_EX|LOCK_NB))throw new RuntimeException('Upgrade controller already running');
-    if($action==='status') {echo json_encode(['id'=>$session->data['id'],'closed'=>$session->data['closed'],'failed'=>$session->data['failed'],'verified'=>$session->data['verified'],'pending_phase'=>$session->operation()['phase']??null]),"\n";exit;}
+    if($action==='status') {echo json_encode(['id'=>$session->data['id'],'closed'=>$session->data['closed'],'failed'=>$session->data['failed'],'verified'=>$session->data['verified'],'pending_phase'=>$session->operation()['phase']??null,'catalog_migration_pending'=>(bool)($session->data['catalog_migration']??false)]),"\n";exit;}
     if($action==='plan') {
         $locked=new Session($directory);$engine=new Engine(connection($locked->data['target']),$locked);
         $sql=file_get_contents($args['sql-file']??throw new RuntimeException('A single-statement --sql-file is required'));
         $plan=$engine->plan($sql);Session::write($directory.'/preview.json',['plan'=>$plan]);
         echo json_encode(['mode'=>$plan['mode']??'noop','table'=>$plan['original']??null,'columns_after'=>count($plan['after']['columns']??[]),'indexes_after'=>count($plan['after']['indexes']??[]),'details_file'=>$directory.'/preview.json']),"\n";exit;
     }
-    if(in_array($action,['recover','cancel'],true)) {
+    if(in_array($action,['recover','cancel','catalog-migrate'],true)) {
         $locked=new Session($directory);$guard=Session::guard($locked->data['wordpress']);
         if($locked->data['closed']||!is_file($guard)||trim(file_get_contents($guard))!==$locked->data['id'])throw new RuntimeException('Recovery requires this session\'s active maintenance guard');
         $p=connection($locked->data['target']);
         if(!$p->query("SELECT run_id FROM wp_live.__wp_dsql_upgrade_lock WHERE id='schema'")->fetchColumn()){$s=$p->prepare("INSERT INTO wp_live.__wp_dsql_upgrade_lock (id,run_id) VALUES ('schema',?)");$s->execute([$locked->data['id']]);}
         $engine=new Engine($p,$locked);
-        try {$action==='recover'?$engine->recover():$engine->cancel();}catch(Throwable $e){$locked->fail();throw $e;}
-        echo "Schema recovery completed; rerun the interrupted idempotent command and verify before finishing.\n";exit;
+        try {if($action==='catalog-migrate'){echo json_encode($engine->migrateCatalog(),JSON_THROW_ON_ERROR)."\n";}elseif($action==='recover'){$engine->recover();}else{$engine->cancel();}}catch(Throwable $e){$locked->fail();throw $e;}
+        echo $action==='catalog-migrate'?"Catalog migration completed; verify before finishing.\n":"Schema recovery completed; rerun the interrupted idempotent command and verify before finishing.\n";exit;
     }
     if($action==='finish') {
         if($session->data['closed']) {

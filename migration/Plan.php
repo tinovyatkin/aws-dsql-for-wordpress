@@ -2,8 +2,20 @@
 namespace WPDSQLMigration;
 /** Generate DSQL schema from inspected MySQL metadata, never execute a SQL dump. */
 final class Plan {
+    private static function unsupportedStructure(string $sql): bool {
+        if($sql==='')return false;
+        if(!class_exists(\WPDSQL\MySQL\SqlParser::class)){
+            foreach(['ParseException','ParsedQuery','SqlParser'] as $file)require_once dirname(__DIR__).'/parser/mysql/'.$file.'.php';
+        }
+        $query=\WPDSQL\MySQL\SqlParser::parse($sql);
+        $tokens=array_map(fn($t)=>strtoupper($t->get_bytes()),$query->tokens);
+        for($i=0;$i<count($tokens);$i++){
+            if(($tokens[$i]==='FOREIGN'&&($tokens[$i+1]??'')==='KEY')||($tokens[$i]==='CHECK'&&($tokens[$i+1]??'')==='(')||($tokens[$i]==='PARTITION'&&($tokens[$i+1]??'')==='BY'))return true;
+        }return false;
+    }
     public static function type(array $c): string {
         $t=strtolower($c['Type']);
+        if((($c['DefaultExpression']??false)||str_contains($c['Extra']??'','DEFAULT_GENERATED'))&&(!self::temporal($c)||!preg_match('/^CURRENT_TIMESTAMP(?:\([0-6]?\))?$/i',(string)($c['Default']??''))))throw new \RuntimeException('Unsupported default expression requires a dedicated migration');
         if (preg_match('/\b(zerofill|binary)\b/',$t) || preg_match('/(?:VIRTUAL|STORED)\s+GENERATED|on update|INVISIBLE/i',$c['Extra']??'')) { throw new \RuntimeException('Unsupported generated/automatic/binary column behavior'); }
         if (str_contains($c['Extra']??'','auto_increment')) {
             if (!preg_match('/^(tinyint|smallint|mediumint|int|bigint)/',$t)) { throw new \RuntimeException('Unsupported identity type'); }
@@ -49,13 +61,13 @@ final class Plan {
     public static function tableName(array $t): string { return Backup::qi($t['target_schema']??'public').'.'.Backup::qi($t['name']); }
     public static function ddl(array $t,\PDO $pdo): array {
         $fields=[];$groups=self::indexes($t);
-        if (preg_match('/\bFOREIGN\s+KEY\b|\bCHECK\s*\(|\bPARTITION\s+BY\b/i',$t['mysql_ddl'])) { throw new \RuntimeException('Explicit constraint/partition translation is required'); }
+        if (self::unsupportedStructure($t['mysql_ddl'])) { throw new \RuntimeException('Explicit constraint/partition translation is required'); }
         foreach ($t['columns'] as $c) {
             $type=self::type($c);$line=Backup::qi($c['Field']).' '.$type;
             if ($c['Null']==='NO') { $line.=' NOT NULL'; }
             if (!str_contains($c['Extra']??'','auto_increment') && $c['Default']!==null) {
                 $value=(string)$c['Default'];
-                $line.=' DEFAULT '.(preg_match('/^CURRENT_TIMESTAMP(?:\(\d*\))?$/i',$value)&&self::temporal($c) ? 'CURRENT_TIMESTAMP' : $pdo->quote(self::convert($value,$c,false,$t['value_codec']??false)));
+                $line.=' DEFAULT '.(($c['DefaultExpression']??(bool)preg_match('/^CURRENT_TIMESTAMP(?:\(\d*\))?$/i',$value))&&self::temporal($c) ? 'CURRENT_TIMESTAMP' : $pdo->quote(self::convert($value,$c,false,$t['value_codec']??false)));
             }
             if (str_starts_with(strtolower($c['Type']), 'enum(')) {
                 $values=str_getcsv(substr($c['Type'],5,-1),',',"'",'\\');
@@ -80,7 +92,7 @@ final class Plan {
             $label=$t['name'];$columns=$t['columns'];$hashes=[];$count=0;
             try {
                 if (strlen($label)>63 || count($columns)>255) { throw new \RuntimeException('DSQL identifier/column limit'); }
-                if (preg_match('/\bFOREIGN\s+KEY\b|\bCHECK\s*\(|\bPARTITION\s+BY\b/i',$t['mysql_ddl'])) { throw new \RuntimeException('Explicit constraint/partition translation is required'); }
+                if (self::unsupportedStructure($t['mysql_ddl'])) { throw new \RuntimeException('Explicit constraint/partition translation is required'); }
                 foreach ($columns as $c) {if (strlen($c['Field'])>63) throw new \RuntimeException('A column identifier exceeds the PostgreSQL 63-byte limit');}
                 $types=[];foreach ($columns as $c) { $types[]=self::type($c); }
                 $groups=self::indexes($t);

@@ -207,3 +207,11 @@ generated-column upgrades, collation conversion, and arbitrary/lossy type
 conversions. The initial migration's broader MySQL collation/unsigned limitations
 are not removed by this milestone. New NOT NULL columns in populated tables
 need an explicit default or a reviewed backfill. Automatic updates remain paused.
+
+## Logical catalog migration
+
+Adapter 0.8 reads old metadata without changing it. To persist the version-2
+logical model, run `catalog-migrate` inside an existing controlled session after
+its usual backup and writer-freeze checks. The command journals legacy metadata,
+keeps physical fingerprints unchanged, and requires verification before finish.
+Use `recover` after interruption. See [the catalog migration procedure](logical-schema.md).

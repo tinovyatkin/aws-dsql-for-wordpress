@@ -84,16 +84,29 @@ class DSQL_WPDB extends wpdb {
         if (!is_scalar($data)) { return ''; }
         return $this->add_placeholder_escape($this->get_driver()->escape((string) $data));
     }
-    // Full logical-schema column contracts are the next adoption milestone.
-    public function get_col_charset($table, $column) { return 'utf8mb4'; }
-    public function get_col_length($table, $column) { return false; }
+    public function get_col_charset($table, $column) {
+        $old=$this->is_mysql;try{$this->is_mysql=true;return parent::get_col_charset($table,$column);}finally{$this->is_mysql=$old;}
+    }
+    public function get_col_length($table, $column) {
+        // PostgreSQL TEXT cannot reveal whether legacy MySQL declared TEXT or LONGTEXT.
+        // Preserve the previous unbounded behavior rather than invent a truncation limit.
+        $start=microtime(true);
+        try{if(($this->get_driver()->logicalTable($table)['inferred']??false))return false;}
+        catch(QueryException $error){
+            $this->last_error=$error->nativeFailure()->getMessage();
+            $this->recordFailure($error->nativeFailure(),'SHOW FULL COLUMNS FROM '.\WPDSQL\Schema\Model::identifier($table),'metadata',$start);
+            if($error->controlledUpgrade)throw new RuntimeException($error->getMessage());
+            return new WP_Error('wpdb_get_col_length_failure','Could not retrieve table metadata.');
+        }
+        $old=$this->is_mysql;try{$this->is_mysql=true;return parent::get_col_length($table,$column);}finally{$this->is_mysql=$old;}
+    }
     protected function check_safe_collation($query) { return true; }
     protected function load_col_info() {
         $this->col_info = [];
         if ($this->result instanceof Result) {
             for ($i = 0; $i < $this->result->columnCount(); $i++) {
-                $meta = $this->result->getColumnMeta($i);
-                $this->col_info[] = (object) ['name'=>$meta['name'], 'type'=>$meta['native_type'] ?? 'text'];
+                $meta = $this->get_driver()->columnMeta($this->result,$i);
+                $this->col_info[] = (object) ['name'=>$meta['name'],'orgname'=>$meta['mysqli:orgname']??$meta['name'],'table'=>$meta['table']??'','orgtable'=>$meta['mysqli:orgtable']??($meta['table']??''),'db'=>$meta['mysqli:db']??'','type'=>$meta['mysqli:type']??($meta['native_type']??'text'),'length'=>$meta['len']??0,'decimals'=>$meta['precision']??0,'flags'=>$meta['mysqli:flags']??0,'charsetnr'=>$meta['mysqli:charsetnr']??null];
             }
         }
     }
@@ -156,6 +169,7 @@ class DSQL_WPDB extends wpdb {
             return false;
         } finally {
             $this->num_queries += $driver->queryCount() - $before;
+            if(in_array($operation,['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true)){$this->col_meta=[];$this->table_charset=[];}
         }
     }
     public function enable_schema_upgrade(\WPDSQLUpgrade\Session $session): void { $this->get_driver()->enableSchemaUpgrade($session); }

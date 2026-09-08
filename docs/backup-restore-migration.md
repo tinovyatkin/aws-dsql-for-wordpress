@@ -125,7 +125,9 @@ php scripts/migrate.php verify \
 Verify **before application writes are enabled**. Once WordPress starts writing
 to the target, differences from the backup are expected.
 
-Restored MySQL column/index metadata is retained in `__wp_dsql_schema`.
+Restored MySQL column/index metadata is retained in `__wp_dsql_schema`. Version
+0.8 writes the shared version-2 logical model while continuing to read legacy
+rows without automatic writes. See [catalog migration](logical-schema.md).
 The driver uses it for `DESCRIBE` and `SHOW INDEX`, avoiding false `dbDelta`
 changes caused by PostgreSQL type representations. A fingerprint detects native
 schema drift before that metadata is reported. An unchanged restored WordPress
