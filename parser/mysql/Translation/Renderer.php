@@ -219,6 +219,10 @@ final class Renderer {
     }
     private function function(array $n,Shape $s):string {
         $name=$n['name'];$a=$n['args'];$emit=fn($i)=>$this->emit($a[$i]??throw new \RuntimeException('Missing function argument'),$s);
+        if($name==='VERSION'){
+            if($a)throw new \RuntimeException('VERSION takes no arguments');
+            return 'CAST('.$this->bind(\WPDSQL\Engine\Driver::MYSQL_VERSION.'-Aurora-DSQL-compat').' AS text)';
+        }
         if(in_array($name,['CURRENT_USER','USER','SESSION_USER'],true))return $name==='SESSION_USER'?'SESSION_USER':'CURRENT_USER';
         if(in_array($name,['UTC_TIMESTAMP','UTC_DATE','UTC_TIME'],true))return match($name){'UTC_TIMESTAMP'=>"(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')",'UTC_DATE'=>"CAST(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS date)",default=>"CAST(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS time)"};
         if(in_array($name,['NOW','CURRENT_TIMESTAMP','SYSDATE','CURDATE','CURTIME'],true))return match($name){'CURDATE'=>'CURRENT_DATE','CURTIME'=>'CURRENT_TIME',default=>'CURRENT_TIMESTAMP'};

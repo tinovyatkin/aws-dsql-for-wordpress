@@ -11,6 +11,13 @@ final class coreCompatibilityTest extends TestCase {
         $shape=new Shape($sql);$plan=(new Compiler($shape))->compile();
         return (new Renderer(new CoreSqlFixturePDO(),'wp_live',false))->statements($plan['body'],$shape)[0];
     }
+    public function test_sql_version_reports_the_existing_mysql_compatibility_level():void {
+        $r=$this->translate('SELECT VERSION()');
+        self::assertSame([\WPDSQL\Engine\Driver::MYSQL_VERSION.'-Aurora-DSQL-compat'],$r['params']);
+        self::assertStringNotContainsString('VERSION()',$r['sql']);
+        self::assertTrue(version_compare('8.0',$r['params'][0],'<='));
+        self::assertStringContainsString('Aurora DSQL',(new ReflectionClass(\WPDSQL\Engine\Driver::class))->newInstanceWithoutConstructor()->serverInfo());
+    }
     public function test_calendar_expressions_bind_current_arguments_once():void {
         foreach(['WEEK','DAYOFYEAR','DAYOFWEEK','WEEKDAY'] as $function){
             $r=$this->translate("SELECT $function('2026-01-01')");

@@ -123,3 +123,13 @@ under ignored `.local/`. The upgrade test retains its closed private recovery
 journal and archived test table according to the runner's existing behavior.
 Deploy the complete adapter release, including the new calendar helper; its
 source is included in the translation-cache build fingerprint.
+
+
+## 0.9.1: Site Health version comparison
+
+SQL `VERSION()` now returns `8.0.17-Aurora-DSQL-compat`, matching the existing
+`wpdb::db_version()` compatibility level. Core's SQL-server health test reads
+`SELECT VERSION()` directly; the native PostgreSQL version string was previously
+misclassified as an obsolete MySQL server. `db_server_info()` continues to
+identify Aurora DSQL. This is an adapter compatibility version, not an AWS engine
+release or a claim that MySQL is installed.
