@@ -166,6 +166,13 @@ pinned, and all writers must be paused before an upgrade. See
 [controlled upgrades](docs/controlled-upgrades.md) for setup, commands, tested
 scope, and remaining limitations.
 
+## MySQL parser foundation
+
+An ANTLR-generated PHP parser based on Oracle's MySQL grammar is available for
+structured translator development. It includes PHP runtime helpers, nested parse
+trees, and visitors. See [usage, coverage, and performance](docs/antlr-mysql-parser.md).
+The runtime SQL translator has not yet been switched to this parser.
+
 ## Known limits
 
 - **Unattended schema upgrades are not supported.** Migrated tables use a verified

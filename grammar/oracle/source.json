@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/mysql/mysql-shell-plugins",
+  "commit": "758c33bdf23785769e7d5aa88bfe5494f86aa6d4",
+  "directory": "gui/frontend/src/parsing/mysql",
+  "sha256": {
+    "MySQLLexer.g4": "2814272080ca3a7f853d35a4099ec2c2e6cedd52b631a4ef668e69721f9a5924",
+    "MySQLParser.g4": "656921ca63d4811488af21494fca0bb7a6de1fea065eb76d295a14728d313217",
+    "MySQLBaseLexer.ts": "b2f3f945a60b9850fcdf8cc7cd922cf51ed4025a353d1e3bb566e37a79c01aee",
+    "MySQLBaseRecognizer.ts": "c538ea401cc169053d98edc7dc5128667edb7cd42ed3bfa4189fb3cd4ab4357f",
+    "MySQLRecognizerCommon.ts": "56b012cb01e53463dd9212b70274983a82ef04c652052f6bb41750018f24ad15"
+  }
+}
