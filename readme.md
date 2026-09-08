@@ -186,6 +186,13 @@ MySQL's Bison grammar. Repeated query shapes reuse bounded, value-free plans; pe
 hits avoid loading the parser. See [configuration, supported forms, and verification](docs/sql-translation.md)
 and [parser sources, maintenance, and the Rust evaluation](docs/mysql-parser.md).
 
+## Core SQL coverage
+
+The [WordPress 7.1 source audit](docs/wordpress-core-sql-audit.md) inventories
+core database calls, checks a maintenance-branch snapshot, and records concrete
+translation gaps with reproducible probes. Static source coverage is separate
+from live execution and MySQL result-equivalence testing.
+
 ## Known limits
 
 - **Unattended schema upgrades are not supported.** Migrated tables use a verified
