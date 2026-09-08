@@ -1,0 +1,37 @@
+<?php
+/** Handwritten synthetic MySQL probes, never production queries. */
+return [
+    'nested_functions' => [true, "SELECT COALESCE(NULLIF(LOWER(title), ''), CONCAT('SELECT, UPDATE; 🌍', id)) AS label FROM wp_posts WHERE (id = 1 OR id IN (SELECT post_id FROM wp_postmeta WHERE meta_key = 'x')) AND NOT (title IS NULL) LIMIT 5, 10"],
+    'escaped_literals' => [true, <<<'SQL'
+SELECT 'O\'Reilly; UPDATE wp_posts SET title=1', 'back\\slash', 'double''quote', 'Русский 🌍' FROM wp_posts
+SQL],
+    'nul_literal' => [true, "INSERT INTO wp_options (option_name, option_value) VALUES ('probe', 'a\0b')"],
+    'backslash_nul' => [true, "INSERT INTO wp_options (option_name, option_value) VALUES ('probe', 'a\\0b')"],
+    'comments' => [true, "/* SELECT fake FROM hidden */ SELECT id FROM wp_posts -- LIMIT 99\nWHERE title = '/* data */'"],
+    'executable_comment' => [true, 'SELECT /*! SQL_NO_CACHE */ id FROM wp_posts'],
+    'cte' => [true, 'WITH ids AS (SELECT id FROM wp_posts WHERE id > 1) SELECT id FROM ids'],
+    'window' => [true, 'SELECT id, ROW_NUMBER() OVER (PARTITION BY post_type ORDER BY id) AS n FROM wp_posts'],
+    'union' => [true, "SELECT 'user' AS kind, CAST(id AS CHAR) AS value FROM wp_posts UNION ALL SELECT 'meta', meta_value FROM wp_postmeta"],
+    'upsert' => [true, "INSERT INTO wp_options (option_name, option_value) VALUES ('x','y') ON DUPLICATE KEY UPDATE option_value = CONCAT(VALUES(option_value), ' suffix')"],
+    'insert_ignore' => [true, "INSERT IGNORE INTO wp_options (option_name,option_value) VALUES ('x','y')"],
+    'replace' => [true, "REPLACE INTO wp_options (option_name,option_value) VALUES ('x','y')"],
+    'order_like' => [true, "SELECT id FROM wp_posts ORDER BY title LIKE '%needle%' DESC, id DESC LIMIT 0, 1"],
+    'order_like_parenthesized' => [true, "SELECT id FROM wp_posts ORDER BY (title LIKE '%needle%') DESC, id DESC LIMIT 0, 1"],
+    'update_limit' => [true, "UPDATE wp_posts SET title = 'new' WHERE post_type = 'post' ORDER BY id LIMIT 1"],
+    'delete_join' => [true, "DELETE p, pm FROM wp_posts p JOIN wp_postmeta pm ON pm.post_id = p.id WHERE p.post_type = 'revision'"],
+    'ddl_create' => [true, "CREATE TABLE wp_probe (id bigint unsigned NOT NULL AUTO_INCREMENT, title varchar(255) NOT NULL DEFAULT 'a,b', payload longtext, PRIMARY KEY (id), KEY title_idx (title(100))) DEFAULT CHARSET=utf8mb4"],
+    'ddl_alter' => [true, "ALTER TABLE wp_probe ADD COLUMN extra varchar(30) DEFAULT 'x,y' AFTER title, CHANGE COLUMN title name varchar(300), DROP INDEX title_idx, ADD KEY name_idx(name(100))"],
+    'ddl_generated' => [true, 'CREATE TABLE wp_probe (a int, b int GENERATED ALWAYS AS (a + 1) STORED)'],
+    'ddl_rename' => [true, 'RENAME TABLE wp_probe TO wp_probe_new'],
+    'ddl_drop' => [true, 'DROP TABLE IF EXISTS wp_probe'],
+    'json' => [true, "SELECT JSON_UNQUOTE(JSON_EXTRACT(payload, '$.name')), payload->>'$.name' FROM wp_probe"],
+    'calc_found_rows' => [true, 'SELECT SQL_CALC_FOUND_ROWS id FROM wp_posts LIMIT 0, 10'],
+    'multiple_statements' => [true, "SELECT 'a;b'; SELECT 2"],
+    'bad_unterminated_string' => [false, "SELECT 'unterminated"],
+    'bad_parenthesis' => [false, 'SELECT COALESCE(id, 0 FROM wp_posts'],
+    'bad_where_rhs' => [false, 'SELECT id FROM wp_posts WHERE id ='],
+    'bad_binary_rhs' => [false, 'SELECT id + FROM wp_posts'],
+    'bad_function_arity' => [false, 'SELECT COALESCE() FROM wp_posts'],
+    'bad_create' => [false, 'CREATE TABLE wp_probe (id)'],
+    'bad_keyword' => [false, 'SELEC id FROM wp_posts'],
+];
