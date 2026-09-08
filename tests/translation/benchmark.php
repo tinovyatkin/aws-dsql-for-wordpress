@@ -16,7 +16,7 @@ $pdo=new class extends PDO {
  }
 };
 $sql=static fn($id)=>"SELECT p.ID,p.post_title FROM wp_posts p WHERE p.post_status='publish' AND p.ID IN ($id,".($id+1).','.($id+2).') ORDER BY p.ID DESC LIMIT 20,10';
-$start=hrtime(true);$translator=new DSQL_SQL($pdo);$translator->translate($sql(1000));$first=(hrtime(true)-$start)/1e6;
+$start=hrtime(true);$translator=new DSQL_SQL($pdo,cacheDirectory:DSQL_TRANSLATION_CACHE_DIR);$translator->translate($sql(1000));$first=(hrtime(true)-$start)/1e6;
 $loaded=class_exists(WPDSQL\MySQL\WordPress\WP_Parser::class,false);
 $times=[];for($i=0;$i<1000;$i++){$q=$sql(1000+$i);$start=hrtime(true);$translator->translate($q);$times[]=(hrtime(true)-$start)/1e6;}
 sort($times);

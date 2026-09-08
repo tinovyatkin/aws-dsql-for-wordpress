@@ -21,11 +21,16 @@ each site's plugins, schema, and workload; this is not a drop-in MySQL replaceme
 WordPress core and plugins
         │ usual wpdb / MySQL queries
         ▼
-wp-content/db.php → DSQL_WPDB → cached MySQL translation plans
+wp-content/db.php → DSQL_WPDB → standalone MySQL-on-DSQL engine
+                                      │ cached translation plans
         │
         ▼
 AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent worker
 ```
+
+Version 0.7 separates the WordPress shim from a standalone engine that owns
+connection renewal, SQL execution, session state, retries and buffered results.
+See [the engine API and compatibility tests](docs/standalone-engine.md).
 
 The DSQL implementation:
 

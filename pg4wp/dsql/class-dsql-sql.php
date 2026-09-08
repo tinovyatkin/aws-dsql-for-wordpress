@@ -17,21 +17,22 @@ final class DSQL_SQL {
     private int $preparedHits=0;
     private string $mode='';
     private ?Shape $currentShape=null;
-    public function __construct(private PDO $pdo,private bool $valueCodec=false,private string $schema='public',?string $sqlMode=null) {
-        $this->mode=$sqlMode??(defined('DSQL_SQL_MODE')?DSQL_SQL_MODE:'');
+    public function __construct(private PDO $pdo,private bool $valueCodec=false,private string $schema='public',string $sqlMode='',private string $cacheScope='local',private ?string $cacheDirectory=null,private bool $cacheEnabled=true,private string $tablePrefix='wp_') {
+        $this->mode=$sqlMode;
         $this->initCache();
         $this->renderer=new Renderer($pdo,$schema,$valueCodec);
     }
     private function initCache():void {
         $schema=$this->schema;$valueCodec=$this->valueCodec;
-        $scope=(defined('DB_HOST')?DB_HOST:'local').'|'.$schema.'|'.($valueCodec?'codec':'plain').'|'.$this->mode;
-        $directory=defined('DSQL_TRANSLATION_CACHE_DIR')?DSQL_TRANSLATION_CACHE_DIR:null;
-        $this->cache=new PlanCache($scope,$directory,256,86400,!defined('DSQL_TRANSLATION_CACHE')||DSQL_TRANSLATION_CACHE!==false);
+        $scope=$this->cacheScope.'|'.$schema.'|'.($valueCodec?'codec':'plain').'|'.$this->mode;
+        $directory=$this->cacheDirectory;
+        $this->cache=new PlanCache($scope,$directory,256,86400,$this->cacheEnabled);
     }
     /** Refresh live catalog information while retaining value-free compiled plans. */
     public function refreshSchemaMetadata():void {
         $this->renderer=new Renderer($this->pdo,$this->schema,$this->valueCodec);
     }
+    public function reconnect(PDO $pdo):void {$this->pdo=$pdo;$this->refreshSchemaMetadata();}
     public function sqlMode():string {return $this->mode;}
     public function setSqlModeStatement(string $sql):void {
         $shape=$this->shape($sql);
@@ -77,7 +78,7 @@ final class DSQL_SQL {
         $change=(new WPDSQLUpgrade\Schema($mysql))->parse();
         if($change['kind']==='create') {
             if($change['if_exists']){$exists=$this->pdo->prepare('SELECT 1 FROM pg_tables WHERE schemaname=? AND tablename=?');$exists->execute([$this->schema,$change['table']]);if($exists->fetchColumn())return [];}
-            $table=WPDSQLUpgrade\Schema::apply($change,null,['table_prefix'=>isset($GLOBALS['wpdb'])?$GLOBALS['wpdb']->prefix:'wp_','allow_destructive'=>false,'omit_fulltext_indexes'=>[]]);
+            $table=WPDSQLUpgrade\Schema::apply($change,null,['table_prefix'=>$this->tablePrefix,'allow_destructive'=>false,'omit_fulltext_indexes'=>[]]);
             $table['target_schema']=$this->schema;$table['value_codec']=$this->valueCodec;
             $sql=WPDSQLMigration\Plan::ddl($table,$this->pdo);
             if($change['if_exists']??false)$sql[0]=str_replace('CREATE TABLE ','CREATE TABLE IF NOT EXISTS ',$sql[0]);

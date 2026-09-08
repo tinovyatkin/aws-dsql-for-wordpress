@@ -1,120 +1,99 @@
 <?php
-/**
- * WordPress database drop-in using AWS's Aurora DSQL PHP PDO connector.
- * SPDX-License-Identifier: GPL-2.0-or-later
- */
-use Aws\AuroraDsql\PdoPgsql\AuroraDsql;
-use Aws\AuroraDsql\PdoPgsql\DsqlConfig;
-use Aws\AuroraDsql\PdoPgsql\OCCRetry;
+/** WordPress API adaptation above the standalone MySQL-on-DSQL engine. */
+use WPDSQL\Engine\Config;
+use WPDSQL\Engine\Driver;
+use WPDSQL\Engine\Result;
+use WPDSQL\Engine\QueryException;
 
-$autoload = defined('DSQL_AUTOLOAD') ? DSQL_AUTOLOAD : dirname(__DIR__, 2) . '/vendor/autoload.php';
-require_once $autoload;
-require_once __DIR__ . '/class-dsql-sql.php';
-require_once __DIR__ . '/class-dsql-schema-catalog.php';
-require_once __DIR__ . '/class-dsql-diagnostics.php';
+require_once defined('DSQL_AUTOLOAD') ? DSQL_AUTOLOAD : dirname(__DIR__, 2).'/vendor/autoload.php';
+require_once __DIR__.'/class-dsql-diagnostics.php';
 
 class DSQL_WPDB extends wpdb {
-    private DSQL_SQL $translator;
-    private bool $valueCodec=false;
-    private string $schema='public';
-    private DSQL_Schema_Catalog $schemaCatalog;
-    private float $connectedAt = 0;
-    private array $indexJobs = [];
     public bool $defer_index_wait = false;
     public array $dsql_errors = [];
     public int $dsql_error_count = 0;
-    private int $queryRetries = 0;
-    private ?\WPDSQLUpgrade\Engine $schemaUpgrade = null;
 
+    public function get_driver(): Driver {
+        if (!$this->dbh instanceof Driver) { throw new RuntimeException('No active DSQL driver'); }
+        return $this->dbh;
+    }
     public function db_connect($allow_bail = true) {
         $start = microtime(true);
         try {
-            $profile = defined('DSQL_PROFILE') ? DSQL_PROFILE : null;
-            $provider = null;
-            $upgrade=class_exists('WPDSQLUpgrade\\Context',false) ? \WPDSQLUpgrade\Context::$session : null;
-            if($upgrade) {
-                $profile=$upgrade->data['target']['profile']??null;
-                if(isset($upgrade->data['target']['credentials_file']))$provider=\Aws\Credentials\CredentialProvider::ini($profile?:'default',$upgrade->data['target']['credentials_file']);
-            }
-            if ($profile && !$provider) {
-                // Connector 0.1.1 passes "profile" to defaultProvider(), which
-                // the PHP SDK ignores for shared profiles. Use its client resolver.
-                $sdkClient = new \Aws\DSQL\DSQLClient([
-                    'version' => 'latest', 'region' => defined('DSQL_REGION') ? DSQL_REGION : 'us-east-1',
-                    'profile' => $profile,
-                ]);
-                $provider = static fn() => $sdkClient->getCredentials();
-            }
-            $config = new DsqlConfig(
+            $upgrade = class_exists('WPDSQLUpgrade\\Context', false) ? \WPDSQLUpgrade\Context::$session : null;
+            $this->dbh = new Driver(new Config(
                 host: $this->dbhost,
                 user: $this->dbuser ?: 'admin',
                 database: $this->dbname ?: 'postgres',
                 region: defined('DSQL_REGION') ? DSQL_REGION : null,
-                credentialsProvider: $provider,
-                occMaxRetries: 3,
-            );
-            $this->dbh = AuroraDsql::connect($config, [
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_STRINGIFY_FETCHES => true,
-                // libpq <17 uses SQL DEALLOCATE for named-statement cleanup,
-                // which can abort a DSQL transaction. Keep native binding unnamed.
-                (defined('Pdo\\Pgsql::ATTR_DISABLE_PREPARES')?constant('Pdo\\Pgsql::ATTR_DISABLE_PREPARES'):constant('PDO::PGSQL_ATTR_DISABLE_PREPARES')) => true,
-            ]);
-            $this->schema=defined('DSQL_SCHEMA')?DSQL_SCHEMA:'public';
-            if(!in_array($this->schema,['public','wp_live'],true)) throw new RuntimeException('Unsupported application schema');
-            $this->dbh->exec('SET search_path TO "'.$this->schema.'", pg_catalog');
-            $this->valueCodec=defined('DSQL_VALUE_CODEC') && DSQL_VALUE_CODEC==='frame-v1';
-            $this->translator = new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema,isset($this->translator)?$this->translator->sqlMode():null);
-            $this->schemaCatalog = new DSQL_Schema_Catalog($this->dbh);
-            $this->connectedAt = microtime(true);
+                profile: $upgrade ? ($upgrade->data['target']['profile'] ?? null) : (defined('DSQL_PROFILE') ? DSQL_PROFILE : null),
+                credentialsFile: $upgrade->data['target']['credentials_file'] ?? null,
+                schema: defined('DSQL_SCHEMA') ? DSQL_SCHEMA : 'public',
+                valueCodec: defined('DSQL_VALUE_CODEC') && DSQL_VALUE_CODEC === 'frame-v1',
+                sqlMode: defined('DSQL_SQL_MODE') ? DSQL_SQL_MODE : '',
+                tablePrefix: $GLOBALS['table_prefix'] ?? 'wp_',
+                cacheEnabled: !defined('DSQL_TRANSLATION_CACHE') || DSQL_TRANSLATION_CACHE !== false,
+                cacheDirectory: defined('DSQL_TRANSLATION_CACHE_DIR') ? DSQL_TRANSLATION_CACHE_DIR : null,
+            ));
             $this->is_mysql = false;
             $this->ready = true;
             $this->has_connected = true;
             $this->init_charset();
             return true;
-        } catch (Throwable $e) {
+        } catch (Throwable $error) {
             $this->ready = false;
-            $this->last_error = $e->getMessage();
-            $event = $this->recordFailure($e, '', 'connect', $start);
-            // An uncaught PDO/SDK exception can contain credentials or SQL DETAIL.
-            if ($allow_bail) { throw new RuntimeException('DSQL connection failed; reference ' . $event['fingerprint']); }
+            $failure = $error instanceof QueryException ? $error->nativeFailure() : $error;
+            $this->last_error = $failure->getMessage();
+            $event = $this->recordFailure($failure, '', 'connect', $start);
+            if ($allow_bail) { throw new RuntimeException('DSQL connection failed; reference '.$event['fingerprint']); }
             return false;
         }
     }
-
+    public function check_connection($allow_bail = true) {
+        if (!$this->ready || !$this->dbh instanceof Driver) { return $this->db_connect($allow_bail); }
+        try { $this->dbh->checkConnection(); return true; }
+        catch (Throwable $error) {
+            $failure = $error instanceof QueryException ? $error->nativeFailure() : $error;
+            $event = $this->recordFailure($failure, '', 'connect', microtime(true));
+            $this->last_error = $failure->getMessage();
+            if ($allow_bail) { throw new RuntimeException('DSQL connection failed; reference '.$event['fingerprint']); }
+            return false;
+        }
+    }
+    public function close() {
+        try {
+            if ($this->dbh instanceof Driver) { $this->dbh->close(); }
+            return true;
+        } finally {
+            $this->dbh = null;
+            $this->ready = false;
+            $this->flush();
+        }
+    }
     public function init_charset() { $this->charset = 'utf8mb4'; $this->collate = ''; }
     public function set_charset($dbh, $charset = null, $collate = null) {}
     public function set_sql_mode($modes = []) {}
     public function select($db, $dbh = null) {
         if ($db !== $this->dbname) { throw new RuntimeException('DSQL supports one database per cluster'); }
     }
-    public function check_connection($allow_bail = true) {
-        return $this->ready && microtime(true) - $this->connectedAt < 3300
-            ? true : $this->db_connect($allow_bail);
-    }
-    public function close() { $this->dbh = null; $this->ready = false; return true; }
     public function check_database_version() { return null; }
-    public function db_version() { return '8.0.17'; } // MySQL dialect: integer display widths have no storage meaning.
-    public function db_server_info() { return 'Aurora DSQL (PostgreSQL-compatible)'; }
-    public function has_cap($cap) { return in_array($cap, ['collation', 'group_concat', 'subqueries', 'set_charset', 'utf8mb4', 'identifier_placeholders'], true); }
+    public function db_version() { return $this->dbh instanceof Driver ? Driver::MYSQL_VERSION : ''; }
+    public function db_server_info() { return $this->dbh instanceof Driver ? $this->dbh->serverInfo() : ''; }
+    public function has_cap($cap) { return in_array(strtolower($cap), ['collation','group_concat','subqueries','set_charset','utf8mb4','identifier_placeholders'], true); }
     public function _real_escape($data) {
         if (!is_scalar($data)) { return ''; }
-        if (isset($this->translator) && in_array('NO_BACKSLASH_ESCAPES', explode(',', $this->translator->sqlMode()), true)) {
-            return $this->add_placeholder_escape(str_replace("'", "''", (string) $data));
-        }
-        return $this->add_placeholder_escape(strtr((string) $data, [
-            '\\' => '\\\\', "'" => "\\'", '"' => '\\"', "\0" => '\\0', "\n" => '\\n', "\r" => '\\r', "\x1a" => '\\Z',
-        ]));
+        return $this->add_placeholder_escape($this->get_driver()->escape((string) $data));
     }
+    // Full logical-schema column contracts are the next adoption milestone.
     public function get_col_charset($table, $column) { return 'utf8mb4'; }
     public function get_col_length($table, $column) { return false; }
     protected function check_safe_collation($query) { return true; }
     protected function load_col_info() {
         $this->col_info = [];
-        if ($this->result instanceof PDOStatement) {
+        if ($this->result instanceof Result) {
             for ($i = 0; $i < $this->result->columnCount(); $i++) {
                 $meta = $this->result->getColumnMeta($i);
-                $this->col_info[] = (object) ['name' => $meta['name'], 'type' => $meta['native_type'] ?? 'text'];
+                $this->col_info[] = (object) ['name'=>$meta['name'], 'type'=>$meta['native_type'] ?? 'text'];
             }
         }
     }
@@ -127,253 +106,71 @@ class DSQL_WPDB extends wpdb {
         $this->last_error = '';
         $this->result = null;
     }
-
     public function prepare($query, ...$args) {
         $sql = parent::prepare($query, ...$args);
-        if (is_string($sql) && isset($this->translator)) {
-            $this->translator->rememberPrepared($this->remove_placeholder_escape($sql));
+        if (is_string($sql) && $this->dbh instanceof Driver) {
+            $this->dbh->rememberPrepared($this->remove_placeholder_escape($sql));
         }
         return $sql;
     }
-    public function translation_cache_stats(): array { return $this->translator->stats(); }
-
+    public function translation_cache_stats(): array { return $this->get_driver()->cacheStats(); }
     public function query($query) {
-        if($this->schemaUpgrade)$this->schemaUpgrade->session->assertActive();
         if (!$this->check_connection()) { return false; }
         $query = apply_filters('query', $query);
-        if (!$query) { return false; }
+        if (!$query) { $this->insert_id = 0; return false; }
         $this->flush();
         $this->last_query = $query;
+        $this->func_call = '$db->query("'.$query.'")';
         $start = microtime(true);
-        $stage = 'metadata';
-        $this->queryRetries = 0;
-        $operation='';
+        $driver = $this->get_driver();
+        $before = $driver->queryCount();
+        $operation = '';
         try {
-            $operation=$this->translator->operation($query);
-            if (in_array($operation,['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true)) {
-                if($this->schemaUpgrade) {
-                    $this->schemaUpgrade->execute($query);
-                    $this->schemaCatalog->clear();
-                    $this->translator=new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema,isset($this->translator)?$this->translator->sqlMode():null);
-                    $this->num_queries++;
-                    return true;
-                }
-                if($this->schemaCatalog->managed())throw new RuntimeException('Schema changes on restored tables require the controlled DSQL upgrade runner');
-            }
-            $emulated = $this->metadataQuery($query);
-            $rows = [];
-            $rowTypes = [];
-            if ($emulated !== null) {
-                $rows = $emulated;
-                $this->num_queries++;
-            } else {
-                if (in_array($operation,['INSERT','UPDATE','DELETE','REPLACE'],true)) {
-                    $this->wait_for_indexes();
-                }
-                // MySQL SET NAMES/sql_mode are driver configuration, not DSQL settings.
-                if (preg_match('/^\s*SET\s+(?:NAMES|(?:SESSION\s+)?sql_mode)\b/i', $query)) {
-                    if (preg_match('/^\s*SET\s+(?:SESSION\s+)?sql_mode\b/i', $query)) { $this->translator->setSqlModeStatement($query); }
-                    return true;
-                }
-                $stage = 'translate';
-                $statements = $this->translator->translate($query);
-                $stage = 'execute';
-                $atomic = !empty($statements[0]['atomic']);
-                $outerTransaction = $this->dbh->inTransaction();
-                for ($batchAttempt = 0; ; $batchAttempt++) {
-                    $ownsTransaction = $atomic && !$outerTransaction;
-                    try {
-                        if ($ownsTransaction) { $this->dbh->beginTransaction(); }
-                        $rows = []; $rowTypes = []; $this->rows_affected = 0;
-                foreach ($statements as $statement) {
-                    $sql = $statement['sql'];
-                    $stmt = $this->execute($sql, $statement['params']);
-                    $this->result = $stmt;
-                    if (preg_match('/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\b/i', $sql)) {
-                        $job = $stmt->fetchColumn();
-                        if ($job) { $this->indexJobs[] = $job; }
-                    } else {
-                        for ($i=0; $i<$stmt->columnCount(); $i++) {
-                            $meta=$stmt->getColumnMeta($i);
-                            $rowTypes[$meta['name']]=$meta['native_type']??'';
-                        }
-                        $rows = $stmt->columnCount() ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
-                        $this->rows_affected += $stmt->rowCount();
-                    }
-                }
-                        if ($ownsTransaction) { $this->dbh->commit(); }
-                        break;
-                    } catch (PDOException $batchError) {
-                        if ($ownsTransaction && $this->dbh->inTransaction()) { $this->dbh->rollBack(); }
-                        if (!$ownsTransaction || $batchAttempt >= 3 || !OCCRetry::isOccError($batchError)) { throw $batchError; }
-                        $this->queryRetries++;
-                        usleep(random_int(10000, 30000) * (2 ** $batchAttempt));
-                    } catch (Throwable $batchError) {
-                        if ($ownsTransaction && $this->dbh->inTransaction()) { $this->dbh->rollBack(); }
-                        throw $batchError;
-                    }
-                }
-                if (!$this->defer_index_wait) { $this->wait_for_indexes(); }
-            }
-            $decodeValues=$this->valueCodec && $emulated===null;
-            $stage = 'decode';
-            $this->last_result = array_map(static function ($row) use ($rowTypes,$decodeValues) {
-                foreach ($row as $field=>&$value) {
-                    if (is_resource($value)) { $value=stream_get_contents($value); }
-                    if (in_array($rowTypes[$field]??'', ['timestamp','timestamptz','date'],true) && is_string($value)) {
-                        $value=preg_replace('/^0001-01-01/', '0000-00-00', $value);
-                    }
-                    elseif ($value !== null) { $value = $decodeValues && ($rowTypes[$field]??'')!=='bytea'?DSQL_Value_Codec::decode((string)$value):(string)$value; }
-                }
-                return (object) $row;
-            }, $rows);
-            $this->num_rows = count($rows);
-            if (in_array($operation,['INSERT','REPLACE'],true)) {
-                $this->insert_id = $rows ? (int) reset($rows[0]) : 0;
-                // Core installs the default category with explicit term_id=1.
-                // PostgreSQL identities do not advance after an explicit ID.
-                // Restrict reseeding to the single-writer installation phase.
+            $this->result = $driver->query($query, $this->defer_index_wait);
+            $operation = $this->result->operation;
+            $this->last_result = $this->result->fetchAll(PDO::FETCH_OBJ);
+            $this->num_rows = count($this->last_result);
+            $this->rows_affected = $this->result->rowCount();
+            if (in_array($operation, ['INSERT','REPLACE'], true)) {
+                $this->insert_id = $this->result->insertId;
+                // WordPress installs its default category with an explicit ID.
                 if (defined('WP_INSTALLING') && WP_INSTALLING
                     && preg_match('/^INSERT\s+INTO\s+[\x60"]?(\w+)[\x60"]?\s*\(([^)]+)\)/i', $query, $insert)
                     && $insert[1] === $this->terms && preg_match('/\bterm_id\b/', $insert[2])) {
-                    $table = '"' . str_replace('"', '""', $this->terms) . '"';
-                    $reset = $this->dbh->prepare("SELECT setval(pg_get_serial_sequence(?, 'term_id'), (SELECT MAX(term_id) FROM $table))");
-                    $reset->execute([$this->terms]);
+                    $driver->reseedIdentity($this->terms, 'term_id');
                 }
             }
             if (defined('SAVEQUERIES') && SAVEQUERIES) {
                 $this->log_query($query, microtime(true) - $start, $this->get_caller(), $start, []);
             }
-            if (in_array($operation,['CREATE','ALTER','DROP','RENAME','BEGIN','START','COMMIT','ROLLBACK'],true)) { return true; }
-            return in_array($operation,['INSERT','REPLACE','UPDATE','DELETE'],true) ? $this->rows_affected : $this->num_rows;
-        } catch (Throwable $e) {
-            $this->last_error = $e->getMessage();
-            if (in_array($operation,['INSERT','REPLACE'],true)) { $this->insert_id = 0; }
-            $this->recordFailure($e, $query, $stage, $start, $this->queryRetries);
-            if($this->schemaUpgrade) {
-                $this->schemaUpgrade->session->fail();
-                file_put_contents($this->schemaUpgrade->session->directory.'/failure.txt',$e->getMessage());
-                chmod($this->schemaUpgrade->session->directory.'/failure.txt',0600);
-                throw new RuntimeException('Controlled DSQL upgrade stopped after a database/schema failure; inspect its private journal');
-            }
+            if ($this->result->command) { return true; }
+            return in_array($operation, ['INSERT','REPLACE','UPDATE','DELETE'], true) ? $this->rows_affected : $this->num_rows;
+        } catch (Throwable $error) {
+            $failure = $error instanceof QueryException ? $error->nativeFailure() : $error;
+            if ($error instanceof QueryException) { $operation = $error->operation; }
+            $this->last_error = $failure->getMessage();
+            if (in_array($operation, ['INSERT','REPLACE'], true)) { $this->insert_id = 0; }
+            $this->recordFailure($failure, $query, $error instanceof QueryException ? $error->stage : 'execute', $start,
+                $error instanceof QueryException ? $error->retries : 0);
+            if ($error instanceof QueryException && $error->controlledUpgrade) { throw new RuntimeException($error->getMessage()); }
             return false;
         } finally {
-            // Installation probes missing tables before creating them. DDL can also
-            // partially succeed, so discard catalog misses even when a batch fails.
-            if (in_array($operation,['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true)) {
-                $this->schemaCatalog->clear();
-                $this->translator->refreshSchemaMetadata();
-            }
+            $this->num_queries += $driver->queryCount() - $before;
         }
     }
-
-    public function enable_schema_upgrade(\WPDSQLUpgrade\Session $session): void {
-        require_once dirname(__DIR__,2).'/upgrade/Engine.php';
-        $this->schemaUpgrade=new \WPDSQLUpgrade\Engine($this->dbh,$session);
-    }
-    public function verify_schema_upgrade(): array {
-        if(!$this->schemaUpgrade)throw new RuntimeException('No controlled upgrade context');
-        return $this->schemaUpgrade->verify();
-    }
-
+    public function enable_schema_upgrade(\WPDSQLUpgrade\Session $session): void { $this->get_driver()->enableSchemaUpgrade($session); }
+    public function verify_schema_upgrade(): array { return $this->get_driver()->verifySchemaUpgrade(); }
+    public function wait_for_indexes(): void { $this->get_driver()->waitForIndexes(); }
     private function recordFailure(Throwable $error, string $query, string $stage, float $started, int $retries = 0): array {
         $event = DSQL_Diagnostics::event($error, $query, $stage, $started, $retries);
         $this->dsql_error_count++;
-        // Retain bounded diagnostics for long-running WP-CLI/cron processes.
         if (count($this->dsql_errors) >= 100) { array_shift($this->dsql_errors); }
         $this->dsql_errors[] = $event;
         DSQL_Diagnostics::emit($event);
         return $event;
     }
-
-    /** Never use wpdb's raw SQL/message HTML and error-log renderer. */
     public function print_error($str = '') {
         $this->recordFailure(new RuntimeException('Reported database failure'), (string) $this->last_query, 'reported', microtime(true));
         return false;
-    }
-
-    public function wait_for_indexes(): void {
-        foreach ($this->indexJobs as $job) {
-            $wait = $this->dbh->prepare('CALL sys.wait_for_job(?)');
-            $wait->execute([$job]);
-            if (!$wait->fetchColumn()) { throw new RuntimeException('DSQL index build failed'); }
-        }
-        $this->indexJobs = [];
-    }
-
-    private function execute(string $sql, array $params = []): PDOStatement {
-        for ($attempt = 0; ; $attempt++) {
-            try {
-                $this->num_queries++;
-                if (!$params) { return $this->dbh->query($sql); }
-                $stmt = $this->dbh->prepare($sql);
-                $stmt->execute($params);
-                return $stmt;
-            } catch (PDOException $e) {
-                // Retry only known aborted, single-statement transactions.
-                // Never replay an ambiguous connection failure or part of a caller transaction.
-                if ($attempt >= 3 || $this->dbh->inTransaction() || !OCCRetry::isOccError($e)) { throw $e; }
-                $this->queryRetries++;
-                usleep(random_int(10000, 30000) * (2 ** $attempt));
-            }
-        }
-    }
-
-    /** Emulate the metadata queries used by install/dbDelta and wpdb. */
-    private function metadataQuery(string $query): ?array {
-        // Core's update check asks whether any tables use the MyISAM engine.
-        // DSQL has no MyISAM tables.
-        if (preg_match('/^\s*SELECT\s+TABLE_NAME\s+FROM\s+information_schema\.TABLES\b/i', $query)
-            && preg_match('/\bENGINE\s*=\s*[\'"]MyISAM[\'"]/i', $query)) {
-            return [];
-        }
-        if (preg_match('/^\s*SELECT\s+COUNT\(\*\)\s+FROM\s+information_schema\.statistics\b/i',$query)
-            && preg_match('/index_type\s*=\s*[\'"]FULLTEXT[\'"]/i',$query)) { return [['count'=>'0']]; }
-        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?autocommit\s*;?\s*$/i',$query)) { return [['autocommit'=>$this->dbh->inTransaction()?'0':'1']]; }
-        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode\s*;?\s*$/i', $query)) { return [['sql_mode' => $this->translator->sqlMode()]]; }
-        if (preg_match('/^\s*SHOW\s+INDEX(?:ES)?\s+FROM\s+[\x60"]?(\w+)[\x60"]?\s*;?\s*$/i', $query, $m)) {
-            $saved = $this->schemaCatalog->get($m[1]);
-            if ($saved) { return $saved['indexes']; }
-            $stmt = $this->dbh->prepare("SELECT t.relname AS \"Table\",
-                CASE WHEN i.indisunique THEN 0 ELSE 1 END AS \"Non_unique\",
-                CASE WHEN i.indisprimary THEN 'PRIMARY' ELSE substr(idx.relname, length(t.relname)+2) END AS \"Key_name\",
-                k.ordinality AS \"Seq_in_index\", a.attname AS \"Column_name\",
-                NULL AS \"Sub_part\", 'BTREE' AS \"Index_type\", 'A' AS \"Collation\"
-                FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid
-                JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class idx ON idx.oid=i.indexrelid
-                CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
-                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum
-                WHERE t.relname=? AND n.nspname=? AND i.indisvalid
-                ORDER BY idx.relname, k.ordinality");
-            $stmt->execute([$m[1],$this->schema]);
-            return $stmt->fetchAll(PDO::FETCH_ASSOC);
-        }
-        if (preg_match('/^\s*SHOW\s+(?:FULL\s+)?TABLES(?:\s+LIKE\s+(.+))?/i', $query, $m)) {
-            $sql = "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = '".$this->schema."'";
-            if (isset($m[1])) { $sql .= ' AND tablename LIKE ' . $this->translator->quote_mysql_literal(rtrim(trim($m[1]), ';')); }
-            return $this->dbh->query($sql)->fetchAll(PDO::FETCH_ASSOC);
-        }
-        if (preg_match('/^\s*(?:DESCRIBE|DESC|SHOW\s+(?:FULL\s+)?COLUMNS\s+FROM)\s+[\x60"]?(\w+)[\x60"]?\s*;?\s*$/i', $query, $m)) {
-            $saved = $this->schemaCatalog->get($m[1]);
-            if ($saved) { return $saved['columns']; }
-            $stmt = $this->dbh->prepare("SELECT column_name, data_type, is_nullable, column_default, character_maximum_length, is_identity
-                FROM information_schema.columns WHERE table_name = ? AND table_schema = ? ORDER BY ordinal_position");
-            $stmt->execute([$m[1],$this->schema]);
-            return array_map(static function ($r) {
-                $type = match ($r['data_type']) {
-                    'character varying' => 'varchar(' . $r['character_maximum_length'] . ')',
-                    'timestamp without time zone' => 'datetime', 'integer' => 'int', default => $r['data_type'],
-                };
-                $default = $r['column_default'];
-                if (is_string($default) && preg_match("/^'((?:[^']|'')*)'::/", $default, $value)) {
-                    $default = str_replace("''", "'", $value[1]);
-                    if ($default === '0001-01-01 00:00:00') { $default = '0000-00-00 00:00:00'; }
-                }
-                return ['Field' => $r['column_name'], 'Type' => $type, 'Null' => $r['is_nullable'], 'Key' => '',
-                    'Default' => $default, 'Extra' => $r['is_identity'] === 'YES' ? 'auto_increment' : '',
-                    'Collation' => 'utf8mb4_unicode_ci'];
-            }, $stmt->fetchAll(PDO::FETCH_ASSOC));
-        }
-        return null;
     }
 }

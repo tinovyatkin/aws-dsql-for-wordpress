@@ -6,7 +6,7 @@ use WPDSQL\MySQL\Translation\PlanCache;
 $dir=$argv[2]??sys_get_temp_dir().'/dsql-cache-test-'.bin2hex(random_bytes(8));
 define('DSQL_TRANSLATION_CACHE_DIR',$dir);
 $pdo=new class extends PDO {public function __construct(){}};
-$t=new DSQL_SQL($pdo);
+$t=new DSQL_SQL($pdo,cacheDirectory:DSQL_TRANSLATION_CACHE_DIR);
 if(($argv[1]??'')==='child') {
  $result=$t->translate("SELECT CONCAT('different-secret', LOWER('B'))");
  if($t->stats()['disk_hits']!==1||$t->stats()['compilations']!==0||class_exists(WPDSQL\MySQL\WordPress\WP_Parser::class,false))throw new RuntimeException('Persistent hit loaded the parser');
