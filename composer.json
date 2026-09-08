@@ -1,6 +1,6 @@
 {
   "name": "tinovyatkin/aws-dsql-for-wordpress",
-  "description": "Experimental Aurora DSQL database drop-in for WordPress, derived from PG4WP",
+  "description": "Aurora DSQL database drop-in for WordPress with a standalone MySQL compatibility engine",
   "type": "wordpress-plugin",
   "license": "GPL-2.0-or-later",
   "require": {
