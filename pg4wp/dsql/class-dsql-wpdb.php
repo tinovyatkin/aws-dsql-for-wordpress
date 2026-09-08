@@ -64,7 +64,7 @@ class DSQL_WPDB extends wpdb {
             if(!in_array($this->schema,['public','wp_live'],true)) throw new RuntimeException('Unsupported application schema');
             $this->dbh->exec('SET search_path TO "'.$this->schema.'", pg_catalog');
             $this->valueCodec=defined('DSQL_VALUE_CODEC') && DSQL_VALUE_CODEC==='frame-v1';
-            $this->translator = new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema);
+            $this->translator = new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema,isset($this->translator)?$this->translator->sqlMode():null);
             $this->schemaCatalog = new DSQL_Schema_Catalog($this->dbh);
             $this->connectedAt = microtime(true);
             $this->is_mysql = false;
@@ -99,6 +99,9 @@ class DSQL_WPDB extends wpdb {
     public function has_cap($cap) { return in_array($cap, ['collation', 'group_concat', 'subqueries', 'set_charset', 'utf8mb4', 'identifier_placeholders'], true); }
     public function _real_escape($data) {
         if (!is_scalar($data)) { return ''; }
+        if (isset($this->translator) && in_array('NO_BACKSLASH_ESCAPES', explode(',', $this->translator->sqlMode()), true)) {
+            return $this->add_placeholder_escape(str_replace("'", "''", (string) $data));
+        }
         return $this->add_placeholder_escape(strtr((string) $data, [
             '\\' => '\\\\', "'" => "\\'", '"' => '\\"', "\0" => '\\0', "\n" => '\\n', "\r" => '\\r', "\x1a" => '\\Z',
         ]));
@@ -125,6 +128,15 @@ class DSQL_WPDB extends wpdb {
         $this->result = null;
     }
 
+    public function prepare($query, ...$args) {
+        $sql = parent::prepare($query, ...$args);
+        if (is_string($sql) && isset($this->translator)) {
+            $this->translator->rememberPrepared($this->remove_placeholder_escape($sql));
+        }
+        return $sql;
+    }
+    public function translation_cache_stats(): array { return $this->translator->stats(); }
+
     public function query($query) {
         if($this->schemaUpgrade)$this->schemaUpgrade->session->assertActive();
         if (!$this->check_connection()) { return false; }
@@ -135,12 +147,14 @@ class DSQL_WPDB extends wpdb {
         $start = microtime(true);
         $stage = 'metadata';
         $this->queryRetries = 0;
+        $operation='';
         try {
-            if (preg_match('/^\s*(?:CREATE|ALTER|DROP|RENAME|TRUNCATE)\b/i', $query)) {
+            $operation=$this->translator->operation($query);
+            if (in_array($operation,['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true)) {
                 if($this->schemaUpgrade) {
                     $this->schemaUpgrade->execute($query);
                     $this->schemaCatalog->clear();
-                    $this->translator=new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema);
+                    $this->translator=new DSQL_SQL($this->dbh,$this->valueCodec,$this->schema,isset($this->translator)?$this->translator->sqlMode():null);
                     $this->num_queries++;
                     return true;
                 }
@@ -153,18 +167,27 @@ class DSQL_WPDB extends wpdb {
                 $rows = $emulated;
                 $this->num_queries++;
             } else {
-                if (preg_match('/^\s*(INSERT|UPDATE|DELETE|REPLACE)\b/i', $query)) {
+                if (in_array($operation,['INSERT','UPDATE','DELETE','REPLACE'],true)) {
                     $this->wait_for_indexes();
                 }
                 // MySQL SET NAMES/sql_mode are driver configuration, not DSQL settings.
                 if (preg_match('/^\s*SET\s+(?:NAMES|(?:SESSION\s+)?sql_mode)\b/i', $query)) {
+                    if (preg_match('/^\s*SET\s+(?:SESSION\s+)?sql_mode\b/i', $query)) { $this->translator->setSqlModeStatement($query); }
                     return true;
                 }
                 $stage = 'translate';
                 $statements = $this->translator->translate($query);
                 $stage = 'execute';
-                foreach ($statements as $sql) {
-                    $stmt = $this->execute($sql);
+                $atomic = !empty($statements[0]['atomic']);
+                $outerTransaction = $this->dbh->inTransaction();
+                for ($batchAttempt = 0; ; $batchAttempt++) {
+                    $ownsTransaction = $atomic && !$outerTransaction;
+                    try {
+                        if ($ownsTransaction) { $this->dbh->beginTransaction(); }
+                        $rows = []; $rowTypes = []; $this->rows_affected = 0;
+                foreach ($statements as $statement) {
+                    $sql = $statement['sql'];
+                    $stmt = $this->execute($sql, $statement['params']);
                     $this->result = $stmt;
                     if (preg_match('/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\b/i', $sql)) {
                         $job = $stmt->fetchColumn();
@@ -176,6 +199,18 @@ class DSQL_WPDB extends wpdb {
                         }
                         $rows = $stmt->columnCount() ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
                         $this->rows_affected += $stmt->rowCount();
+                    }
+                }
+                        if ($ownsTransaction) { $this->dbh->commit(); }
+                        break;
+                    } catch (PDOException $batchError) {
+                        if ($ownsTransaction && $this->dbh->inTransaction()) { $this->dbh->rollBack(); }
+                        if (!$ownsTransaction || $batchAttempt >= 3 || !OCCRetry::isOccError($batchError)) { throw $batchError; }
+                        $this->queryRetries++;
+                        usleep(random_int(10000, 30000) * (2 ** $batchAttempt));
+                    } catch (Throwable $batchError) {
+                        if ($ownsTransaction && $this->dbh->inTransaction()) { $this->dbh->rollBack(); }
+                        throw $batchError;
                     }
                 }
                 if (!$this->defer_index_wait) { $this->wait_for_indexes(); }
@@ -193,7 +228,7 @@ class DSQL_WPDB extends wpdb {
                 return (object) $row;
             }, $rows);
             $this->num_rows = count($rows);
-            if (preg_match('/^\s*(INSERT|REPLACE)\b/i', $query)) {
+            if (in_array($operation,['INSERT','REPLACE'],true)) {
                 $this->insert_id = $rows ? (int) reset($rows[0]) : 0;
                 // Core installs the default category with explicit term_id=1.
                 // PostgreSQL identities do not advance after an explicit ID.
@@ -209,11 +244,11 @@ class DSQL_WPDB extends wpdb {
             if (defined('SAVEQUERIES') && SAVEQUERIES) {
                 $this->log_query($query, microtime(true) - $start, $this->get_caller(), $start, []);
             }
-            if (preg_match('/^\s*(CREATE|ALTER|DROP|BEGIN|START|COMMIT|ROLLBACK)\b/i', $query)) { return true; }
-            return preg_match('/^\s*(INSERT|REPLACE|UPDATE|DELETE)\b/i', $query) ? $this->rows_affected : $this->num_rows;
+            if (in_array($operation,['CREATE','ALTER','DROP','RENAME','BEGIN','START','COMMIT','ROLLBACK'],true)) { return true; }
+            return in_array($operation,['INSERT','REPLACE','UPDATE','DELETE'],true) ? $this->rows_affected : $this->num_rows;
         } catch (Throwable $e) {
             $this->last_error = $e->getMessage();
-            if (preg_match('/^\s*(INSERT|REPLACE)\b/i', $query)) { $this->insert_id = 0; }
+            if (in_array($operation,['INSERT','REPLACE'],true)) { $this->insert_id = 0; }
             $this->recordFailure($e, $query, $stage, $start, $this->queryRetries);
             if($this->schemaUpgrade) {
                 $this->schemaUpgrade->session->fail();
@@ -259,11 +294,14 @@ class DSQL_WPDB extends wpdb {
         $this->indexJobs = [];
     }
 
-    private function execute(string $sql): PDOStatement {
+    private function execute(string $sql, array $params = []): PDOStatement {
         for ($attempt = 0; ; $attempt++) {
             try {
                 $this->num_queries++;
-                return $this->dbh->query($sql);
+                if (!$params) { return $this->dbh->query($sql); }
+                $stmt = $this->dbh->prepare($sql);
+                $stmt->execute($params);
+                return $stmt;
             } catch (PDOException $e) {
                 // Retry only known aborted, single-statement transactions.
                 // Never replay an ambiguous connection failure or part of a caller transaction.
@@ -284,9 +322,9 @@ class DSQL_WPDB extends wpdb {
         }
         if (preg_match('/^\s*SELECT\s+COUNT\(\*\)\s+FROM\s+information_schema\.statistics\b/i',$query)
             && preg_match('/index_type\s*=\s*[\'"]FULLTEXT[\'"]/i',$query)) { return [['count'=>'0']]; }
-        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?autocommit/i',$query)) { return [['autocommit'=>$this->dbh->inTransaction()?'0':'1']]; }
-        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode/i', $query)) { return [['sql_mode' => '']]; }
-        if (preg_match('/^\s*SHOW\s+INDEX(?:ES)?\s+FROM\s+[\x60"]?(\w+)/i', $query, $m)) {
+        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?autocommit\s*;?\s*$/i',$query)) { return [['autocommit'=>$this->dbh->inTransaction()?'0':'1']]; }
+        if (preg_match('/^\s*SELECT\s+@@(?:SESSION\.)?sql_mode\s*;?\s*$/i', $query)) { return [['sql_mode' => $this->translator->sqlMode()]]; }
+        if (preg_match('/^\s*SHOW\s+INDEX(?:ES)?\s+FROM\s+[\x60"]?(\w+)[\x60"]?\s*;?\s*$/i', $query, $m)) {
             $saved = $this->schemaCatalog->get($m[1]);
             if ($saved) { return $saved['indexes']; }
             $stmt = $this->dbh->prepare("SELECT t.relname AS \"Table\",
@@ -308,7 +346,7 @@ class DSQL_WPDB extends wpdb {
             if (isset($m[1])) { $sql .= ' AND tablename LIKE ' . $this->translator->quote_mysql_literal(rtrim(trim($m[1]), ';')); }
             return $this->dbh->query($sql)->fetchAll(PDO::FETCH_ASSOC);
         }
-        if (preg_match('/^\s*(?:DESCRIBE|DESC|SHOW\s+(?:FULL\s+)?COLUMNS\s+FROM)\s+[\x60"]?(\w+)/i', $query, $m)) {
+        if (preg_match('/^\s*(?:DESCRIBE|DESC|SHOW\s+(?:FULL\s+)?COLUMNS\s+FROM)\s+[\x60"]?(\w+)[\x60"]?\s*;?\s*$/i', $query, $m)) {
             $saved = $this->schemaCatalog->get($m[1]);
             if ($saved) { return $saved['columns']; }
             $stmt = $this->dbh->prepare("SELECT column_name, data_type, is_nullable, column_default, character_maximum_length, is_identity

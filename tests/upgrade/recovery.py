@@ -61,12 +61,14 @@ check(True, 'Indexing encoded NUL text is refused before publishing')
 
 run('exec', '--', 'eval-file', str(ROOT / 'tests/upgrade/core-old-schema.php'))
 run('exec', '--', 'core', 'update-db', fault='after-old-rename', expected=1)
+assert (SESSION / 'pending.json').exists(), 'Core fault did not leave a pending DDL operation'
 run('recover')
 run('exec', '--', 'core', 'update-db')
 run('verify')
 check(True, 'Real WordPress core update-db recovers and dbDelta converges')
 run('exec', '--', 'eval-file', str(ROOT / 'tests/upgrade/ai-old-schema.php'))
 run('exec', '--', 'eval-file', str(ROOT / 'tests/upgrade/ai-upgrade.php'), fault='during-copy', expected=1)
+assert (SESSION / 'pending.json').exists(), 'AI fault did not leave a pending DDL operation'
 run('recover')
 run('exec', '--', 'eval-file', str(ROOT / 'tests/upgrade/ai-upgrade.php'))
 check(True, 'Real AI schema migration recovers and advances its version afterward')

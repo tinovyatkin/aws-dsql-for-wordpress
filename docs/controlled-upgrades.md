@@ -43,7 +43,7 @@ unverified partial data into the original.
 
 ## Administrative setup
 
-Deploy the complete release, including `pg4wp/`, `upgrade/`, `migration/`,
+Deploy the complete release, including `pg4wp/`, `parser/mysql/`, `upgrade/`, `migration/`,
 `scripts/`, Composer files and `vendor/`. Older bundles containing only `pg4wp/`
 are insufficient. Keep the runtime and upgrader identities separate.
 

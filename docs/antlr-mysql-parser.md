@@ -2,8 +2,9 @@
 
 The repository now includes a PHP parser generated from Oracle's MySQL grammar,
 with a lexer, complete grammar parse tree, and generated visitor interfaces.
-It is a foundation for structured SQL translation. The existing DSQL runtime
-translator still uses its current implementation; no deployment was changed.
+Adapter 0.5 uses this tree for [SQL translation and caching](antlr-translation.md).
+The uncached parser measurements below describe the parser foundation; cache-hit
+measurements belong to the translation workflow.
 
 ## Usage
 
@@ -62,8 +63,9 @@ printf '%s' 'SELECT id FROM wp_posts ORDER BY title LIKE '\''%needle%'\'' DESC' 
   lexer reset, malformed statements, nested functions, and visitors.
 - **676 successful cases** produced identical SLL-first and full-LL trees, and
   their full token streams reproduced the original input exactly.
-- Existing translation regression tests remain green: **31 tests / 541 assertions**.
-  The controlled schema-upgrade parser checks also pass.
+- The original parser-only evaluation also passed the then-existing legacy
+  translation tests. Those rewriters have since been replaced by the compiler
+  and its own regression tests; see the translation workflow.
 
 The shared 31-probe set yields 24 accepted inputs. All six malformed-syntax probes
 are rejected. The multi-statement probe is rejected by the single-statement API.
@@ -103,7 +105,8 @@ This implementation provides better grammar structure and tested syntax coverage
 but is **slower and larger** than phpMyAdmin's parser. It must not be described
 as a performance improvement. Static automaton/DFA state warms within a process;
 these measurements do not establish FPM request latency or cross-request cache
-behavior. Runtime integration needs its own end-to-end performance work.
+behavior. The translation layer avoids this cost on cache hits; deployment still needs
+end-to-end performance verification.
 
 To reproduce the comparison, install the isolated phpMyAdmin evaluation package
 as described in the earlier evaluation, then run:

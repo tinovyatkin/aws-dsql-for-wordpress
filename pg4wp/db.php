@@ -3,7 +3,7 @@
 Plugin Name: AWS DSQL for WordPress
 Plugin URI: https://github.com/tinovyatkin/aws-dsql-for-wordpress
 Description: Experimental Aurora DSQL database drop-in, derived from PostgreSQL for WordPress.
-Version: 0.4.0
+Version: 0.5.0
 Author: tinovyatkin and PG4WP contributors
 License: GPLv2 or newer.
 */
@@ -15,17 +15,6 @@ if(!defined('PG4WP_BOOTSTRAPPED')) {
     // DSQL is the only supported driver.
     if (!defined('DB_DRIVER')) {
         define('DB_DRIVER', 'dsql');
-    }
-
-    // Set this to 'true' and check that `pg4wp` is writable if you want debug logs to be written
-    if (!defined('PG4WP_DEBUG')) {
-        define('PG4WP_DEBUG', false);
-    }
-
-    if (!defined('PG4WP_LOG_ERRORS')) {
-        // If you just want to log queries that generate errors, leave PG4WP_DEBUG to "false"
-        // and set this to true
-        define('PG4WP_LOG_ERRORS', false);
     }
 
     // This defines the directory where PG4WP files are loaded from
@@ -42,15 +31,6 @@ if(!defined('PG4WP_BOOTSTRAPPED')) {
         define('PG4WP_ROOT', ABSPATH . 'pg4wp');
     } else {
         die('PG4WP file directory not found');
-    }
-
-    // Logs are put in the pg4wp directory
-    if (!defined('PG4WP_LOG')) {
-        define('PG4WP_LOG', PG4WP_ROOT . '/logs/');
-    }
-    // Check if the logs directory is needed and exists or create it if possible
-    if((PG4WP_DEBUG || PG4WP_LOG_ERRORS) && !file_exists(PG4WP_LOG) && is_writable(dirname(PG4WP_LOG))) {
-        mkdir(PG4WP_LOG);
     }
 
     // Here happens all the magic

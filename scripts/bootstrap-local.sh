@@ -9,7 +9,7 @@ export AWS_REGION="${AWS_REGION:-eu-central-1}"
 export PGSSLROOTCERT="${PGSSLROOTCERT:-system}"
 mkdir -p .local/tools .local/wordpress
 for tool in aws php wp curl; do command -v "$tool" >/dev/null; done
-php -r 'if (!extension_loaded("pdo_pgsql")) { fwrite(STDERR,"pdo_pgsql is required\n"); exit(1); }'
+php -r 'if (!extension_loaded("pdo_pgsql") || !extension_loaded("mbstring")) { fwrite(STDERR,"pdo_pgsql and mbstring are required\n"); exit(1); }'
 if [[ ! -s .local/cluster.json ]]; then
   aws dsql create-cluster --region "$AWS_REGION" --no-deletion-protection-enabled \
     --client-token "$(php -r 'echo bin2hex(random_bytes(16));')" \

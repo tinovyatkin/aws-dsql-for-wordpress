@@ -30,6 +30,7 @@ jobs:
     - name: Run Tests
       run: |
         php tests/tools/phpunit.phar tests/
+        php tests/translation/cache.php
         php tests/mysql-parser/helpers.php
         php tests/mysql-parser/corpus.php
         php tests/upgrade/parser.php

@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "516050394b5ef8c48311598f0805819e",
+    "content-hash": "bac44325a3a47de9ce60785cab8b78dd",
     "packages": [
         {
             "name": "antlr/antlr4-php-runtime",
@@ -1281,7 +1281,8 @@
     "prefer-lowest": false,
     "platform": {
         "php": ">=8.2",
-        "ext-pdo_pgsql": "*"
+        "ext-pdo_pgsql": "*",
+        "ext-mbstring": "*"
     },
     "platform-dev": {},
     "platform-overrides": {

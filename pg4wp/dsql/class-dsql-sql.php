@@ -1,253 +1,85 @@
 <?php
-/**
- * DSQL-specific SQL adaptation, reusing PG4WP's MySQL rewrite classes.
- * This is a compatibility prototype, not a complete MySQL implementation.
- * SPDX-License-Identifier: GPL-2.0-or-later
- */
-require_once dirname(__DIR__) . '/rewriters/bootstrap.php';
+/** ANTLR-based SQL compilation with best-effort, value-free translation caching. */
 require_once __DIR__.'/class-dsql-value-codec.php';
-
-class DSQL_SelectSQLRewriter extends SelectSQLRewriter {
-    // The upstream routines can change projection/aggregation semantics.
-    protected function ensureOrderByInSelect(string $sql): string {
-        // WP_Term_Query selects distinct term IDs but orders by the term name.
-        // Grouping by the ID and its dependent name preserves the projection.
-        if (preg_match('/^SELECT\s+DISTINCT\s+(t\.term_id(?:,\s*tr\.object_id)?)\s+FROM\b/i', $sql, $projection)
-            && preg_match('/\bORDER\s+BY\s+t\.name\s+(ASC|DESC)\s*$/i', $sql)) {
-            $sql = preg_replace('/^SELECT\s+DISTINCT\s+/i', 'SELECT ', $sql);
-            $sql = preg_replace('/\bORDER\s+BY\b/i', 'GROUP BY ' . $projection[1] . ', t.name ORDER BY', $sql);
-        }
-        return $sql;
-    }
-    protected function ensureGroupByOrAggregate(string $sql): string { return $sql; }
-}
+use WPDSQL\MySQL\Translation\Shape;
+use WPDSQL\MySQL\Translation\PlanCache;
+use WPDSQL\MySQL\Translation\Compiler;
+use WPDSQL\MySQL\Translation\Renderer;
 
 final class DSQL_SQL {
-    private PDO $pdo;
-    private string $foundRowsQuery = '';
-    private array $dateColumns = [];
-    private array $nulMarkers = [];
-    private array $binaryColumns = [];
-
-    public function __construct(PDO $pdo,private bool $valueCodec=false,private string $schema='public') { $this->pdo = $pdo; }
-
-    public function quote_mysql_literal(string $literal): string {
-        [$masked, $values] = $this->protectLiterals($literal);
-        if (count($values) !== 1 || !array_key_exists($masked, $values)) {
-            throw new RuntimeException('Expected exactly one SQL string literal');
-        }
-        return $values[$masked];
+    private PlanCache $cache;
+    private Renderer $renderer;
+    private ?array $foundRows=null;
+    private array $prepared=[];
+    private int $preparedBytes=0;
+    private function shapeSize(Shape $shape):int {return strlen($shape->sql)*3+count($shape->slots)*512;}
+    private int $compilations=0;
+    private int $preparedHits=0;
+    private string $mode='';
+    private ?Shape $currentShape=null;
+    public function __construct(private PDO $pdo,private bool $valueCodec=false,private string $schema='public',?string $sqlMode=null) {
+        $this->mode=$sqlMode??(defined('DSQL_SQL_MODE')?DSQL_SQL_MODE:'');
+        $this->initCache();
+        $this->renderer=new Renderer($pdo,$schema,$valueCodec);
     }
-
-    /** @return list<string> One statement per DSQL transaction. */
-    public function translate(string $mysql): array {
-        if (preg_match('/^\s*SELECT\s+FOUND_ROWS\s*\(\s*\)/i', $mysql)) {
-            if (!$this->foundRowsQuery) {
-                throw new RuntimeException('FOUND_ROWS called without SQL_CALC_FOUND_ROWS');
-            }
-            return ['SELECT COUNT(*) FROM (' . $this->foundRowsQuery . ') AS dsql_found_rows'];
-        }
-        [$sql, $literals] = $this->protectLiterals(trim($mysql));
-        $this->validateBinaryWrites($sql);
-        $this->zeroDates($sql, $literals);
-        // WordPress login/email lookup assumes MySQL's case-insensitive comparison.
-        if(preg_match('/\bFROM\s+[\x60"]?\w+_users[\x60"]?\b/i',$sql)) {
-            $sql=preg_replace('/(?<![\w"])([\x60"]?(?:user_login|user_email)[\x60"]?)\s*=\s*(\'__dsql_[a-f0-9]+_[0-9]+\')/i','LOWER($1) = LOWER($2)',$sql);
-        }
-        // Used by the active AI plugin's log summaries and retention queries.
-        $sql=preg_replace_callback('/\bDATE_(SUB|ADD)\(\s*((?:UTC_TIMESTAMP|NOW|CURRENT_TIMESTAMP)\(\s*\))\s*,\s*INTERVAL\s+(-?\d+)\s+(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR)\s*\)/i',
-            static fn($m)=>'('.$m[2].(strtoupper($m[1])==='SUB'?' - ':' + ')."INTERVAL '".$m[3].' '.strtolower($m[4])."')",$sql);
-        $sql=preg_replace('/\bUTC_TIMESTAMP\(\s*\)/i', "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')", $sql);
-        // AI request-log filter options union text values with a numeric user_id.
-        // MySQL promotes the mixed column to text; PostgreSQL needs the cast.
-        if (stripos($sql,'UNION ALL')!==false && preg_match('/\b\w*wpai_request_logs\b/i',$sql)) {
-            $sql=preg_replace('/\buser_id\s+AS\s+value\b/i','CAST(user_id AS TEXT) AS value',$sql);
-        }
-        $calc = stripos($sql, 'SQL_CALC_FOUND_ROWS') !== false;
-        $sql = str_ireplace('SQL_CALC_FOUND_ROWS', '', $sql);
-
-        if (preg_match('/^CREATE\s+TABLE\b/i', $sql)) {
-            $sql = (new CreateTableSQLRewriter($sql))->rewrite();
-        } elseif (preg_match('/^SELECT\b/i', $sql)) {
-            $sql = (new DSQL_SelectSQLRewriter($sql))->rewrite();
-        } elseif (preg_match('/^INSERT\b/i', $sql)) {
-            $sql = $this->insert($sql);
-        } elseif (preg_match('/^REPLACE\s+INTO\b/i', $sql)) {
-            $sql = (new ReplaceIntoSQLRewriter($sql))->rewrite();
-        } elseif (preg_match('/^ALTER\s+TABLE\b/i', $sql)) {
-            $sql = (new AlterTableSQLRewriter($sql))->rewrite();
-        } elseif (preg_match('/^UPDATE\b/i', $sql)) {
-            $sql = (new UpdateSQLRewriter($sql))->rewrite();
-        } elseif (preg_match('/^DELETE\b/i', $sql)) {
-            $sql = (new DeleteSQLRewriter($sql))->rewrite();
-        } elseif (!preg_match('/^(DROP|CREATE\s+(?:UNIQUE\s+)?INDEX|BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK)\b/i', $sql)) {
-            throw new RuntimeException('Unsupported MySQL statement: ' . strtok($sql, " \t\n"));
-        }
-
-        $sql = preg_replace('/\b(bigserial|smallserial|serial)\b/i', 'bigint GENERATED BY DEFAULT AS IDENTITY (CACHE 1)', $sql);
-        $sql = preg_replace('/CREATE\s+(UNIQUE\s+)?INDEX\s+(?!ASYNC\b)/i', 'CREATE $1INDEX ASYNC ', $sql);
-        $sql = preg_replace('/\)\s*(?:DEFAULT\s+)?(?:CHARACTER SET|CHARSET)\s*=?\s*\w+(?:\s+COLLATE\s*=?\s*\w+)?\s*;/i', ');', $sql);
-        // MySQL's quoted identifiers and WordPress's mixed-case column names.
-        $sql = preg_replace_callback('/\x60([^\x60]+)\x60/', static fn($m) => '"' . str_replace('"', '""', $m[1]) . '"', $sql);
-        $sql = preg_replace('/(?<!["\w])\b(ID|comment_ID|comment_post_ID|comment_author_IP|link_ID)\b(?!")/', '"$1"', $sql);
-        $sql = str_replace('&&', ' AND ', $sql);
-        $sql = preg_replace('/\bAS\s+SIGNED\b/i', 'AS BIGINT', $sql);
-        $sql = preg_replace('/\bSTART\s+TRANSACTION\b/i', 'BEGIN', $sql);
-        $statements = array_values(array_filter(array_map('trim', explode(';', $sql))));
-        $statements = array_map(static fn($part) => strtr($part, $literals), $statements);
-        if ($calc) {
-            $this->foundRowsQuery = preg_replace('/\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?\s*$/i', '', $statements[0]);
-        }
+    private function initCache():void {
+        $schema=$this->schema;$valueCodec=$this->valueCodec;
+        $scope=(defined('DB_HOST')?DB_HOST:'local').'|'.$schema.'|'.($valueCodec?'codec':'plain').'|'.$this->mode;
+        $directory=defined('DSQL_TRANSLATION_CACHE_DIR')?DSQL_TRANSLATION_CACHE_DIR:null;
+        $this->cache=new PlanCache($scope,$directory,256,86400,!defined('DSQL_TRANSLATION_CACHE')||DSQL_TRANSLATION_CACHE!==false);
+    }
+    public function sqlMode():string {return $this->mode;}
+    public function setSqlModeStatement(string $sql):void {
+        $shape=$this->shape($sql);
+        if(count($shape->slots)!==1||$shape->slots[0]['kind']!=='string')throw new RuntimeException('SET sql_mode requires a literal mode list');
+        $key=hash('sha256','sql-mode|'.$shape->key);
+        if($this->cache->get($key)===null){if(function_exists('wp_raise_memory_limit'))wp_raise_memory_limit('dsql_translation');\WPDSQL\MySQL\SqlParser::parse($shape->template,sqlMode:$this->mode);$this->cache->put($key,['kind'=>'sql_mode']);}
+        $modes=array_values(array_filter(array_map('trim',explode(',',strtoupper($shape->slots[0]['value'])))));
+        if(array_diff($modes,['ANSI_QUOTES','NO_BACKSLASH_ESCAPES','IGNORE_SPACE','PIPES_AS_CONCAT','HIGH_NOT_PRECEDENCE']))throw new RuntimeException('Unsupported SQL execution mode');
+        sort($modes);$this->mode=implode(',',$modes);$this->prepared=[];$this->preparedBytes=0;$this->currentShape=null;$this->initCache();
+    }
+    private function shape(string $sql):Shape {return new Shape($sql,$this->mode);}
+    public function operation(string $sql):string {
+        $key=hash('sha256',$sql);$this->currentShape=$this->prepared[$key]??$this->shape($sql);return $this->currentShape->operation;
+    }
+    public function rememberPrepared(string $sql):void {
+        if(strlen($sql)>65536)return;
+        try {$shape=$this->shape($sql);}catch(Throwable $e){return;}
+        $key=hash('sha256',$sql);if(isset($this->prepared[$key]))$this->preparedBytes-=$this->shapeSize($this->prepared[$key]);
+        $this->prepared[$key]=$shape;$this->preparedBytes+=$this->shapeSize($shape);
+        while(count($this->prepared)>64||$this->preparedBytes>1048576){$key=array_key_first($this->prepared);$this->preparedBytes-=$this->shapeSize($this->prepared[$key]);unset($this->prepared[$key]);}
+    }
+    public function stats():array {return $this->cache->stats+['compilations'=>$this->compilations,'prepared_hits'=>$this->preparedHits,'persistent_cache'=>$this->cache->persistenceEnabled()];}
+    public function quote_mysql_literal(string $literal):string {
+        $shape=$this->shape($literal);if(count($shape->slots)!==1||$shape->slots[0]['kind']!=='string'||trim($literal)!==$shape->slots[0]['raw'])throw new RuntimeException('Expected one SQL string literal');
+        $value=$shape->slots[0]['value'];if(str_contains($value,"\0"))throw new RuntimeException('NUL in metadata pattern');
+        return $this->pdo->quote($value);
+    }
+    /** @return list<array{sql:string,params:array}> */
+    public function translate(string $mysql):array {
+        $key=hash('sha256',$mysql);
+        if(isset($this->prepared[$key])){$shape=$this->prepared[$key];$this->preparedHits++;}else $shape=$this->currentShape?->sql===$mysql?$this->currentShape:$this->shape($mysql);
+        $plan=$this->cache->get($shape->key);
+        if($plan===null){if(function_exists('wp_raise_memory_limit'))wp_raise_memory_limit('dsql_translation');$this->compilations++;$plan=(new Compiler($shape))->compile();if($plan['kind']!=='ddl')$this->cache->put($shape->key,$plan);}
+        if($plan['kind']==='ddl')return $this->ddl($mysql);
+        if($plan['kind']==='found_rows'){if($this->foundRows===null)throw new RuntimeException('FOUND_ROWS called without SQL_CALC_FOUND_ROWS');return [$this->foundRows];}
+        $statements=$this->renderer->statements($plan['body'],$shape);
+        if($plan['count']!==null){$count=$this->renderer->render($plan['count'],$shape);$count['sql']='SELECT COUNT(*) FROM ('.$count['sql'].') AS dsql_found_rows';$this->foundRows=$count;}
         return $statements;
     }
-
-    private function insert(string $sql): string {
-        $sql = rtrim($sql, " \t\n;");
-        if (preg_match('/\bON\s+DUPLICATE\s+KEY\s+UPDATE\b/i', $sql, $m, PREG_OFFSET_CAPTURE)) {
-            $position = $m[0][1];
-            $insert = substr($sql, 0, $position);
-            $update = substr($sql, $position + strlen($m[0][0]));
-            preg_match('/^INSERT\s+INTO\s+[\x60"]?(\w+)[\x60"]?\s*\((.*?)\)/is', $insert, $match);
-            if (!$match) { throw new RuntimeException('Unsupported upsert shape'); }
-            $table = $match[1];
-            $columns = array_map(static fn($c) => trim($c, " \t\n\x60\""), explode(',', $match[2]));
-            // Select an actual unique key, never an arbitrary updated column.
-            $stmt = $this->pdo->prepare("SELECT i.indisprimary, array_agg(a.attname ORDER BY k.ordinality) AS columns
-                FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid
-                JOIN pg_namespace n ON n.oid=t.relnamespace
-                CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
-                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum
-                WHERE t.relname=? AND n.nspname=? AND i.indisunique AND i.indisvalid AND k.ordinality<=i.indnkeyatts
-                GROUP BY i.indexrelid, i.indisprimary ORDER BY i.indisprimary DESC");
-            $stmt->execute([$table,$this->schema]);
-            $target = null;
-            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $key) {
-                $names = str_getcsv(trim($key['columns'], '{}'), ',', '"', '\\');
-                if (!array_diff($names, $columns)) { $target = $names; break; }
-            }
-            if (!$target) { throw new RuntimeException('Upsert has no supported unique key in its insert columns'); }
-            $target = implode(', ', array_map(static fn($c) => '"' . str_replace('"', '""', $c) . '"', $target));
-            $update = preg_replace('/\bVALUES\s*\(\s*([\x60"]?\w+[\x60"]?)\s*\)/i', 'EXCLUDED.$1', $update);
-            return $insert . ' ON CONFLICT (' . $target . ') DO UPDATE SET ' . $update . ' RETURNING *';
-        }
-        if (preg_match('/^INSERT\s+IGNORE\b/i', $sql)) {
-            return preg_replace('/^INSERT\s+IGNORE\b/i', 'INSERT', $sql) . ' ON CONFLICT DO NOTHING RETURNING *';
-        }
-        return $sql . ' RETURNING *';
-    }
-
-    /** Keep runtime writes within the same binary-text contract as migration preflight. */
-    private function validateBinaryWrites(string $sql): void {
-        if(!$this->nulMarkers || !preg_match('/^(INSERT|REPLACE|UPDATE)\b/i',$sql))return;
-        $assignments=[];
-        if(preg_match('/^(?:INSERT|REPLACE)\s+(?:IGNORE\s+)?INTO\s+[\x60"]?(\w+)[\x60"]?\s*\(([^)]+)\)\s*VALUES\s*(.*)/is',$sql,$m)) {
-            $table=$m[1];$columns=array_map(static fn($c)=>trim($c," \t\n\x60\""),explode(',',$m[2]));
-            preg_match_all('/\(([^()]*)\)/',$m[3],$groups);
-            foreach($groups[1] as $group){$values=array_map('trim',explode(',',$group));if(count($values)!==count($columns))continue;
-                foreach($values as $i=>$value)if(isset($this->nulMarkers[$value]))$assignments[$value]=$columns[$i];}
-        } elseif(preg_match('/^UPDATE\s+[\x60"]?(\w+)[\x60"]?/i',$sql,$m)) {
-            $table=$m[1];preg_match_all('/[\x60"]?(\w+)[\x60"]?\s*=\s*(\'__dsql_[a-f0-9]+_[0-9]+\')/i',$sql,$matches,PREG_SET_ORDER);
-            foreach($matches as $a)if(isset($this->nulMarkers[$a[2]]))$assignments[$a[2]]=$a[1];
-        }
-        if(count($assignments)!==count($this->nulMarkers))throw new RuntimeException('Binary text requires direct literal assignment');
-        foreach($assignments as $column){
-            $key=$table.'.'.$column;
-            if(!array_key_exists($key,$this->binaryColumns)){
-                $s=$this->pdo->prepare("SELECT data_type FROM information_schema.columns WHERE table_schema=? AND table_name=? AND column_name=?");
-                $s->execute([$this->schema,$table,$column]);$text=$s->fetchColumn()==='text';
-                $s=$this->pdo->prepare("SELECT COUNT(*) FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE k.ordinality<=i.indnkeyatts AND n.nspname=? AND t.relname=? AND a.attname=?");
-                $s->execute([$this->schema,$table,$column]);$this->binaryColumns[$key]=$text && (int)$s->fetchColumn()===0;
-            }
-            if(!$this->binaryColumns[$key])throw new RuntimeException('NUL encoding is supported only for unindexed TEXT columns');
-        }
-    }
-
-    /** Translate zero dates only in temporal columns, never in article/option text. */
-    private function zeroDates(string $sql, array &$literals): void {
-        $replace = function(string $marker) use (&$literals): void {
-            if (isset($literals[$marker]) && preg_match("/^'0000-00-00(?: 00:00:00(?:\.0+)?)?'$/D", $literals[$marker])) {
-                $literals[$marker] = str_replace('0000-00-00','0001-01-01',$literals[$marker]);
-            }
-        };
-        $marker = "'__dsql_[a-f0-9]+_[0-9]+'";
-        if (preg_match('/^CREATE\s+TABLE\b/i',$sql)) {
-            preg_match_all('/(?:^|,|\()\s*[\x60"]?\w+[\x60"]?\s+(?:datetime|timestamp|date)\b[^,]*?\bDEFAULT\s+('.$marker.')/i',$sql,$m);
-            foreach ($m[1] as $literal) $replace($literal);
-            return;
-        }
-        preg_match_all('/\b(?:FROM|JOIN|UPDATE|INTO)\s+[\x60"]?(\w+)[\x60"]?/i',$sql,$tables);
-        $dates=[];
-        foreach (array_unique($tables[1]) as $table) {
-            if (!isset($this->dateColumns[$table])) {
-                $s=$this->pdo->prepare("SELECT column_name FROM information_schema.columns WHERE table_schema=? AND table_name=? AND data_type IN ('timestamp without time zone','timestamp with time zone','date')");
-                $s->execute([$this->schema,$table]);$this->dateColumns[$table]=$s->fetchAll(PDO::FETCH_COLUMN);
-            }
-            $dates=array_merge($dates,$this->dateColumns[$table]);
-        }
-        if (!$dates) return;
-        if (preg_match('/^INSERT\s+(?:IGNORE\s+)?INTO\s+[\x60"]?\w+[\x60"]?\s*\(([^)]+)\)\s*VALUES\s*(.*)/is',$sql,$insert)) {
-            $columns=array_map(static fn($c)=>trim($c," \t\n\x60\""),explode(',',$insert[1]));
-            preg_match_all('/\(([^()]*)\)/',$insert[2],$groups);
-            foreach ($groups[1] as $group) {
-                $values=array_map('trim',explode(',',$group));
-                if (count($columns)!==count($values)) continue;
-                foreach ($columns as $i=>$column) { if (in_array($column,$dates,true)) $replace($values[$i]); }
-            }
-        }
-        $names=implode('|',array_map(static fn($d)=>preg_quote($d,'/'),array_unique($dates)));
-        preg_match_all('/(?:[\x60"]?\w+[\x60"]?\.)?[\x60"]?(?:'.$names.')[\x60"]?\s*(?:=|!=|<>|<=|>=|<|>)\s*('.$marker.')/i',$sql,$matches);
-        foreach ($matches[1] as $literal) $replace($literal);
-    }
-
-    /**
-     * Never apply regex SQL rewrites to article text, serialized PHP, or secrets.
-     * Parse MySQL string quoting first, then restore PostgreSQL-quoted values.
-     * @return array{string,array<string,string>}
-     */
-    private function protectLiterals(string $sql): array {
-        $this->nulMarkers=[];
-        $out = '';
-        $values = [];
-        $nonce = '__dsql_' . bin2hex(random_bytes(8)) . '_';
-        for ($i = 0, $n = strlen($sql); $i < $n; $i++) {
-            $quote = $sql[$i];
-            if ($quote !== "'" && $quote !== '"') {
-                $out .= $quote;
-                continue;
-            }
-            $value = '';
-            $closed = false;
-            while (++$i < $n) {
-                $c = $sql[$i];
-                if ($c === '\\' && $i + 1 < $n) {
-                    $c = $sql[++$i];
-                    $value .= match ($c) {
-                        'n' => "\n", 'r' => "\r", 't' => "\t", '0' => "\0", 'Z' => "\x1a",
-                        '\\' => '\\', "'" => "'", '"' => '"',
-                        '%', '_' => '\\' . $c,
-                        default => $c,
-                    };
-                } elseif ($c === $quote) {
-                    if ($i + 1 < $n && $sql[$i + 1] === $quote) {
-                        $value .= $quote;
-                        $i++;
-                    } else {
-                        $closed = true;
-                        break;
-                    }
-                } else {
-                    $value .= $c;
-                }
-            }
-            if (!$closed) { throw new RuntimeException('Unterminated SQL string'); }
-            $hasNul=str_contains($value,"\0");
-            if ($this->valueCodec) { $value=DSQL_Value_Codec::encode($value); }
-            elseif (str_contains($value, "\0")) { throw new RuntimeException('NUL bytes in text are unsupported by PostgreSQL'); }
-            $marker = "'" . $nonce . count($values) . "'";
-            if($hasNul)$this->nulMarkers[$marker]=true;
-            $values[$marker] = $this->pdo->quote($value);
-            $out .= $marker;
-        }
-        return [$out, $values];
+    private function ddl(string $mysql):array {
+        if((new DSQL_Schema_Catalog($this->pdo))->managed())throw new RuntimeException('Restored schema changes require the controlled upgrade runner');
+        require_once dirname(__DIR__,2).'/upgrade/Engine.php';
+        $change=(new WPDSQLUpgrade\Schema($mysql))->parse();
+        if($change['kind']==='create') {
+            if($change['if_exists']){$exists=$this->pdo->prepare('SELECT 1 FROM pg_tables WHERE schemaname=? AND tablename=?');$exists->execute([$this->schema,$change['table']]);if($exists->fetchColumn())return [];}
+            $table=WPDSQLUpgrade\Schema::apply($change,null,['table_prefix'=>isset($GLOBALS['wpdb'])?$GLOBALS['wpdb']->prefix:'wp_','allow_destructive'=>false,'omit_fulltext_indexes'=>[]]);
+            $table['target_schema']=$this->schema;$table['value_codec']=$this->valueCodec;
+            $sql=WPDSQLMigration\Plan::ddl($table,$this->pdo);
+            if($change['if_exists']??false)$sql[0]=str_replace('CREATE TABLE ','CREATE TABLE IF NOT EXISTS ',$sql[0]);
+        }elseif($change['kind']==='drop') {
+            $sql=['DROP TABLE '.(($change['if_exists']??false)?'IF EXISTS ':'').Renderer::qi($change['table'])];
+        }else throw new RuntimeException('Schema alteration requires the controlled upgrade runner');
+        return array_map(fn($q)=>['sql'=>$q,'params'=>[]],$sql);
     }
 }

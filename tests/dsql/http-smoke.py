@@ -26,5 +26,5 @@ print('PASS anonymous article renders the Node.js comment')
 with error_log.open('rb') as f:
     f.seek(log_offset)
     recent_errors=f.read().decode()
-assert 'WordPress database error' not in recent_errors and 'PHP Fatal' not in recent_errors, 'New server/database errors during HTTP tests'
+assert 'WordPress database error' not in recent_errors and 'wordpress_dsql_error' not in recent_errors and 'PHP Fatal' not in recent_errors, 'New server/database errors during HTTP tests'
 print('PASS no new database errors or PHP fatal errors during HTTP tests')

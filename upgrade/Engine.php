@@ -40,6 +40,8 @@ final class Engine {
     public function plan(string $sql): ?array {
         if($this->pdo->inTransaction())throw new \RuntimeException('Schema changes inside application transactions require a dedicated migration');
         $this->session->assertActive();if($this->session->operation())throw new \RuntimeException('Pending DDL must be recovered first');
+        if(function_exists('wp_raise_memory_limit'))wp_raise_memory_limit('dsql_translation');
+        \WPDSQL\MySQL\SqlParser::parse($sql);
         $ddl=(new Schema($sql))->parse();$before=$this->metadata($ddl['table']);$oid=$this->oid($ddl['table']);
         if($oid&&!$before)throw new \RuntimeException('Existing table is not in the migration catalog');
         if(!$oid&&$before)throw new \RuntimeException('Catalogued table is missing');

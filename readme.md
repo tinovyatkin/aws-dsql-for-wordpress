@@ -21,7 +21,7 @@ each site's plugins, schema, and workload; this is not a drop-in MySQL replaceme
 WordPress core and plugins
         │ usual wpdb / MySQL queries
         ▼
-wp-content/db.php → DSQL_WPDB → PG4WP-derived SQL translation
+wp-content/db.php → DSQL_WPDB → cached ANTLR translation plans
         │
         ▼
 AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent worker
@@ -30,13 +30,15 @@ AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent 
 The DSQL implementation:
 
 - uses IAM authentication and verified TLS through the AWS PHP connector;
-- subclasses `wpdb` directly, without the original driver's runtime core-source rewriting;
-- protects SQL string literals before applying the inherited rewrite rules, so
-  article text and PHP-serialized data do not get rewritten as SQL;
+- subclasses `wpdb` directly and preserves its public string-based API;
+- parses value-free MySQL templates with Oracle's ANTLR grammar, then emits DSQL
+  SQL with current PDO bindings;
+- caches compiled instructions across requests without caching values or results;
 - translates auto-increment columns into DSQL identities with explicit `CACHE 1`;
 - submits indexes using `CREATE INDEX ASYNC` and waits for their completion;
 - splits translated DDL into individual statements;
-- adapts upserts using actual unique indexes and preserves update expressions;
+- resolves unambiguous upserts against actual unique indexes and executes supported
+  REPLACE operations atomically;
 - implements pagination counts and the term-query ordering used by WordPress;
 - retries known aborted single-statement concurrency conflicts, never ambiguous
   connection failures or an individual statement inside a caller-owned transaction;
@@ -48,7 +50,8 @@ ID is reseeded during that single-writer installation phase.
 
 ## Run the isolated experiment
 
-Requires AWS CLI with an authorized profile, PHP 8.2+ with `pdo_pgsql`, WP-CLI,
+Requires AWS CLI with an authorized profile, PHP 8.2+ with `pdo_pgsql` and
+`mbstring`, WP-CLI,
 `curl`, and a PostgreSQL client library with a trusted CA configuration. The
 provided scripts default `PGSSLROOTCERT=system` (libpq 17+); for older clients,
 set `PGSSLROOTCERT` to your trusted CA bundle. TLS verification stays enabled.
@@ -93,8 +96,9 @@ node tests/dsql/external-writer.mjs
 php tests/dsql/read-external.php
 python3 tests/dsql/http-smoke.py
 
-# Run the shared SQL translation regression suite (no database required).
+# Run compiler and cache checks (no database required).
 php tests/tools/phpunit.phar tests/
+php tests/translation/cache.php
 wp core verify-checksums --version=7.1 --path=.local/wordpress
 ```
 
@@ -166,12 +170,12 @@ pinned, and all writers must be paused before an upgrade. See
 [controlled upgrades](docs/controlled-upgrades.md) for setup, commands, tested
 scope, and remaining limitations.
 
-## MySQL parser foundation
+## ANTLR translation and caching
 
-An ANTLR-generated PHP parser based on Oracle's MySQL grammar is available for
-structured translator development. It includes PHP runtime helpers, nested parse
-trees, and visitors. See [usage, coverage, and performance](docs/antlr-mysql-parser.md).
-The runtime SQL translator has not yet been switched to this parser.
+Version 0.5 uses Oracle's ANTLR MySQL grammar for runtime translation. Repeated
+query shapes reuse bounded, value-free plans; persistent hits avoid loading the
+ANTLR parser. See [configuration, supported forms, and verification](docs/antlr-translation.md)
+and [parser generation](docs/antlr-mysql-parser.md).
 
 ## Known limits
 
@@ -180,10 +184,11 @@ The runtime SQL translator has not yet been switched to this parser.
   on those tables require the controlled CLI runner; ordinary requests cannot
   perform them. Keep automatic core/plugin updates disabled.
   Fresh tables created outside the restore path still have partial introspection.
-- The reused SQL rewrite rules are not a complete MySQL grammar or complete
-  MySQL behavior emulation. Arbitrary plugin SQL, multisite, MySQL collations,
-  unsigned integer semantics, complex `REPLACE` operations, and unusual schema
-  changes need separate work and testing.
+- The DSQL emitter supports a tested subset of the MySQL grammar and fails on
+  unimplemented constructs. Arbitrary plugin SQL, multisite, MySQL collations,
+  unsigned integer semantics, and unusual schema changes need separate work
+  and testing. Upsert affected-row counts and Unicode case mapping retain
+  documented DSQL behavior.
 - MySQL zero dates use a year-1 sentinel in temporal columns only. Literal text
   is preserved. Migration preflight rejects real source dates using that sentinel.
 - NULs can use the opt-in reversible text codec on unindexed TEXT columns.
