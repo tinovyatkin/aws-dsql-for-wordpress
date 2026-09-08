@@ -1,5 +1,5 @@
 <?php
-/** ANTLR-based SQL compilation with best-effort, value-free translation caching. */
+/** WordPress-parser SQL compilation with best-effort, value-free translation caching. */
 require_once __DIR__.'/class-dsql-value-codec.php';
 use WPDSQL\MySQL\Translation\Shape;
 use WPDSQL\MySQL\Translation\PlanCache;
@@ -28,12 +28,16 @@ final class DSQL_SQL {
         $directory=defined('DSQL_TRANSLATION_CACHE_DIR')?DSQL_TRANSLATION_CACHE_DIR:null;
         $this->cache=new PlanCache($scope,$directory,256,86400,!defined('DSQL_TRANSLATION_CACHE')||DSQL_TRANSLATION_CACHE!==false);
     }
+    /** Refresh live catalog information while retaining value-free compiled plans. */
+    public function refreshSchemaMetadata():void {
+        $this->renderer=new Renderer($this->pdo,$this->schema,$this->valueCodec);
+    }
     public function sqlMode():string {return $this->mode;}
     public function setSqlModeStatement(string $sql):void {
         $shape=$this->shape($sql);
         if(count($shape->slots)!==1||$shape->slots[0]['kind']!=='string')throw new RuntimeException('SET sql_mode requires a literal mode list');
         $key=hash('sha256','sql-mode|'.$shape->key);
-        if($this->cache->get($key)===null){if(function_exists('wp_raise_memory_limit'))wp_raise_memory_limit('dsql_translation');\WPDSQL\MySQL\SqlParser::parse($shape->template,sqlMode:$this->mode);$this->cache->put($key,['kind'=>'sql_mode']);}
+        if($this->cache->get($key)===null){\WPDSQL\MySQL\SqlParser::parse($shape->template,sqlMode:$this->mode);$this->cache->put($key,['kind'=>'sql_mode']);}
         $modes=array_values(array_filter(array_map('trim',explode(',',strtoupper($shape->slots[0]['value'])))));
         if(array_diff($modes,['ANSI_QUOTES','NO_BACKSLASH_ESCAPES','IGNORE_SPACE','PIPES_AS_CONCAT','HIGH_NOT_PRECEDENCE']))throw new RuntimeException('Unsupported SQL execution mode');
         sort($modes);$this->mode=implode(',',$modes);$this->prepared=[];$this->preparedBytes=0;$this->currentShape=null;$this->initCache();
@@ -60,7 +64,7 @@ final class DSQL_SQL {
         $key=hash('sha256',$mysql);
         if(isset($this->prepared[$key])){$shape=$this->prepared[$key];$this->preparedHits++;}else $shape=$this->currentShape?->sql===$mysql?$this->currentShape:$this->shape($mysql);
         $plan=$this->cache->get($shape->key);
-        if($plan===null){if(function_exists('wp_raise_memory_limit'))wp_raise_memory_limit('dsql_translation');$this->compilations++;$plan=(new Compiler($shape))->compile();if($plan['kind']!=='ddl')$this->cache->put($shape->key,$plan);}
+        if($plan===null){$this->compilations++;$plan=(new Compiler($shape))->compile();if($plan['kind']!=='ddl')$this->cache->put($shape->key,$plan);}
         if($plan['kind']==='ddl')return $this->ddl($mysql);
         if($plan['kind']==='found_rows'){if($this->foundRows===null)throw new RuntimeException('FOUND_ROWS called without SQL_CALC_FOUND_ROWS');return [$this->foundRows];}
         $statements=$this->renderer->statements($plan['body'],$shape);

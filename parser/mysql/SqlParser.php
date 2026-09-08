@@ -1,56 +1,20 @@
 <?php
 namespace WPDSQL\MySQL;
+use WPDSQL\MySQL\WordPress\WP_MySQL_Lexer;
+use WPDSQL\MySQL\WordPress\WP_MySQL_Parser_Factory;
 
-use Antlr\Antlr4\Runtime\CommonTokenStream;
-use Antlr\Antlr4\Runtime\InputStream;
-use Antlr\Antlr4\Runtime\Atn\PredictionMode;
-use Antlr\Antlr4\Runtime\Error\BailErrorStrategy;
-use Antlr\Antlr4\Runtime\Error\DefaultErrorStrategy;
-use Antlr\Antlr4\Runtime\Error\Exceptions\ParseCancellationException;
-use WPDSQL\MySQL\Generated\MySQLLexer;
-use WPDSQL\MySQL\Generated\MySQLParser;
-
-/** Parse exactly one complete MySQL statement, preserving its concrete syntax tree. */
+/** Parse a complete statement using WordPress's standalone MySQL 8.4.10 grammar. */
 final class SqlParser {
-    public static function parse(string $sql, int $serverVersion = 80400, string $sqlMode = '', bool $sllFirst = true): ParsedQuery {
-        if ($serverVersion < 80000) throw new \InvalidArgumentException('This grammar targets MySQL 8.0 and newer');
-        if (!mb_check_encoding($sql, 'UTF-8')) throw new \InvalidArgumentException('SQL input must be UTF-8');
-        $errors = new ThrowingErrorListener();
-        $lexer = new MySQLLexer(InputStream::fromString($sql));
-        $lexer->serverVersion = $serverVersion;
-        $lexer->sqlModeFromString($sqlMode);
-        $lexer->removeErrorListeners();
-        $lexer->addErrorListener($errors);
-        $tokens = new CommonTokenStream($lexer);
-        $tokens->fill();
-        foreach ($tokens->getAllTokens() as $token) {
-            if ($token->getType() === MySQLLexer::INVALID_BLOCK_COMMENT) {
-                throw new ParseException($token->getLine(), $token->getCharPositionInLine());
-            }
-        }
-        if ($lexer->hasUnclosedVersionComment()) throw new ParseException($lexer->getLine(), $lexer->getCharPositionInLine());
-        $parser = new MySQLParser($tokens);
-        $parser->serverVersion = $serverVersion;
-        $parser->sqlModeFromString($sqlMode);
-        $parser->removeErrorListeners();
-        $parser->addErrorListener($errors);
-        if ($sllFirst) {
-            $parser->getInterpreter()->setPredictionMode(PredictionMode::SLL);
-            $parser->setErrorHandler(new BailErrorStrategy());
-            try {
-                $tree = $parser->query();
-            } catch (ParseCancellationException | ParseException $e) {
-                // SLL failure can be a context ambiguity rather than invalid SQL.
-                // Reparse the complete token stream with full LL prediction.
-                $parser->reset();
-                $parser->getInterpreter()->setPredictionMode(PredictionMode::LL);
-                $parser->setErrorHandler(new DefaultErrorStrategy());
-                $tree = $parser->query();
-            }
-        } else {
-            $tree = $parser->query();
-        }
-        if ($tree->simpleStatement() === null && $tree->beginWork() === null) throw new ParseException(1, 0);
-        return new ParsedQuery($sql, $tokens, $tree);
+    public const GRAMMAR_VERSION='8.4.10';
+    public static function parse(string $sql,int $serverVersion=80410,string $sqlMode=''):ParsedQuery {
+        if($serverVersion<80400||$serverVersion>=80500)throw new \InvalidArgumentException('This parse table targets MySQL 8.4');
+        if(!mb_check_encoding($sql,'UTF-8'))throw new \InvalidArgumentException('SQL input must be UTF-8');
+        require_once __DIR__.'/WordPress/bootstrap.php';
+        $modes=array_values(array_filter(array_map('trim',explode(',',strtoupper($sqlMode)))));
+        $tokens=(new WP_MySQL_Lexer($sql,$serverVersion,$modes))->remaining_tokens();
+        if(!$tokens||end($tokens)->id!==0||!array_filter($tokens,fn($t)=>$t->length>0&&$t->get_bytes()!==';'))throw new ParseException();
+        $tree=WP_MySQL_Parser_Factory::create_parser()->parse($tokens);
+        if($tree===null)throw new ParseException();
+        return new ParsedQuery($sql,$tokens,$tree);
     }
 }

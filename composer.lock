@@ -4,63 +4,8 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "bac44325a3a47de9ce60785cab8b78dd",
+    "content-hash": "2bb1a74113f3392d46a49302c7729811",
     "packages": [
-        {
-            "name": "antlr/antlr4-php-runtime",
-            "version": "0.10.0",
-            "source": {
-                "type": "git",
-                "url": "https://github.com/antlr/antlr-php-runtime.git",
-                "reference": "396cbea30b6b45f97511a37effde24d98de918c6"
-            },
-            "dist": {
-                "type": "zip",
-                "url": "https://api.github.com/repos/antlr/antlr-php-runtime/zipball/396cbea30b6b45f97511a37effde24d98de918c6",
-                "reference": "396cbea30b6b45f97511a37effde24d98de918c6",
-                "shasum": ""
-            },
-            "require": {
-                "ext-mbstring": "^8.0",
-                "php": "^8.0",
-                "psr/log": "^2.0 || ^3.0"
-            },
-            "require-dev": {
-                "ergebnis/composer-normalize": "^2.15",
-                "phpstan/extension-installer": "^1.0",
-                "phpstan/phpstan": "^1.4",
-                "phpstan/phpstan-deprecation-rules": "^1.0",
-                "phpstan/phpstan-strict-rules": "^1.1",
-                "slevomat/coding-standard": "^7.0",
-                "squizlabs/php_codesniffer": "^3.6"
-            },
-            "type": "library",
-            "extra": {
-                "branch-alias": {
-                    "dev-master": "0.2-dev"
-                }
-            },
-            "autoload": {
-                "psr-4": {
-                    "Antlr\\Antlr4\\Runtime\\": "src/"
-                }
-            },
-            "notification-url": "https://packagist.org/downloads/",
-            "license": [
-                "BSD-3-Clause"
-            ],
-            "description": "PHP 8.0+ runtime for ANTLR 4",
-            "keywords": [
-                "antlr4",
-                "php",
-                "runtime"
-            ],
-            "support": {
-                "issues": "https://github.com/antlr/antlr-php-runtime/issues",
-                "source": "https://github.com/antlr/antlr-php-runtime/tree/0.10.0"
-            },
-            "time": "2026-08-15T19:53:16+00:00"
-        },
         {
             "name": "aws/aws-crt-php",
             "version": "v1.2.7",

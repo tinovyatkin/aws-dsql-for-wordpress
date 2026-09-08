@@ -1,13 +1,9 @@
 <?php
 namespace WPDSQL\MySQL;
-
-use Antlr\Antlr4\Runtime\CommonTokenStream;
-use WPDSQL\MySQL\Generated\Context\QueryContext;
+use WPDSQL\MySQL\WordPress\WP_Parser_Node;
+use WPDSQL\MySQL\WordPress\WP_Parser_Token;
 
 final class ParsedQuery {
-    public function __construct(
-        public readonly string $sql,
-        public readonly CommonTokenStream $tokens,
-        public readonly QueryContext $tree,
-    ) {}
+    /** @param list<WP_Parser_Token> $tokens Significant tokens with byte offsets; source retains whitespace/comments. */
+    public function __construct(public readonly string $sql,public readonly array $tokens,public readonly WP_Parser_Node $tree) {}
 }

@@ -1,2 +1,3 @@
-
-parser/mysql/Generated/*.php linguist-generated=true
+parser/mysql/WordPress/src/* linguist-vendored=true
+parser/mysql/WordPress/src/parser/* linguist-vendored=true
+parser/mysql/WordPress/src/mysql-parse-table.php linguist-generated=true

@@ -35,6 +35,6 @@ try {
  echo "PASS $backend result and write-effect collection\n";
 } catch(Throwable $e){$report['failure']=$e->getMessage();echo 'FAIL '.$backend.': '.$e->getMessage()."\n";}
 finally {query_check("DROP TABLE IF EXISTS $table");}
-$dir=$root.'/.local/antlr-research';if(!is_dir($dir))mkdir($dir,0700,true);
+$dir=$root.'/.local/translation-results';if(!is_dir($dir))mkdir($dir,0700,true);
 file_put_contents($dir.'/differential-'.$backend.'.json',json_encode($report,JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE));
 exit(isset($report['failure'])?1:0);

@@ -21,7 +21,7 @@ each site's plugins, schema, and workload; this is not a drop-in MySQL replaceme
 WordPress core and plugins
         │ usual wpdb / MySQL queries
         ▼
-wp-content/db.php → DSQL_WPDB → cached ANTLR translation plans
+wp-content/db.php → DSQL_WPDB → cached MySQL translation plans
         │
         ▼
 AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent worker
@@ -31,7 +31,7 @@ The DSQL implementation:
 
 - uses IAM authentication and verified TLS through the AWS PHP connector;
 - subclasses `wpdb` directly and preserves its public string-based API;
-- parses value-free MySQL templates with Oracle's ANTLR grammar, then emits DSQL
+- parses value-free MySQL templates with WordPress's standalone MySQL parser, then emits DSQL
   SQL with current PDO bindings;
 - caches compiled instructions across requests without caching values or results;
 - translates auto-increment columns into DSQL identities with explicit `CACHE 1`;
@@ -170,12 +170,13 @@ pinned, and all writers must be paused before an upgrade. See
 [controlled upgrades](docs/controlled-upgrades.md) for setup, commands, tested
 scope, and remaining limitations.
 
-## ANTLR translation and caching
+## MySQL translation and caching
 
-Version 0.5 uses Oracle's ANTLR MySQL grammar for runtime translation. Repeated
-query shapes reuse bounded, value-free plans; persistent hits avoid loading the
-ANTLR parser. See [configuration, supported forms, and verification](docs/antlr-translation.md)
-and [parser generation](docs/antlr-mysql-parser.md).
+Version 0.6 uses WordPress's standalone PHP MySQL parser, generated from MySQL's
+Bison grammar. Repeated query shapes reuse bounded, value-free plans; persistent
+hits avoid loading the parser. The generated ANTLR parser and runtime have been
+removed. See [configuration, supported forms, and verification](docs/sql-translation.md)
+and [parser sources, maintenance, and the Rust evaluation](docs/mysql-parser.md).
 
 ## Known limits
 

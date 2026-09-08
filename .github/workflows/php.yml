@@ -35,7 +35,7 @@ jobs:
         php tests/mysql-parser/corpus.php
         php tests/upgrade/parser.php
 
-    - name: Check parser regeneration
+    - name: Check pinned parser sources
       run: |
-        python3 scripts/generate-mysql-parser.py
-        git diff --exit-code -- parser/mysql/Generated
+        python3 scripts/sync-wordpress-parser.py
+        git diff --exit-code -- parser/mysql/WordPress

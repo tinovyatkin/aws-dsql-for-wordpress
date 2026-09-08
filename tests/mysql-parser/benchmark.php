@@ -1,10 +1,10 @@
 <?php
 /** Separate-process warmed timing; never executes queries. */
 $root=dirname(__DIR__,2);
-$engine=$argv[1]??'antlr';
-if(!in_array($engine,['antlr','phpmyadmin'],true))throw new InvalidArgumentException('antlr or phpmyadmin required');
-require $root.($engine==='antlr'?'/vendor/autoload.php':'/.local/parser-evaluation/vendor/autoload.php');
-$parse=$engine==='antlr'
+$engine=$argv[1]??'wordpress';
+if(!in_array($engine,['wordpress','phpmyadmin'],true))throw new InvalidArgumentException('wordpress or phpmyadmin required');
+require $root.($engine==='wordpress'?'/vendor/autoload.php':'/.local/parser-evaluation/vendor/autoload.php');
+$parse=$engine==='wordpress'
  ? static fn($sql)=>WPDSQL\MySQL\SqlParser::parse($sql)
  : static function($sql){$l=new PhpMyAdmin\SqlParser\Lexer($sql);$p=new PhpMyAdmin\SqlParser\Parser($l->list);if($l->errors||$p->errors)throw new RuntimeException('Parser errors');return $p;};
 $start=hrtime(true);$parse('SELECT 1');$cold=(hrtime(true)-$start)/1e6;

@@ -1,7 +1,7 @@
 """Check differential results, with two explicit existing backend differences."""
 import json
 from pathlib import Path
-root=Path(__file__).resolve().parents[2]/'.local/antlr-research'
+root=Path(__file__).resolve().parents[2]/'.local/translation-results'
 mysql=json.loads((root/'differential-mysql.json').read_text())
 dsql=json.loads((root/'differential-dsql.json').read_text())
 assert 'failure' not in mysql and 'failure' not in dsql, 'A backend collection failed'

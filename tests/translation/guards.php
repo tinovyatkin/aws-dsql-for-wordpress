@@ -5,6 +5,7 @@ $table=$wpdb->prefix.'translation_guards';$checks=0;
 function guard_check(bool $ok,string $name):void {global $checks,$wpdb;if(!$ok)throw new RuntimeException($name.': '.$wpdb->last_error);$checks++;}
 try {
  $wpdb->query("DROP TABLE IF EXISTS $table");
+ guard_check($wpdb->query("SELECT name FROM $table")===false,'Pre-install lookup of a missing table fails');
  $ddl="CREATE TABLE IF NOT EXISTS $table (id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,name varchar(60) NOT NULL,score int NOT NULL,payload longtext NULL,UNIQUE KEY name_key(name)) DEFAULT CHARSET=utf8mb4";
  guard_check($wpdb->query($ddl)!==false,'Create fixture');
  guard_check($wpdb->query($ddl)!==false,'Existing CREATE IF NOT EXISTS does not recreate indexes');
@@ -16,9 +17,11 @@ try {
  guard_check($wpdb->query("REPLACE INTO $table (id,name,score) VALUES (1,'first','not-an-integer')")===false,'Invalid REPLACE insert fails');
  guard_check($wpdb->get_var("SELECT score FROM $table WHERE id=1")==='5','REPLACE rollback restored its deleted row');
  guard_check($wpdb->get_var('SELECT @@SESSION.autocommit')==='1','REPLACE released its own failed transaction');
- guard_check($wpdb->query("INSERT INTO $table (id,name,score) VALUES (0,'zero-id',1)")===1&&$wpdb->insert_id===3,'Zero identity uses a generated ID');
- guard_check($wpdb->query("INSERT INTO $table VALUES (4,'implicit',3,NULL)")===1,'Implicit INSERT column order comes from current schema');
- $wpdb->query("DELETE FROM $table WHERE id IN (3,4)");
+ // Identity sequences can have gaps after an aborted concurrent transaction.
+ guard_check($wpdb->query("INSERT INTO $table (id,name,score) VALUES (0,'zero-id',1)")===1&&($generatedId=$wpdb->insert_id)>2&&$wpdb->get_var("SELECT id FROM $table WHERE name='zero-id'")===(string)$generatedId,'Zero identity uses a generated ID');
+ $implicitId=$generatedId+1;
+ guard_check($wpdb->query("INSERT INTO $table VALUES ($implicitId,'implicit',3,NULL)")===1,'Implicit INSERT column order comes from current schema');
+ $wpdb->query("DELETE FROM $table WHERE id IN ($generatedId,$implicitId)");
  guard_check($wpdb->query("SET SESSION sql_mode='PIPES_AS_CONCAT'")!==false,'Set concatenation mode');
  guard_check($wpdb->get_var("SELECT 'a'||'b'")==='ab','Concatenation mode has its own translation');
  $wpdb->query("SET SESSION sql_mode=''");

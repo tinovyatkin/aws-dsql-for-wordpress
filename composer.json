@@ -7,7 +7,6 @@
     "php": ">=8.2",
     "ext-pdo_pgsql": "*",
     "awslabs/aurora-dsql-pdo-pgsql": "^0.1",
-    "antlr/antlr4-php-runtime": "0.10.0",
     "ext-mbstring": "*"
   },
   "config": {
@@ -18,9 +17,6 @@
   "autoload": {
     "psr-4": {
       "WPDSQL\\MySQL\\": "parser/mysql/"
-    },
-    "classmap": [
-      "parser/mysql/Generated/MySQLParser.php"
-    ]
+    }
   }
 }

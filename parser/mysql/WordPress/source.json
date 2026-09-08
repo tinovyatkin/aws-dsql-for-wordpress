@@ -1,0 +1,22 @@
+{
+  "repository": "https://github.com/WordPress/sqlite-database-integration",
+  "commit": "bf181a286470be4de550112ce1f1d05322502c0e",
+  "package": "packages/mysql-parser",
+  "namespace": "WPDSQL\\MySQL\\WordPress",
+  "patches": [
+    "namespace-imports",
+    "strict-comment-termination-v1"
+  ],
+  "sha256": {
+    "LICENSE": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+    "README.md": "64972bd5d83dae52b5cb2f7b2888b01e4cdfb52551f4ace0faa91717fd5f51e8",
+    "src/class-wp-mysql-lexer.php": "9363dff1822c86bc3bfc7724d6ed79a9bd6ec005264092c2cb3387826df5cd81",
+    "src/class-wp-mysql-token.php": "78d7d8bdba4fdcded65aba0aba1bacdf607fe2d931d552fc5847886af2e2a825",
+    "src/class-wp-mysql-parser-factory.php": "46ad6a195ccdd9af251b57065c7e00cd4e451b86c391035e63bb5f70f62c9f1d",
+    "src/mysql-parse-table.php": "def7681ff10bb47324ab89cd2f7af3142a0d72381d64c42abc92f7e9d28f8199",
+    "src/parser/class-wp-parser.php": "5ae940a91a30533c234961723ce760019061ea9fbaf62db51ec5de7d9f8817d0",
+    "src/parser/class-wp-parser-grammar.php": "8bfbb54a4275b49682ca699c9b41c8f5a21efb0bf1924b15aa5c3580bcbda479",
+    "src/parser/class-wp-parser-node.php": "874c3efaeda6a6671141abf159815ef0447327d17189429f96bddf6e4ac77372",
+    "src/parser/class-wp-parser-token.php": "943fa6ed1b4ef16448384127ad49ad3ea85ab879a07b0106135297a1317d3344"
+  }
+}

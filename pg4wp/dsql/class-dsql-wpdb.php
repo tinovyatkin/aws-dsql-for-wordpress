@@ -257,6 +257,13 @@ class DSQL_WPDB extends wpdb {
                 throw new RuntimeException('Controlled DSQL upgrade stopped after a database/schema failure; inspect its private journal');
             }
             return false;
+        } finally {
+            // Installation probes missing tables before creating them. DDL can also
+            // partially succeed, so discard catalog misses even when a batch fails.
+            if (in_array($operation,['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true)) {
+                $this->schemaCatalog->clear();
+                $this->translator->refreshSchemaMetadata();
+            }
         }
     }
 

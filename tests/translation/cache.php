@@ -9,8 +9,8 @@ $pdo=new class extends PDO {public function __construct(){}};
 $t=new DSQL_SQL($pdo);
 if(($argv[1]??'')==='child') {
  $result=$t->translate("SELECT CONCAT('different-secret', LOWER('B'))");
- if($t->stats()['disk_hits']!==1||$t->stats()['compilations']!==0||class_exists(WPDSQL\MySQL\Generated\MySQLParser::class,false))throw new RuntimeException('Persistent hit loaded the parser');
- echo "PASS separate-process cache hit without ANTLR loading\n";exit;
+ if($t->stats()['disk_hits']!==1||$t->stats()['compilations']!==0||class_exists(WPDSQL\MySQL\WordPress\WP_Parser::class,false))throw new RuntimeException('Persistent hit loaded the parser');
+ echo "PASS separate-process cache hit without parser loading\n";exit;
 }
 $checks=0;
 function verify(bool $ok,string $name):void {global $checks;if(!$ok)throw new RuntimeException($name);$checks++;}

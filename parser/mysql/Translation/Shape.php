@@ -51,7 +51,7 @@ final class Shape {
                 $op??=$c;$parts[]='o:'.$op;$i+=strlen($op);
             }
             $compile[]=$replacement??substr($sql,$start,$i-$start);
-            $charOffset+=mb_strlen(substr($sql,$start,$i-$start),'UTF-8');
+            $charOffset=$i; // WordPress lexer offsets are bytes.
         }
         $this->template=implode('',$compile);
         $this->key=hash('sha256',json_encode($parts,JSON_THROW_ON_ERROR));

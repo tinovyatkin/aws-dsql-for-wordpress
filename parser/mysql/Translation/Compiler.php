@@ -1,12 +1,12 @@
 <?php
 namespace WPDSQL\MySQL\Translation;
 
-use Antlr\Antlr4\Runtime\ParserRuleContext;
-use Antlr\Antlr4\Runtime\Tree\TerminalNode;
-use Antlr\Antlr4\Runtime\Token;
+use WPDSQL\MySQL\Node;
+use WPDSQL\MySQL\Token;
+use WPDSQL\MySQL\TreeAdapter;
 use WPDSQL\MySQL\SqlParser;
 
-/** Compile ANTLR contexts into value-free, serializable translation instructions. */
+/** Compile normalized WordPress parser nodes into value-free, serializable translation instructions. */
 final class Compiler {
     private array $tables=[];
     private array $unqualified=[];
@@ -22,16 +22,16 @@ final class Compiler {
     private array $termGroup=[];
     private Shape $shape;
     public function __construct(Shape $shape) {$this->shape=new Shape($shape->template,$shape->sqlMode);}
-    private static function tag(object $node):string {return substr(strrchr(get_class($node),'\\'),1,-7);}
+    private static function tag(object $node):string {return $node->kind;}
     public static function sql(array $parts):array {return ['op'=>'sql','parts'=>$parts];}
     private static function id(string $raw):string {
         if(in_array($raw[0]??'',['`','"'],true)){$q=$raw[0];return str_replace($q.$q,$q,substr($raw,1,-1));}return $raw;
     }
     private function kids(object $ctx):array { $out=[];for($i=0;$i<$ctx->getChildCount();$i++)$out[]=$ctx->getChild($i);return $out; }
     private function contexts(object $ctx,string $tag,bool $deep=true):array {
-        $out=[];foreach($this->kids($ctx) as $c)if($c instanceof ParserRuleContext){if(self::tag($c)===$tag)$out[]=$c;elseif($deep)$out=array_merge($out,$this->contexts($c,$tag));}return $out;
+        $out=[];foreach($this->kids($ctx) as $c)if($c instanceof Node){if(self::tag($c)===$tag)$out[]=$c;elseif($deep)$out=array_merge($out,$this->contexts($c,$tag));}return $out;
     }
-    private function has(object $ctx,string $text):bool {foreach($this->kids($ctx) as $c)if($c instanceof TerminalNode&&strcasecmp($c->getText(),$text)===0)return true;return false;}
+    private function has(object $ctx,string $text):bool {foreach($this->kids($ctx) as $c)if($c instanceof Token&&strcasecmp($c->getText(),$text)===0)return true;return false;}
     private function names(object $ctx):array {return array_map(fn($i)=>self::id($i->getText()),$this->contexts($ctx,'Identifier'));}
     private function column(object $ctx):array {
         $parts=$this->names($ctx);if(!$parts)$parts=[self::id($ctx->getText())];
@@ -54,14 +54,14 @@ final class Compiler {
                 if($node->tableAlias())$local[self::id($node->tableAlias()->identifier()->getText())]=$name;
                 return;
             }
-            foreach($this->kids($node) as $c)if($c instanceof ParserRuleContext)$walk($c);
+            foreach($this->kids($node) as $c)if($c instanceof Node)$walk($c);
         };
         $walk($ctx);$this->tables=array_replace($this->tables,$local);
         if($local)$this->unqualified=array_values(array_unique($local));
     }
     private function specifications(object $ctx):array {
         if(self::tag($ctx)==='QuerySpecification')return [$ctx];
-        $out=[];foreach($this->kids($ctx) as $child)if($child instanceof ParserRuleContext&&in_array(self::tag($child),['QueryExpression','QueryExpressionBody','QueryPrimary','QuerySpecification','QueryExpressionParens','QueryExpressionWithOptLockingClauses'],true))$out=array_merge($out,$this->specifications($child));
+        $out=[];foreach($this->kids($ctx) as $child)if($child instanceof Node&&in_array(self::tag($child),['QueryExpression','QueryExpressionBody','QueryPrimary','QuerySpecification','QueryExpressionParens','QueryExpressionWithOptLockingClauses'],true))$out=array_merge($out,$this->specifications($child));
         return $out;
     }
     private function globalAggregate(array $items):bool {
@@ -76,10 +76,11 @@ final class Compiler {
     }
     public function compile():array {
         $parsed=SqlParser::parse($this->shape->sql,sqlMode:$this->shape->sqlMode);
-        $simple=$parsed->tree->simpleStatement();$root=$simple?$this->kids($simple)[0]:$parsed->tree->beginWork();
+        $tree=(new TreeAdapter())->convert($parsed->tree);$simple=$tree->simpleStatement();$root=$simple?$this->kids($simple)[0]:$tree->beginWork();
+        if(!$root)throw new \RuntimeException('A single nonempty statement is required');
         $tag=self::tag($root);
         if(in_array($tag,['CreateStatement','AlterStatement','DropStatement','RenameTableStatement','TruncateTableStatement'],true))return ['kind'=>'ddl','tag'=>$tag];
-        if(!in_array($tag,['SelectStatement','InsertStatement','UpdateStatement','DeleteStatement','ReplaceStatement','TransactionOrLockingStatement','BeginWork'],true))throw new \RuntimeException('Statement requires the metadata or controlled schema path: '.$tag);
+        if(!in_array($tag,['SelectStatement','InsertStatement','UpdateStatement','DeleteStatement','ReplaceStatement','TransactionOrLockingStatement','TransactionStatement','SavepointStatement','BeginWork'],true))throw new \RuntimeException('Statement requires the metadata or controlled schema path: '.$tag);
         if($tag==='SelectStatement')$this->rootExpression=$root->queryExpression();
         $body=$this->render($root);$count=null;
         if($this->calc){$this->omitLimit=$this->rootExpression?->limitClause();$count=$this->render($root);$this->omitLimit=null;}
@@ -89,9 +90,9 @@ final class Compiler {
     private function render(object $ctx):array|string {
         if($ctx===$this->omitLimit||$ctx===$this->omitOrder)return '';
         if($ctx===$this->replaceOrder)return $this->replacementOrder;
-        if($ctx instanceof TerminalNode) {
+        if($ctx instanceof Token) {
             $token=$ctx->getSymbol();$raw=$token->getText();
-            if($token->getType()===Token::EOF||$raw===';')return '';
+            if($token->isEnd()||$raw===';')return '';
             if(isset($this->shape->offsets[$token->getStartIndex()])) {
                 $index=$this->shape->offsets[$token->getStartIndex()];
                 return ['op'=>'slot','index'=>$index,'kind'=>$this->shape->slots[$index]['kind']];
@@ -116,7 +117,7 @@ final class Compiler {
         if($tag==='SelectItemList') {
             $parts=[];$position=0;
             foreach($this->kids($ctx) as $item) {
-                if($item instanceof ParserRuleContext&&self::tag($item)==='SelectItem'&&$item->expr())$parts[]=['op'=>'select_item','position'=>$position++,'value'=>$this->render($item->expr()),'alias'=>$item->selectAlias()?$this->render($item->selectAlias()):''];
+                if($item instanceof Node&&self::tag($item)==='SelectItem'&&$item->expr())$parts[]=['op'=>'select_item','position'=>$position++,'value'=>$this->render($item->expr()),'alias'=>$item->selectAlias()?$this->render($item->selectAlias()):''];
                 else $parts[]=$this->render($item);
             }return self::sql($parts);
         }
@@ -165,7 +166,7 @@ final class Compiler {
             $saved=$this->tables;$savedUnqualified=$this->unqualified;$this->bindTables($ctx->fromClause());
             try {
                 if($ctx!==$this->termDistinctSpec)return $this->renderChildren($ctx);
-                $parts=[];foreach($this->kids($ctx) as $child)if(!($child instanceof ParserRuleContext&&self::tag($child)==='SelectOption'&&strtoupper($child->getText())==='DISTINCT'))$parts[]=$this->render($child);
+                $parts=[];foreach($this->kids($ctx) as $child)if(!($child instanceof Node&&self::tag($child)==='SelectOption'&&strtoupper($child->getText())==='DISTINCT'))$parts[]=$this->render($child);
                 $parts[]='GROUP BY';foreach($this->termGroup as $i=>$col){if($i)$parts[]=',';$parts[]=$col;}
                 return ['op'=>'term_distinct','table'=>$this->tables['t'],'body'=>self::sql($parts)];
             }finally{$this->tables=$saved;$this->unqualified=$savedUnqualified;}
@@ -211,7 +212,7 @@ final class Compiler {
             $args=$ctx->expr();if(count($args)!==1||$this->has($ctx,'FROM')||$this->has($ctx,'LEADING')||$this->has($ctx,'TRAILING')||$this->has($ctx,'BOTH'))throw new \RuntimeException('Custom TRIM semantics require explicit support');
             return ['op'=>'function','name'=>'TRIM','args'=>[$this->render($args[0])]];
         }
-        if($tag==='RuntimeFunctionCall'&&$this->kids($ctx)[0] instanceof ParserRuleContext) {
+        if($tag==='RuntimeFunctionCall'&&$this->kids($ctx)[0] instanceof Node) {
             $child=$this->kids($ctx)[0];if(!in_array(self::tag($child),['SubstringFunction','TrimFunction'],true))throw new \RuntimeException('Unsupported runtime function construct');return $this->render($child);
         }
         if(in_array($tag,['FunctionCallGeneric','RuntimeFunctionCall'],true))return $this->functionCall($ctx);
@@ -222,10 +223,10 @@ final class Compiler {
         if(in_array($tag,['BeginWork','TransactionStatement','RollbackStatement'],true)) {
             $word=strtoupper($this->kids($ctx)[0]->getText());
             if(!in_array($word,['BEGIN','START','COMMIT','ROLLBACK'],true))throw new \RuntimeException('Unsupported transaction command');
-            if($word==='START'&&$ctx->getText()!=='STARTTRANSACTION')throw new \RuntimeException('Transaction options require explicit support');
+            if(!in_array(strtoupper($ctx->getText()),['BEGIN','BEGINWORK','STARTTRANSACTION','COMMIT','COMMITWORK','ROLLBACK','ROLLBACKWORK'],true))throw new \RuntimeException('Transaction options require explicit support');
             return $word==='START'?'BEGIN':$word;
         }
-        if($tag==='SavepointStatement'&&strtoupper($ctx->getText())==='ROLLBACK')return 'ROLLBACK';
+        if($tag==='SavepointStatement'&&in_array(strtoupper($ctx->getText()),['ROLLBACK','ROLLBACKWORK'],true))return 'ROLLBACK';
         if($tag==='SavepointStatement'||$tag==='LockStatement'||$tag==='XaStatement')throw new \RuntimeException('Unsupported DSQL transaction operation');
         return $this->renderChildren($ctx);
     }
@@ -240,7 +241,7 @@ final class Compiler {
     private function functionArgs(object $ctx):array {
         // Collect top-level expression arguments, never descendants of an expression.
         $out=[];
-        $walk=function($node)use(&$walk,&$out){foreach($this->kids($node) as $c)if($c instanceof ParserRuleContext){$tag=self::tag($c);if(str_starts_with($tag,'Expr')&&in_array($tag,['ExprIs','ExprAnd','ExprOr','ExprNot','ExprXor'],true))$out[]=$this->render($c);elseif(in_array($tag,['ExprList','ExprListWithParentheses','ExprWithParentheses','UdfExprList','UdfExpr'],true))$walk($c);}};
+        $walk=function($node)use(&$walk,&$out){foreach($this->kids($node) as $c)if($c instanceof Node){$tag=self::tag($c);if(str_starts_with($tag,'Expr')&&in_array($tag,['ExprIs','ExprAnd','ExprOr','ExprNot','ExprXor'],true))$out[]=$this->render($c);elseif(in_array($tag,['ExprList','ExprListWithParentheses','ExprWithParentheses','UdfExprList','UdfExpr'],true))$walk($c);}};
         $walk($ctx);return $out;
     }
     private function functionCall(object $ctx):array {
@@ -272,7 +273,7 @@ final class Compiler {
         return ['op'=>'aggregate','name'=>$name,'args'=>$args,'distinct'=>$this->has($ctx,'DISTINCT'),'order'=>$ctx->orderClause()?$this->render($ctx->orderClause()):null,'separator'=>$separator];
     }
     private function assignments(object $list,string $table):array {
-        $out=[];$assigned=[];foreach($this->kids($list) as $c)if($c instanceof ParserRuleContext) {
+        $out=[];$assigned=[];foreach($this->kids($list) as $c)if($c instanceof Node) {
             $kids=$this->kids($c);$field=$this->column($kids[0]);$field['tables']=[$table];$field['qualifier']=null;
             $value=$this->render($kids[count($kids)-1]);
             $references=[];$scan=function($n)use(&$scan,&$references){if(!is_array($n))return;if(($n['op']??null)==='column')$references[]=strtolower($n['name']);foreach($n as $v)if(is_array($v))$scan($v);};$scan($value);
@@ -287,7 +288,7 @@ final class Compiler {
         $columns=$constructor->fields()?array_map(fn($n)=>self::id($n->getText()),$constructor->fields()->insertIdentifier()):null;
         $rows=[];
         foreach($constructor->insertValues()->valueList()->values() as $row) {
-            $values=[];foreach($this->kids($row) as $c)if(!($c instanceof TerminalNode&&$c->getText()===','))$values[]=$this->render($c);
+            $values=[];foreach($this->kids($row) as $c)if(!($c instanceof Token&&$c->getText()===','))$values[]=$this->render($c);
             if($columns!==null&&count($values)!==count($columns))throw new \RuntimeException('INSERT column/value count mismatch');$rows[]=$values;
         }
         $updates=[];

@@ -3,9 +3,9 @@ namespace WPDSQL\MySQL\Translation;
 
 /** Bounded, optional private JSON cache. Never stores bindings or PHP objects. */
 final class PlanCache {
-    public const VERSION='antlr-plan-v5';
+    public const VERSION='wordpress-lalr-plan-v1';
     private static ?string $build=null;
-    public static function buildFingerprint():string {return self::$build??=hash('sha256',self::VERSION.hash_file('sha256',__DIR__.'/Compiler.php').hash_file('sha256',__DIR__.'/Renderer.php').hash_file('sha256',__DIR__.'/Shape.php'));}
+    public static function buildFingerprint():string {return self::$build??=hash('sha256',self::VERSION.hash_file('sha256',dirname(__DIR__).'/TreeAdapter.php').hash_file('sha256',dirname(__DIR__).'/Node.php').hash_file('sha256',dirname(__DIR__).'/Token.php').hash_file('sha256',dirname(__DIR__).'/SqlParser.php').hash_file('sha256',dirname(__DIR__).'/WordPress/source.json').hash_file('sha256',__DIR__.'/Compiler.php').hash_file('sha256',__DIR__.'/Renderer.php').hash_file('sha256',__DIR__.'/Shape.php'));}
     private array $memory=[];
     private int $bytes=0;
     private ?string $directory=null;

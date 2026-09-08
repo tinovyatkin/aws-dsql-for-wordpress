@@ -18,6 +18,12 @@ final class translationTest extends TestCase {
         };
         return (new Renderer($pdo,'public',false))->render($plan['body'],$shape);
     }
+    public function test_transaction_boundaries_preserve_their_meaning():void {
+        foreach(['BEGIN'=>'BEGIN','BEGIN WORK'=>'BEGIN','START TRANSACTION'=>'BEGIN','start transaction'=>'BEGIN','COMMIT'=>'COMMIT','COMMIT WORK'=>'COMMIT','ROLLBACK'=>'ROLLBACK','ROLLBACK WORK'=>'ROLLBACK'] as $sql=>$expected)self::assertSame($expected,$this->translate($sql)['sql']);
+        foreach(['START TRANSACTION READ ONLY','COMMIT AND CHAIN','COMMIT RELEASE','ROLLBACK TO SAVEPOINT x','SAVEPOINT x','RELEASE SAVEPOINT x'] as $sql) {
+            try{$this->translate($sql);self::fail('Unsupported transaction accepted: '.$sql);}catch(RuntimeException $e){self::assertNotEmpty($e->getMessage());}
+        }
+    }
     public function test_values_are_bound_not_compiled_into_sql():void {
         $a=$this->translate("SELECT CONCAT('a; DROP TABLE t', LOWER('SECOND')) AS value");
         self::assertSame(['a; DROP TABLE t','SECOND'],$a['params']);
@@ -30,7 +36,7 @@ final class translationTest extends TestCase {
         self::assertMatchesRegularExpression('/SELECT 10\s+LIMIT 1/',$result['sql']);
         self::assertMatchesRegularExpression('/ORDER BY 2\s+LIMIT 4 OFFSET 3/',$result['sql']);
     }
-    public function test_values_never_reach_antlr_template():void {
+    public function test_values_never_reach_parser_template():void {
         $shape=new Shape("SELECT '".str_repeat('large-private-content',10000)."', 2147483648");
         self::assertLessThan(100,strlen($shape->template));
         self::assertStringNotContainsString('large-private-content',$shape->template);
