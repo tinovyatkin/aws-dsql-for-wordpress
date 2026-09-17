@@ -35,6 +35,8 @@ final class Driver {
     private ?\WPDSQLUpgrade\Engine $schemaUpgrade = null;
     private ?\WPDSQLUpgrade\Session $upgradeSession = null;
     private string $schema;
+    private array $pendingPrepared=[];
+    private int $pendingPreparedBytes=0;
 
     /** The optional factory/clock support injected transports and deterministic lifecycle tests. */
     public function __construct(private readonly Config $config, ?\Closure $connector = null, ?\Closure $clock = null) {
@@ -42,7 +44,7 @@ final class Driver {
         $this->clock = $clock ?? static fn() => microtime(true);
         $this->schema = $config->schema;
         $this->client_info = self::MYSQL_VERSION.'-mysql-on-dsql';
-        $this->connect();
+        // Redis can satisfy an entire request without opening a database connection.
     }
     private function connect(): void {
         try {
@@ -56,6 +58,8 @@ final class Driver {
                 $this->translator = new DSQL_SQL($pdo, $c->valueCodec, $c->schema, $c->sqlMode,
                     $c->host, $c->cacheDirectory, $c->cacheEnabled, $c->tablePrefix);
             }
+            foreach($this->pendingPrepared as $sql)$this->translator->rememberPrepared($sql);
+            $this->pendingPrepared=[];$this->pendingPreparedBytes=0;
             $this->pdo = $pdo;
             $this->schemaCatalog = new DSQL_Schema_Catalog($pdo);
             $this->introspection = new \WPDSQL\Schema\Introspection($pdo,$this->schemaCatalog,$this->schema,$this->config->database);
@@ -69,6 +73,7 @@ final class Driver {
     public function checkConnection(): void {
         if ($this->closed) { throw new RuntimeException('DSQL driver is closed'); }
         $this->upgradeSession?->assertActive();
+        if($this->pdo===null){$this->connect();return;}
         // A logical transaction must never be split across physical connections.
         if (($this->clock)() - $this->connectedAt >= 3300 && !$this->pdo->inTransaction()) {
             $this->connect();
@@ -86,13 +91,23 @@ final class Driver {
             unset($this->translator, $this->schemaCatalog, $this->introspection);
             $this->pdo = null;
             $this->indexJobs = [];
+            $this->pendingTables=[];
+            $this->pendingPrepared=[];$this->pendingPreparedBytes=0;
         }
     }
     public function inTransaction(): bool { return $this->pdo?->inTransaction() ?? false; }
     public function queryCount(): int { return $this->queries; }
-    public function sqlMode(): string { return $this->translator->sqlMode(); }
-    public function cacheStats(): array { return $this->translator->stats(); }
-    public function rememberPrepared(string $sql): void { $this->translator->rememberPrepared($sql); }
+    public function sqlMode(): string { return isset($this->translator)?$this->translator->sqlMode():$this->config->sqlMode; }
+    public function cacheStats(): array { return isset($this->translator)?$this->translator->stats():['hits'=>0,'misses'=>0,'disk_hits'=>0,'writes'=>0,'errors'=>0,'compilations'=>0,'prepared_hits'=>0,'persistent_cache'=>false]; }
+    public function isConnected(): bool { return $this->pdo!==null; }
+    public function rememberPrepared(string $sql): void {
+        if($this->closed)throw new RuntimeException('DSQL driver is closed');
+        if(isset($this->translator)){$this->translator->rememberPrepared($sql);return;}
+        $size=strlen($sql);if($size>65536)return;$key=hash('sha256',$sql);
+        if(isset($this->pendingPrepared[$key]))$this->pendingPreparedBytes-=strlen($this->pendingPrepared[$key]);
+        $this->pendingPrepared[$key]=$sql;$this->pendingPreparedBytes+=$size;
+        while(count($this->pendingPrepared)>64||$this->pendingPreparedBytes>1048576){$key=array_key_first($this->pendingPrepared);$this->pendingPreparedBytes-=strlen($this->pendingPrepared[$key]);unset($this->pendingPrepared[$key]);}
+    }
     public function serverInfo(): string { return 'Aurora DSQL (PostgreSQL-compatible)'; }
 
     /** MySQL escaping only; WordPress adds its placeholder-escape markers above this layer. */
@@ -220,8 +235,10 @@ final class Driver {
     private function isDdl(): bool { return in_array($this->operation, ['CREATE','ALTER','DROP','RENAME','TRUNCATE'], true); }
     public function enableSchemaUpgrade(\WPDSQLUpgrade\Session $session): void {
         require_once dirname(__DIR__).'/upgrade/Engine.php';
-        $this->schemaUpgrade = new \WPDSQLUpgrade\Engine($this->pdo, $session);
         $this->upgradeSession = $session;
+        $this->schemaUpgrade = null;
+        $this->checkConnection();
+        $this->schemaUpgrade ??= new \WPDSQLUpgrade\Engine($this->pdo, $session);
     }
     public function verifySchemaUpgrade(): array {
         if (!$this->schemaUpgrade) { throw new RuntimeException('No controlled upgrade context'); }
@@ -229,6 +246,7 @@ final class Driver {
     }
     /** Explicit single-writer import/installation operation, never an ordinary INSERT side effect. */
     public function reseedIdentity(string $table, string $column): void {
+        $this->checkConnection();
         $tableSql = \WPDSQL\MySQL\Translation\Renderer::qi($table);
         $columnSql = \WPDSQL\MySQL\Translation\Renderer::qi($column);
         $s = $this->pdo->prepare("SELECT setval(pg_get_serial_sequence(?, ?), (SELECT MAX($columnSql) FROM $tableSql))");

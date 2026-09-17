@@ -39,8 +39,8 @@ final class Renderer {
     private function bind(mixed $value):string {$this->params[]=$value;return '?';}
     private function metadata(string $table):array {
         if(!isset($this->columns[$table])) {
-            $s=$this->pdo->prepare('SELECT column_name,data_type,is_nullable,column_default,is_identity FROM information_schema.columns WHERE table_schema=? AND table_name=? ORDER BY ordinal_position');
-            $s->execute([$this->schema,$table]);$this->columns[$table]=[];
+            $s=$this->pdo->prepare("SELECT attname AS column_name,atttypid::regtype::text AS data_type,CASE WHEN attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,CASE WHEN attidentity IN ('a','d') THEN 'YES' ELSE 'NO' END AS is_identity FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass(?) AND attnum>0 AND NOT attisdropped ORDER BY attnum");
+            $s->execute([self::qi($this->schema).'.'.self::qi($table)]);$this->columns[$table]=[];
             foreach($s->fetchAll(\PDO::FETCH_ASSOC) as $r)$this->columns[$table][strtolower($r['column_name'])]=$r;
         }return $this->columns[$table];
     }

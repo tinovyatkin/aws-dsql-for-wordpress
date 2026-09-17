@@ -15,7 +15,8 @@ final class CoreSqlFixturePDO extends PDO {
         }
         if(str_starts_with($query,'SELECT COUNT(*) FROM '))return [['count'=>'21']];
         if(str_starts_with($query,'SELECT 1 FROM '))return [['readable'=>'1']];
-        if(str_starts_with($query,'SELECT column_name,')){
+        if(str_starts_with($query,'SELECT column_name,')||str_starts_with($query,'SELECT attname AS column_name,')){
+            if(count($params)===1)$params=[null,explode('.',str_replace('"','',$params[0]))[1]];
             if(!in_array($params[1],['wp_posts','wp_options','wp_postmeta','wp_usermeta'],true))return [];
             $columns=['ID'=>'bigint','post_id'=>'bigint','user_id'=>'bigint','option_id'=>'bigint','post_date'=>'timestamp without time zone','post_title'=>'text','post_excerpt'=>'text','post_content'=>'text','post_password'=>'text','meta_key'=>'text','meta_value'=>'text','option_name'=>'text','option_value'=>'text','autoload'=>'text'];
             $rows=[];foreach($columns as $name=>$type)$rows[]=['column_name'=>$name,'data_type'=>$type,'is_nullable'=>'NO','column_default'=>null,'is_identity'=>'NO','character_maximum_length'=>null];return $rows;

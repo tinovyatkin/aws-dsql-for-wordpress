@@ -153,3 +153,23 @@ Version 0.8 implements the shared logical model, AST-derived DDL, catalog migrat
 metadata query support and WordPress column contracts described in
 [the logical-schema documentation](logical-schema.md). The installation, binding,
 retry and controlled-upgrade boundaries introduced here remain in place.
+
+
+## Connection and physical metadata performance (0.10)
+
+Construction now creates a logical driver without opening PDO. Queries, explicit
+`checkConnection()`, identity reseeding and controlled schema upgrades establish
+the physical connection. Escaping, version reporting, transaction-state checks,
+prepare capture and statistics work before connection. `isConnected()` exposes
+this distinction. `cacheStats()` reports zero counters and an inactive persistent
+cache until initialization. Before connection, prepared SQL is retained only in a
+bounded request-local queue (64 entries, 1 MiB; individual strings over 64 KiB are
+not retained). Closing an unused driver does not open a connection.
+
+The renderer obtains its live physical column names/types/nullability/identity
+flags directly from `pg_catalog.pg_attribute`, resolving the schema-qualified
+relation with a bound `to_regclass()` value. Unused defaults are no longer fetched.
+Dropped/system columns are excluded; missing relations return no metadata. This
+keeps the existing per-request cache and refresh behavior, without a persistent
+schema cache. Logical introspection and schema fingerprint verification keep
+their richer queries unchanged.

@@ -47,6 +47,38 @@ final class engineTest extends TestCase {
     private function driver(EngineTestPdo $pdo): Driver {
         return new Driver(new Config('synthetic.invalid', cacheDirectory:''), fn()=>$pdo);
     }
+    public function test_no_connection_for_cached_request_helpers_and_prepared_capture_survives(): void {
+        $calls=0;$pdo=new EngineTestPdo();
+        $driver=new Driver(new Config('synthetic.invalid',cacheDirectory:''),function()use(&$calls,$pdo){$calls++;return $pdo;});
+        self::assertFalse($driver->isConnected());self::assertSame(0,$calls);
+        self::assertSame("a\\\\b\\'c",$driver->escape("a\\b'c"));
+        self::assertSame('', $driver->sqlMode());self::assertFalse($driver->inTransaction());
+        self::assertSame(0,$driver->cacheStats()['hits']);$driver->serverInfo();
+        $driver->rememberPrepared("SELECT 'captured'");self::assertSame(0,$calls);
+        self::assertSame('captured',$driver->query("SELECT 'captured'")->fetchColumn());
+        self::assertSame(1,$calls);self::assertSame(1,$driver->cacheStats()['prepared_hits']);
+    }
+    public function test_explicit_connection_check_and_close_before_connect(): void {
+        $calls=0;$connect=function()use(&$calls){$calls++;return new EngineTestPdo();};
+        $driver=new Driver(new Config('synthetic.invalid'),$connect);$driver->close();
+        self::assertSame(0,$calls);self::assertFalse($driver->isConnected());
+        try{$driver->checkConnection();self::fail('Closed driver reopened');}catch(RuntimeException $e){}
+        $driver=new Driver(new Config('synthetic.invalid'),$connect);$driver->checkConnection();$driver->checkConnection();
+        self::assertSame(1,$calls);self::assertTrue($driver->isConnected());$driver->close();
+    }
+    public function test_deferred_connection_failure_is_redacted_and_can_be_retried(): void {
+        $calls=0;$driver=new Driver(new Config('synthetic.invalid'),function()use(&$calls){if(++$calls===1)throw new RuntimeException('private credential detail');return new EngineTestPdo();});
+        try{$driver->query('SELECT 1');self::fail('Connection failure swallowed');}catch(QueryException $e){self::assertSame('connect',$e->stage);self::assertStringNotContainsString('private credential detail',(string)$e);}
+        self::assertFalse($driver->isConnected());self::assertSame('1',$driver->query('SELECT 1')->fetchColumn());self::assertSame(2,$calls);
+    }
+    public function test_escaping_before_connection_respects_configured_mode_and_queue_is_bounded(): void {
+        $driver=new Driver(new Config('synthetic.invalid',sqlMode:'NO_BACKSLASH_ESCAPES'),fn()=>throw new LogicException('Unexpected connect'));
+        self::assertSame("a\\b''c",$driver->escape("a\\b'c"));
+        for($i=0;$i<100;$i++)$driver->rememberPrepared("SELECT '$i'");
+        $pending=(new ReflectionProperty($driver,'pendingPrepared'))->getValue($driver);self::assertCount(64,$pending);
+        $driver->rememberPrepared(str_repeat('x',65537));self::assertCount(64,(new ReflectionProperty($driver,'pendingPrepared'))->getValue($driver));
+        $driver->close();self::assertSame([],(new ReflectionProperty($driver,'pendingPrepared'))->getValue($driver));
+    }
     public function test_standalone_engine_binds_current_values_and_reuses_the_plan(): void {
         $pdo = new EngineTestPdo(); $driver = $this->driver($pdo);
         self::assertSame('first', $driver->query("SELECT 'first'")->fetchColumn());
@@ -113,7 +145,7 @@ final class engineTest extends TestCase {
         foreach ([false,true] as $outer) {
             $pdo = new EngineTestPdo(); $pdo->transaction = $outer; $deletes = 0; $inserts = 0;
             $pdo->handler = function($sql) use (&$deletes,&$inserts) {
-                if (str_contains($sql,'information_schema.columns')) {
+                if (str_contains($sql,'FROM pg_catalog.pg_attribute')) {
                     return ['rows'=>[
                         ['column_name'=>'id','data_type'=>'bigint','is_nullable'=>'NO','column_default'=>null,'is_identity'=>'YES'],
                         ['column_name'=>'name','data_type'=>'character varying','is_nullable'=>'NO','column_default'=>null,'is_identity'=>'NO'],
@@ -163,7 +195,7 @@ final class engineTest extends TestCase {
         self::assertSame('ANSI_QUOTES', $driver->sqlMode());
     }
     public function test_close_rejects_queries_and_escaping(): void {
-        $pdo = new EngineTestPdo(); $driver = $this->driver($pdo); $pdo->transaction = true; $driver->close();
+        $pdo = new EngineTestPdo(); $driver = $this->driver($pdo); $driver->checkConnection(); $pdo->transaction = true; $driver->close();
         self::assertFalse($pdo->transaction);
         self::assertFalse($driver->inTransaction());
         try { $driver->query('SELECT 1'); self::fail('Closed driver executed SQL'); } catch (QueryException $e) { self::assertSame('connect', $e->stage); }

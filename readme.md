@@ -47,7 +47,9 @@ AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent 
 
 One logical MySQL schema model serves installation, restored
 metadata, AST-derived DDL and introspection. The standalone engine owns connection
-renewal, SQL execution, session state, retries and buffered results. See
+renewal, SQL execution, session state, retries and buffered results. Version 0.10
+defers physical connections until a query needs one and reads renderer column
+metadata directly from the PostgreSQL catalog, retaining per-request freshness. See
 [the engine API](docs/standalone-engine.md) and
 [the logical schema and catalog migration](docs/logical-schema.md).
 
