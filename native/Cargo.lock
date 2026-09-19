@@ -2685,6 +2685,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -3708,10 +3709,14 @@ name = "wp-dsql-native"
 version = "0.1.0"
 dependencies = [
  "aurora-dsql-sqlx-connector",
+ "base64 0.22.1",
  "chrono",
  "ext-php-rs",
  "lru",
+ "regex",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlparser",
  "sqlx",
  "tokio",

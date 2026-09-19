@@ -1,6 +1,7 @@
 //! Experimental complete MySQL → DSQL operation. Never loaded by the production drop-in.
 pub mod compiler;
 pub mod engine;
+pub mod value;
 
 #[cfg(feature = "php")]
 mod php {
