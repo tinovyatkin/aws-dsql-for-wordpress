@@ -14,7 +14,7 @@ use DSQL_Schema_Catalog;
 use DSQL_Value_Codec;
 
 /** MySQL compatibility and DSQL execution without WordPress bootstrap or hooks. */
-final class Driver {
+class Driver {
     public const MYSQL_VERSION = '8.0.17';
     public readonly string $client_info;
     private ?PDO $pdo = null;

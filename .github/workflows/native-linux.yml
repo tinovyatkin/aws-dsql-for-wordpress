@@ -1,0 +1,31 @@
+name: Native Linux PHP extension
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/native-dsql-production]
+    paths: [native/**, .github/workflows/native-linux.yml]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and test Debian 12 amd64 PHP 8.5.10 extension
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: native/build/Dockerfile
+          build-args: SOURCE_COMMIT=${{ github.sha }}
+          platforms: linux/amd64
+          target: artifact
+          outputs: type=local,dest=artifact
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-php85-debian12-amd64
+          path: artifact/
+          retention-days: 14

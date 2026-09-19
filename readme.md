@@ -5,9 +5,8 @@ MySQL compatibility engine, cached SQL translation, migration tooling, and
 controlled schema upgrades.
 
 WordPress uses its official `wp-content/db.php` extension point. The DSQL driver
-extends the installed core `wpdb` class and connects through AWS's
-[`awslabs/aurora-dsql-pdo-pgsql`](https://github.com/awslabs/aurora-dsql-php-pdo-pgsql)
-package. It does not rewrite or patch WordPress core. Aurora DSQL is the only
+extends the installed core `wpdb` class. The optional native Rust engine uses
+AWS’s SQLx connector; the PHP engine uses AWS’s PDO connector. It does not rewrite or patch WordPress core. Aurora DSQL is the only
 supported database backend.
 
 The repository includes synthetic integration tests for installation, login,
@@ -42,7 +41,10 @@ wp-content/db.php → DSQL_WPDB → standalone MySQL-on-DSQL engine
                                       │ cached translation plans
         │
         ▼
-AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent worker
+Native Rust engine (or PHP maintenance engine)
+        │
+        ▼
+AWS connector → Aurora DSQL ← AWS Node.js connector ← independent worker
 ```
 
 One logical MySQL schema model serves installation, restored
@@ -52,6 +54,12 @@ defers physical connections until a query needs one and reads renderer column
 metadata directly from the PostgreSQL catalog, retaining per-request freshness. See
 [the engine API](docs/standalone-engine.md) and
 [the logical schema and catalog migration](docs/logical-schema.md).
+
+The PHP implementation below remains available for controlled maintenance and
+explicit rollback. The [native Rust engine](native/README.md) performs parsing,
+translation, parameter binding, connections, row decoding and SQL-error logging
+inside one extension. Enable it with `DSQL_ENGINE=native` after installing a
+binary built for the host’s PHP ABI.
 
 The DSQL implementation:
 
@@ -221,6 +229,14 @@ from live execution and MySQL result-equivalence testing.
 - Synthetic tests do not establish compatibility with every plugin, theme, or
   persistent-cache configuration, or validate heavy concurrency, failover, or
   production load.
+
+## Experimental native engine
+
+An opt-in [Rust extension prototype](native/README.md) keeps SQL parsing,
+translation, connection management and execution inside Rust. It includes
+synthetic DSQL integration tests and a PHP-FPM comparison harness. It is not
+loaded by the released WordPress drop-in and does not yet provide its full
+compatibility surface.
 
 ## License
 

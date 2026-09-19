@@ -1,0 +1,36 @@
+[package]
+name = "wp-dsql-native"
+version = "0.11.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["php"]
+php = ["dep:ext-php-rs"]
+
+[dependencies]
+ext-php-rs = { version = "=0.15.15", optional = true }
+sqlparser = { version = "=0.63.0", features = ["visitor"] }
+aurora-dsql-sqlx-connector = { version = "=0.2.2", features = ["pool", "occ"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring", "chrono", "bigdecimal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+lru = "0.16"
+chrono = "0.4"
+aws-config = "1.12"
+aws-runtime = "1.9"
+aws-credential-types = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+base64 = "0.22"
+sha2 = "0.10"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+strip = "debuginfo"
+
+[dev-dependencies]

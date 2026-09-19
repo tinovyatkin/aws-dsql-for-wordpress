@@ -9,7 +9,8 @@ if (($cluster['tags']['Purpose'] ?? '') !== 'synthetic-wordpress-compatibility'
     || $settings['endpoint'] !== $cluster['identifier'].'.dsql.'.$settings['region'].'.on.aws') {
     throw new RuntimeException('Synthetic test cluster configuration required');
 }
-$driver = new Driver(new Config(host:$settings['endpoint'], region:$settings['region'], profile:$settings['profile'], tablePrefix:'engine_contract_'));
+$driverClass=getenv('DSQL_TEST_ENGINE')==='native' ? WPDSQL\Engine\NativeDriver::class : Driver::class;
+$driver = new $driverClass(new Config(host:$settings['endpoint'], region:$settings['region'], profile:$settings['profile'], tablePrefix:'engine_contract_'));
 $checks = 0;
 function engine_check(bool $ok, string $name): void { global $checks; if (!$ok) { throw new RuntimeException($name); } $checks++; }
 $table = 'engine_contract_items';

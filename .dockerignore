@@ -1,0 +1,12 @@
+**
+!native
+!native/Cargo.toml
+!native/Cargo.lock
+!native/src
+!native/src/**
+!native/tests
+!native/tests/*.rs
+!native/examples
+!native/examples/**
+!native/build
+!native/build/**
