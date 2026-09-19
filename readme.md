@@ -41,7 +41,10 @@ wp-content/db.php → DSQL_WPDB → standalone MySQL-on-DSQL engine
                                       │ cached translation plans
         │
         ▼
-AWS PHP PDO connector → Aurora DSQL ← AWS Node.js connector ← independent worker
+Native Rust engine (or PHP maintenance engine)
+        │
+        ▼
+AWS connector → Aurora DSQL ← AWS Node.js connector ← independent worker
 ```
 
 One logical MySQL schema model serves installation, restored

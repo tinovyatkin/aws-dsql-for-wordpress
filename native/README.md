@@ -110,6 +110,10 @@ fixture. Existing repository WordPress, core differential and plugin fixtures
 also run with `DSQL_ENGINE=native`; standalone suites accept
 `DSQL_TEST_ENGINE=native`.
 
+`tests/schema-cache.php` verifies native cache invalidation across a controlled
+rebuild that retains the original physical table for rollback. It uses the
+separate synthetic upgrade fixture and its guarded runner.
+
 Connection fault tests are ignored by default because they require that fixture:
 
 ```sh
