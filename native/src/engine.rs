@@ -636,11 +636,14 @@ impl Client {
                     self.metadata.insert(table.clone(), cached);
                 }
                 if !self.metadata.contains_key(&table) {
-                    let table_meta = rt.block_on(load_table(
+                    let result = rt.block_on(load_table(
                         &mut *self.connection.as_mut().unwrap(),
                         &self.config.schema,
                         &table,
-                    ))?;
+                    ));
+                    let table_meta = self
+                        .metadata_result(result)?
+                        .ok_or("DSQL operation failed (42P01); table is missing")?;
                     b.schema
                         .lock()
                         .map_err(|_| "Schema cache lock failed")?
@@ -799,12 +802,25 @@ impl Client {
     }
     pub(crate) fn raw(&mut self, sql: String, values: Vec<String>) -> Result<Output> {
         self.check_connection()?;
-        runtime()
-            .block_on(execute_command(
-                &mut *self.connection.as_mut().unwrap(),
-                &BoundCommand { sql, values },
-            ))
-            .map_err(db_error)
+        let result = runtime().block_on(execute_command(
+            &mut *self.connection.as_mut().unwrap(),
+            &BoundCommand { sql, values },
+        ));
+        self.metadata_result(result)
+    }
+    fn metadata_result<T>(&mut self, result: std::result::Result<T, sqlx::Error>) -> Result<T> {
+        #[cfg(test)]
+        let result = tests::inject_metadata_fault(result);
+        result.map_err(|error| {
+            if is_transport(&error) {
+                self.discard_connection();
+                self.catalog = None;
+                self.metadata.clear();
+                self.found = None;
+                // Preserve caller transaction ownership: only ROLLBACK unlocks reconnect.
+            }
+            db_error(error)
+        })
     }
     pub(crate) fn invalidate_schema(&mut self) -> Result<()> {
         self.catalog = None;
@@ -961,6 +977,12 @@ fn bind_command(command: &compiler::Command, values: &[String]) -> Result<BoundC
     let mut params = vec![];
     for bind in &command.bindings {
         let mut v = values.get(bind.slot).ok_or("Binding mismatch")?.clone();
+        if bind.binary {
+            // BYTEA is transported as bound hex, never PostgreSQL backslash syntax
+            // and never the reversible TEXT envelope.
+            params.push(crate::value::hex(v.as_bytes()));
+            continue;
+        }
         if bind.temporal && v.starts_with("0000-00-00") {
             v.replace_range(..10, "0001-01-01");
         }
@@ -1116,6 +1138,13 @@ fn decode(row: PgRow) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
                 .try_get::<chrono::NaiveDate, _>(i)
                 .map_err(db_error)?
                 .to_string(),
+            "JSON" | "JSONB" => {
+                let raw = row.try_get_raw(i).map_err(db_error)?;
+                crate::value::json_text(
+                    raw.as_bytes().map_err(|_| "Invalid JSON result")?,
+                    ty == "JSONB" && raw.format() == sqlx::postgres::PgValueFormat::Binary,
+                )?
+            }
             "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" => {
                 row.try_get::<String, _>(i).map_err(db_error)?
             }
@@ -1151,9 +1180,9 @@ async fn load_table(
     c: &mut sqlx::PgConnection,
     schema: &str,
     table: &str,
-) -> Result<compiler::Table> {
+) -> std::result::Result<Option<compiler::Table>, sqlx::Error> {
     let relation = format!("{}.{}", compiler::qi(schema), compiler::qi(table));
-    let rows=sqlx::query("SELECT attname,attnum,attrelid::text AS relation_id,atttypid::regtype::text AS ty,attidentity::text AS identity,NOT attnotnull AS nullable FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum").bind(&relation).fetch_all(&mut *c).await.map_err(db_error)?;
+    let rows=sqlx::query("SELECT attname,attnum,attrelid::text AS relation_id,atttypid::regtype::text AS ty,attidentity::text AS identity,NOT attnotnull AS nullable FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum").bind(&relation).fetch_all(&mut *c).await?;
     let oid = rows
         .first()
         .and_then(|r| r.try_get::<String, _>("relation_id").ok())
@@ -1163,35 +1192,32 @@ async fn load_table(
         .into_iter()
         .map(|r| {
             Ok(Column {
-                name: r.try_get("attname").map_err(db_error)?,
-                ty: r.try_get("ty").map_err(db_error)?,
-                identity: !r
-                    .try_get::<String, _>("identity")
-                    .map_err(db_error)?
-                    .is_empty(),
-                nullable: r.try_get("nullable").map_err(db_error)?,
+                name: r.try_get("attname")?,
+                ty: r.try_get("ty")?,
+                identity: !r.try_get::<String, _>("identity")?.is_empty(),
+                nullable: r.try_get("nullable")?,
                 default: None,
-                ordinal: r.try_get("attnum").map_err(db_error)?,
+                ordinal: r.try_get("attnum")?,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
     if columns.is_empty() {
-        return Err("DSQL operation failed (42P01); table is missing".into());
+        return Ok(None);
     }
-    let rows=sqlx::query("SELECT i.indexrelid::text AS id,i.indisprimary,i.indisunique,a.attname FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE t.relname=$1 AND n.nspname=$2 AND i.indisvalid AND k.ordinality<=i.indnkeyatts ORDER BY i.indisprimary DESC,i.indexrelid,k.ordinality").bind(table).bind(schema).fetch_all(c).await.map_err(db_error)?;
+    let rows=sqlx::query("SELECT i.indexrelid::text AS id,i.indisprimary,i.indisunique,a.attname FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE t.relname=$1 AND n.nspname=$2 AND i.indisvalid AND k.ordinality<=i.indnkeyatts ORDER BY i.indisprimary DESC,i.indexrelid,k.ordinality").bind(table).bind(schema).fetch_all(c).await?;
     let mut keys: BTreeMap<String, compiler::Index> = BTreeMap::new();
     for r in rows {
-        let id: String = r.try_get("id").map_err(db_error)?;
+        let id: String = r.try_get("id")?;
         let key = keys.entry(id).or_default();
-        key.primary = r.try_get("indisprimary").map_err(db_error)?;
-        key.unique = r.try_get("indisunique").map_err(db_error)?;
-        key.columns.push(r.try_get("attname").map_err(db_error)?);
+        key.primary = r.try_get("indisprimary")?;
+        key.unique = r.try_get("indisunique")?;
+        key.columns.push(r.try_get("attname")?);
     }
-    Ok(compiler::Table {
+    Ok(Some(compiler::Table {
         columns,
         keys: keys.into_values().collect(),
         oid,
-    })
+    }))
 }
 
 #[cfg(test)]

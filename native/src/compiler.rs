@@ -71,6 +71,7 @@ pub struct Binding {
     pub allow_nul: bool,
     pub format: bool,
     pub numeric_prefix: bool,
+    pub binary: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -505,6 +506,9 @@ impl Compiler<'_> {
                         | "numeric"
                         | "real"
                         | "double precision"
+                        | "json"
+                        | "jsonb"
+                        | "bytea"
                         | "boolean"
                         | "date"
                         | "timestamp without time zone"
@@ -515,12 +519,17 @@ impl Compiler<'_> {
                     self.bindings.push(Binding {
                         slot,
                         temporal: ty == "date" || ty.starts_with("timestamp"),
-                        codec: self.shape.codec && !(ty == "date" || ty.starts_with("timestamp")),
+                        codec: self.shape.codec && ty == "text",
                         allow_nul: self.write_column.as_ref().is_some_and(|(_, t)| t == "text"),
                         format: false,
                         numeric_prefix: false,
+                        binary: ty == "bytea",
                     });
-                    format!("CAST(${} AS {})", self.bindings.len(), ty)
+                    if ty == "bytea" {
+                        format!("decode(${}, 'hex')", self.bindings.len())
+                    } else {
+                        format!("CAST(${} AS {})", self.bindings.len(), ty)
+                    }
                 }
                 Value::Null => "NULL".into(),
                 Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
@@ -543,6 +552,10 @@ impl Compiler<'_> {
                 negated,
             } => {
                 check(!list.is_empty())?;
+                self.require_comparable(&[expr])?;
+                for value in list {
+                    self.require_comparable(&[value])?;
+                }
                 if Self::is_binary(expr) {
                     let left = self.bytes(expr)?;
                     let rhs = list
@@ -567,6 +580,7 @@ impl Compiler<'_> {
                 high,
                 negated,
             } => {
+                self.require_comparable(&[expr, low, high])?;
                 if Self::is_binary(expr) {
                     format!(
                         "({} {}BETWEEN {} AND {})",

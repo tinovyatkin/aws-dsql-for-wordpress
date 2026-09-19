@@ -105,3 +105,138 @@ fn connection_lifetime_transaction_and_conflict_contracts() {
     b.close();
     reset_worker().unwrap();
 }
+
+thread_local! {
+    static FAIL_METADATA_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+// Only compiled into Rust tests. Inject a connection reset at a metadata result
+// boundary, keeping network-failure controls out of the PHP extension.
+pub(super) fn inject_metadata_fault<T>(
+    result: std::result::Result<T, sqlx::Error>,
+) -> std::result::Result<T, sqlx::Error> {
+    let value = result?;
+    FAIL_METADATA_AFTER.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            Err(sqlx::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            )))
+        }
+        Some(n) => {
+            remaining.set(Some(n - 1));
+            Ok(value)
+        }
+        None => Ok(value),
+    })
+}
+#[test]
+fn failed_metadata_keeps_transaction_ownership() {
+    let cfg = Config {
+        host: "test.dsql.eu-central-1.on.aws".into(),
+        region: "eu-central-1".into(),
+        profile: "default".into(),
+        user: "admin".into(),
+        schema: "public".into(),
+        prefix: "wp_".into(),
+        revision: "unit".into(),
+        credentials_file: None,
+        value_codec: false,
+        sql_mode: String::new(),
+        cache_enabled: true,
+    };
+    let mut client = Client::new(cfg).unwrap();
+    client.transaction = true;
+    client.catalog = Some(crate::catalog::Catalog::default());
+    let error = client
+        .metadata_result::<()>(Err(sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        ))))
+        .unwrap_err();
+    assert!(error.contains("transport"));
+    assert!(client.catalog.is_none());
+    assert!(client.in_transaction());
+    assert!(
+        client
+            .check_connection()
+            .unwrap_err()
+            .contains("rollback is required")
+    );
+    assert_eq!(client.error.retries, 0);
+    client.transaction = false;
+}
+#[test]
+#[ignore = "requires the explicitly selected synthetic AWS fixture"]
+fn metadata_transport_failure_recovers_without_replaying_a_transaction() {
+    let (cfg, table) = fixture_config();
+    // Cold catalog lookup, then the separate column/index loader.
+    for fail_after in [0, 2] {
+        let mut client = Client::new(cfg.clone()).unwrap();
+        FAIL_METADATA_AFTER.with(|remaining| remaining.set(Some(fail_after)));
+        let query = format!("SELECT post_title FROM `{table}` WHERE ID=1");
+        assert!(client.query(&query).err().unwrap().contains("transport"));
+        assert!(client.connection.is_none());
+        assert_eq!(client.error.retries, 0);
+        assert_eq!(first(client.query(&query).unwrap()), b"Synthetic story 1");
+        client.close();
+        reset_worker().unwrap();
+    }
+    let mut client = Client::new(cfg).unwrap();
+    client.query("BEGIN").unwrap();
+    FAIL_METADATA_AFTER.with(|remaining| remaining.set(Some(0)));
+    let query = format!("SELECT post_title FROM `{table}` WHERE ID=1");
+    assert!(client.query(&query).err().unwrap().contains("transport"));
+    assert!(client.connection.is_none());
+    assert!(client.in_transaction());
+    assert!(
+        client
+            .query(&query)
+            .err()
+            .unwrap()
+            .contains("rollback is required")
+    );
+    client.query("ROLLBACK").unwrap();
+    assert_eq!(first(client.query(&query).unwrap()), b"Synthetic story 1");
+    client.close();
+    reset_worker().unwrap();
+}
+#[test]
+fn json_and_binary_bindings_preserve_value_bytes() {
+    use crate::compiler::*;
+    for (ty, literal, expected) in [
+        ("bytea", r"'a\0b\\x41'", "6100625c783431"),
+        (
+            "json",
+            r#"'{"n":123456789012345678901234567890,"x":"~dsqlb64:v1:literal"}'"#,
+            r#"{"n":123456789012345678901234567890,"x":"~dsqlb64:v1:literal"}"#,
+        ),
+    ] {
+        let schema: Schema = [(
+            "wp_probe".into(),
+            Table::from(vec![Column {
+                name: "payload".into(),
+                ty: ty.into(),
+                identity: false,
+                nullable: true,
+                default: None,
+                ordinal: 1,
+            }]),
+        )]
+        .into();
+        let shape = shape_mode(
+            &format!("INSERT INTO wp_probe(payload) VALUES ({literal})"),
+            "",
+            true,
+        )
+        .unwrap();
+        let plan = compile(&shape.statement, &shape, &schema).unwrap();
+        let bound = bind_command(
+            &Command {
+                sql: plan.sql,
+                bindings: plan.bindings,
+            },
+            &shape.values,
+        )
+        .unwrap();
+        assert_eq!(bound.values, [expected]);
+    }
+}
