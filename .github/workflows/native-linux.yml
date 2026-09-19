@@ -2,8 +2,11 @@ name: Native Linux PHP extension
 on:
   workflow_dispatch:
   push:
-    branches: [codex/native-dsql-production]
-    paths: [native/**, .github/workflows/native-linux.yml]
+    branches: [main]
+    paths: [native/**, .dockerignore, .github/workflows/native-linux.yml]
+  pull_request:
+    branches: [main]
+    paths: [native/**, .dockerignore, .github/workflows/native-linux.yml]
 permissions:
   contents: read
 jobs:

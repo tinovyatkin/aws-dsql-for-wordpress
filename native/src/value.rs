@@ -30,6 +30,30 @@ pub fn decode(value: &str) -> Result<String, String> {
     }
     String::from_utf8(bytes).map_err(|_| "DSQL value envelope is not UTF-8".into())
 }
+/// Encode arbitrary payload bytes for a bound PostgreSQL decode(..., 'hex').
+pub fn hex(value: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 15) as usize] as char);
+    }
+    out
+}
+/// JSON binary protocol carries text; JSONB adds a one-byte wire-version tag.
+/// Preserve whitespace, duplicate JSON keys and exact numeric spelling.
+pub fn json_text(bytes: &[u8], binary_jsonb: bool) -> Result<String, String> {
+    let bytes = if binary_jsonb {
+        if bytes.first() != Some(&1) {
+            return Err("Unsupported JSONB wire version".into());
+        }
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    String::from_utf8(bytes.to_vec()).map_err(|_| "Non-UTF8 JSON result".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

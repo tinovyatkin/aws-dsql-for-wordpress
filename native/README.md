@@ -83,11 +83,24 @@ A failed read may reconnect once; an ambiguous write failure is never replayed.
 A lost caller-owned transaction must be rolled back before the client can reconnect.
 Closing a client with an open transaction discards the physical connection.
 
+Metadata transport failures discard the broken connection without replaying the
+failed operation. A subsequent request operation can reconnect; a caller-owned
+transaction still requires rollback first.
+
 Rust classifies failures, fingerprints redacted SQL shapes and emits the
 `wordpress_dsql_error` JSON event through PHP's native logging API. The WordPress
 bridge supplies request context and code location. SQL values, query text,
 credentials and database exception details are excluded from the event. Existing
 log collectors can continue using the version-1 event contract.
+
+## JSON and binary values
+
+Version 0.11.1 binds JSON/JSONB values without applying the TEXT envelope codec.
+Results preserve PostgreSQL's textual representation, including exact numeric
+spelling and, for JSON, whitespace and duplicate keys. JSON `null` remains distinct
+from SQL NULL. Binary column parameters are hex-encoded after literal parsing and
+decoded by PostgreSQL, preserving NULs and backslashes without interpreting them
+as PostgreSQL BYTEA escapes. SQL input retains the existing UTF-8 requirement.
 
 ## Installation and maintenance
 
@@ -109,6 +122,12 @@ codec framing, redaction and credential-file rotation. PHP scripts under
 fixture. Existing repository WordPress, core differential and plugin fixtures
 also run with `DSQL_ENGINE=native`; standalone suites accept
 `DSQL_TEST_ENGINE=native`.
+
+`tests/json-binary-integration.php` checks JSON/JSONB and binary insert, update,
+read and comparison behavior against the PDO wire reference, with the TEXT codec
+enabled. The ignored `metadata_transport_failure` Rust test injects connection
+resets into catalog and column/index metadata results and checks reconnect and
+caller-owned transaction behavior. Run live fault tests with `--test-threads=1`.
 
 `tests/schema-cache.php` verifies native cache invalidation across a controlled
 rebuild that retains the original physical table for rollback. It uses the
