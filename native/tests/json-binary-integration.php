@@ -34,6 +34,11 @@ try {
  $n->query("UPDATE `$b` SET doc='$escapedJson' WHERE id=1");
  $expected=$p->query("SELECT doc::text FROM \"$b\" WHERE id=1")->fetchColumn();
  typed_check($n->query("SELECT doc FROM `$b` WHERE id=1")['rows'][0]['doc']===$expected,'JSONB assignment and read');
+ foreach(["doc='null'","doc IN ('null')","doc BETWEEN 'null' AND '{}'", "CAST(doc AS JSON)='null'"] as $predicate){
+  try{$n->query("SELECT id FROM `$t` WHERE $predicate");throw new RuntimeException('Unsupported JSON comparison accepted');}
+  catch(Throwable $error){if($error instanceof RuntimeException)throw $error;typed_check(str_contains($error->getMessage(),'JSON equality')&&$n->errorInfo()['stage']==='translate','JSON comparison rejected before execution');}
+ }
+ typed_check($n->query("SELECT id FROM `$b` WHERE doc='$escapedJson'")['rows'] === [['id'=>'1']],'JSONB equality remains supported');
  typed_check($n->cacheStats()['hits']>0,'Type round trips exercise cached plans');
  echo "PASS $checks native JSON/binary live contracts\n";
 } finally {

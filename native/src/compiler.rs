@@ -552,6 +552,10 @@ impl Compiler<'_> {
                 negated,
             } => {
                 check(!list.is_empty())?;
+                self.require_comparable(&[expr])?;
+                for value in list {
+                    self.require_comparable(&[value])?;
+                }
                 if Self::is_binary(expr) {
                     let left = self.bytes(expr)?;
                     let rhs = list
@@ -576,6 +580,7 @@ impl Compiler<'_> {
                 high,
                 negated,
             } => {
+                self.require_comparable(&[expr, low, high])?;
                 if Self::is_binary(expr) {
                     format!(
                         "({} {}BETWEEN {} AND {})",

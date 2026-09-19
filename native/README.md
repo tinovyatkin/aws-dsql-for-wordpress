@@ -98,7 +98,9 @@ log collectors can continue using the version-1 event contract.
 Version 0.11.1 binds JSON/JSONB values without applying the TEXT envelope codec.
 Results preserve PostgreSQL's textual representation, including exact numeric
 spelling and, for JSON, whitespace and duplicate keys. JSON `null` remains distinct
-from SQL NULL. Binary column parameters are hex-encoded after literal parsing and
+from SQL NULL. Equality, range and membership predicates on JSON columns are
+explicitly rejected before execution; PostgreSQL JSONB comparisons remain available.
+Binary column parameters are hex-encoded after literal parsing and
 decoded by PostgreSQL, preserving NULs and backslashes without interpreting them
 as PostgreSQL BYTEA escapes. SQL input retains the existing UTF-8 requirement.
 

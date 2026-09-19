@@ -228,6 +228,22 @@ impl Compiler<'_> {
             Ok(format!("({} <> 0)", self.numeric(e)?))
         }
     }
+    fn is_json_value(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Nested(e) => self.is_json_value(e),
+            Expr::Cast {
+                data_type: DataType::JSON,
+                ..
+            } => true,
+            _ => self.ty(expr).as_deref() == Some("json"),
+        }
+    }
+    pub(crate) fn require_comparable(&self, expressions: &[&Expr]) -> Result<()> {
+        if expressions.iter().any(|e| self.is_json_value(e)) {
+            return Err("JSON equality, range and membership comparisons are unsupported".into());
+        }
+        Ok(())
+    }
     pub(crate) fn binary(
         &mut self,
         left: &Expr,
@@ -235,6 +251,9 @@ impl Compiler<'_> {
         right: &Expr,
     ) -> Result<String> {
         use BinaryOperator::*;
+        if matches!(op, Eq | NotEq | Gt | Lt | GtEq | LtEq | Spaceship) {
+            self.require_comparable(&[left, right])?;
+        }
         if matches!(op, Plus | Minus)
             && let Expr::Interval(i) = right
         {

@@ -53,3 +53,46 @@ fn binary_hex_preserves_all_byte_values() {
     assert_eq!(decoded, bytes);
     assert_eq!(value::hex(b""), "");
 }
+
+#[test]
+fn json_predicates_reject_before_execution_while_jsonb_is_comparable() {
+    for ty in ["json", "jsonb"] {
+        let schema: Schema = [(
+            "wp_probe".into(),
+            Table::from(vec![Column {
+                name: "payload".into(),
+                ty: ty.into(),
+                identity: false,
+                nullable: true,
+                default: None,
+                ordinal: 1,
+            }]),
+        )]
+        .into();
+        for predicate in [
+            "payload='{}'",
+            "'{}'=payload",
+            "payload<>payload",
+            "(payload)<=>'{}'",
+            "payload IN ('{}')",
+            "payload NOT IN ('{}')",
+            "payload BETWEEN '{}' AND '[]'",
+        ] {
+            let shape = shape(&format!("SELECT payload FROM wp_probe WHERE {predicate}")).unwrap();
+            let plan = compile(&shape.statement, &shape, &schema);
+            if ty == "json" {
+                assert!(plan.unwrap_err().contains("JSON equality"), "{predicate}");
+            } else {
+                assert!(plan.is_ok(), "{predicate}");
+            }
+        }
+        let shape = shape("SELECT payload FROM wp_probe WHERE payload IS NULL").unwrap();
+        assert!(compile(&shape.statement, &shape, &schema).is_ok());
+    }
+    let shape = shape("SELECT CAST('{}' AS JSON) = CAST('{}' AS JSON)").unwrap();
+    assert!(
+        compile(&shape.statement, &shape, &Schema::new())
+            .unwrap_err()
+            .contains("JSON equality")
+    );
+}
