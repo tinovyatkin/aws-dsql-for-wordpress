@@ -9,7 +9,8 @@ if (($cluster['tags']['Purpose'] ?? '') !== 'synthetic-wordpress-compatibility'
     || $settings['endpoint'] !== $cluster['identifier'].'.dsql.'.$settings['region'].'.on.aws') {
     throw new RuntimeException('Synthetic test cluster configuration required');
 }
-$driver = new Driver(new Config(host:$settings['endpoint'], region:$settings['region'], profile:$settings['profile'], tablePrefix:'schema_adoption_'));
+$driverClass=getenv('DSQL_TEST_ENGINE')==='native' ? WPDSQL\Engine\NativeDriver::class : Driver::class;
+$driver = new $driverClass(new Config(host:$settings['endpoint'], region:$settings['region'], profile:$settings['profile'], tablePrefix:'schema_adoption_'));
 $checks=0;
 function schema_check(bool $ok,string $name):void{global $checks;if(!$ok)throw new RuntimeException($name);$checks++;}
 $table='schema_adoption_items';$bad='schema_adoption_incomplete';
@@ -34,7 +35,7 @@ try{
     schema_check($driver->query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='postgres' AND TABLE_NAME IN ('$table','absent_table') AND ENGINE='MyISAM'")->fetchAll()===[],'WordPress update-check IN predicate');
     schema_check($driver->query("SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_NAME='$table'")->fetchColumn()==='table description','Shared table options');
     foreach(["SHOW TABLES WHERE nonexistent=1","SELECT c.BAD FROM information_schema.COLUMNS c WHERE TABLE_NAME='$table'","SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_NAME='$table' GROUP BY COLUMN_NAME","SELECT a.COLUMN_NAME FROM information_schema.COLUMNS a JOIN information_schema.TABLES b ON 1=1"] as $sql){try{$driver->query($sql);throw new LogicException('Unsupported metadata accepted');}catch(QueryException $e){$checks++;}}
-    $driver->close();$driver=new Driver(new Config(host:$settings['endpoint'],region:$settings['region'],profile:$settings['profile'],tablePrefix:'schema_adoption_'));
+    $driver->close();$driver=new $driverClass(new Config(host:$settings['endpoint'],region:$settings['region'],profile:$settings['profile'],tablePrefix:'schema_adoption_'));
     schema_check($driver->query("SHOW COLUMNS FROM $table LIKE 'body'")->fetchAll()[0]['Type']==='longtext','Logical metadata survives a fresh connection');
     try{$driver->query("CREATE TABLE $bad (n int NOT NULL DEFAULT 'invalid-number')");throw new LogicException('Invalid physical schema accepted');}catch(QueryException $e){$checks++;}
     try{$driver->query("SHOW COLUMNS FROM $bad");throw new LogicException('Incomplete schema was advertised');}catch(QueryException $e){schema_check(str_contains($e->nativeFailure()->getMessage(),'Incomplete installation'),'Pending publication fails closed');}

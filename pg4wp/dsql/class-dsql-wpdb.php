@@ -21,7 +21,11 @@ class DSQL_WPDB extends wpdb {
         $start = microtime(true);
         try {
             $upgrade = class_exists('WPDSQLUpgrade\\Context', false) ? \WPDSQLUpgrade\Context::$session : null;
-            $this->dbh = new Driver(new Config(
+            // Controlled migration orchestration retains its established recovery runner.
+            // The live runtime never falls back after a native query failure.
+            $driverClass = !$upgrade && defined('DSQL_ENGINE') && DSQL_ENGINE === 'native'
+                ? \WPDSQL\Engine\NativeDriver::class : Driver::class;
+            $this->dbh = new $driverClass(new Config(
                 host: $this->dbhost,
                 user: $this->dbuser ?: 'admin',
                 database: $this->dbname ?: 'postgres',
@@ -176,11 +180,13 @@ class DSQL_WPDB extends wpdb {
     public function verify_schema_upgrade(): array { return $this->get_driver()->verifySchemaUpgrade(); }
     public function wait_for_indexes(): void { $this->get_driver()->waitForIndexes(); }
     private function recordFailure(Throwable $error, string $query, string $stage, float $started, int $retries = 0): array {
-        $event = DSQL_Diagnostics::event($error, $query, $stage, $started, $retries);
+        $native=$this->dbh instanceof \WPDSQL\Engine\NativeDriver;
+        $event=$native ? $this->dbh->logFailure($query,$stage,$started)
+            : DSQL_Diagnostics::event($error,$query,$stage,$started,$retries);
         $this->dsql_error_count++;
         if (count($this->dsql_errors) >= 100) { array_shift($this->dsql_errors); }
         $this->dsql_errors[] = $event;
-        DSQL_Diagnostics::emit($event);
+        if (!$native) DSQL_Diagnostics::emit($event);
         return $event;
     }
     public function print_error($str = '') {

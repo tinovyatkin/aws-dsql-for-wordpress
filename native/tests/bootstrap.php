@@ -12,9 +12,9 @@ function fixture(): array {
     global $root;
     return json_decode(file_get_contents($root.'/.local/native-fixture.json'),true,flags:JSON_THROW_ON_ERROR);
 }
-function native_client(): DsqlNativePrototype {
+function native_client(): DsqlNativeEngine {
     $s=lab(); $f=fixture();
-    return new DsqlNativePrototype($s['endpoint'],$s['region'],$s['profile'],'admin','public',$f['prefix'],$f['revision']);
+    return new DsqlNativeEngine($s['endpoint'],$s['region'],$s['profile'],'admin','public',$f['prefix'],$f['revision']);
 }
 function php_client(): WPDSQL\Engine\Driver {
     global $root;require_once $root.'/vendor/autoload.php';$s=lab();$f=fixture();

@@ -4,10 +4,7 @@ final class DSQL_Diagnostics {
     public static function event(Throwable $error, string $query, string $stage, float $started, int $retries = 0): array {
         $state = $error instanceof PDOException ? (string) ($error->errorInfo[0] ?? $error->getCode()) : '';
         $state = preg_match('/^[A-Z0-9]{5}$/D', $state) ? $state : null;
-        $context = defined('WP_CLI') && WP_CLI ? 'cli' :
-            (defined('DOING_CRON') && DOING_CRON ? 'cron' :
-            (defined('REST_REQUEST') && REST_REQUEST ? 'rest' :
-            (defined('WP_ADMIN') && WP_ADMIN ? 'admin' : 'frontend')));
+        $context = self::context();
         return [
             'event' => 'wordpress_dsql_error', 'version' => 1,
             'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
@@ -53,7 +50,13 @@ REGEX;
         return in_array($op, ['SELECT','INSERT','UPDATE','DELETE','REPLACE','CREATE','ALTER','DROP','SHOW','DESCRIBE','SET','BEGIN','START','COMMIT','ROLLBACK','WITH','EXPLAIN','TRUNCATE'], true) ? $op : 'OTHER';
     }
 
-    private static function source(): string {
+    public static function context(): string {
+        return defined('WP_CLI') && WP_CLI ? 'cli' :
+            (defined('DOING_CRON') && DOING_CRON ? 'cron' :
+            (defined('REST_REQUEST') && REST_REQUEST ? 'rest' :
+            (defined('WP_ADMIN') && WP_ADMIN ? 'admin' : 'frontend')));
+    }
+    public static function source(): string {
         $core = 'unclassified';
         foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 32) as $frame) {
             $file = str_replace('\\', '/', $frame['file'] ?? '');

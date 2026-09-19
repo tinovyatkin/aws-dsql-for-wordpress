@@ -10,7 +10,7 @@ function check($condition, string $label): void {
 }
 $wpdb->dsql_errors = [];
 try {
-    check($wpdb instanceof DSQL_WPDB, 'WordPress uses AWS DSQL PDO drop-in');
+    check($wpdb instanceof DSQL_WPDB, 'WordPress uses AWS DSQL drop-in');
     check(is_blog_installed(), 'Core installation is persistent');
     $user = wp_authenticate('dsqltest', trim(file_get_contents(dirname(__DIR__, 2) . '/.local/admin-password')));
     check($user instanceof WP_User, 'Administrator authentication');

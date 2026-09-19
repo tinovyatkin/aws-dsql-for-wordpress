@@ -14,18 +14,63 @@ pub struct Shape {
     pub values: Vec<String>,
     pub numeric: Vec<bool>,
     pub tokens: Vec<Token>,
+    pub statement: Statement,
+    pub mode: String,
+    pub codec: bool,
+    pub metadata: Option<crate::metadata_syntax::Command>,
 }
 #[derive(Clone, Debug)]
 pub struct Column {
     pub name: String,
     pub ty: String,
     pub identity: bool,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub ordinal: i16,
 }
-pub type Schema = BTreeMap<String, Vec<Column>>;
+#[derive(Clone, Debug, Default)]
+pub struct Index {
+    pub columns: Vec<String>,
+    pub primary: bool,
+    pub unique: bool,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Table {
+    pub columns: Vec<Column>,
+    pub keys: Vec<Index>,
+    pub oid: u32,
+}
+impl std::ops::Deref for Table {
+    type Target = Vec<Column>;
+    fn deref(&self) -> &Self::Target {
+        &self.columns
+    }
+}
+impl<'a> IntoIterator for &'a Table {
+    type Item = &'a Column;
+    type IntoIter = std::slice::Iter<'a, Column>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.columns.iter()
+    }
+}
+impl From<Vec<Column>> for Table {
+    fn from(columns: Vec<Column>) -> Self {
+        Self {
+            columns,
+            keys: vec![],
+            oid: 0,
+        }
+    }
+}
+pub type Schema = BTreeMap<String, Table>;
 #[derive(Clone, Debug)]
 pub struct Binding {
     pub slot: usize,
     pub temporal: bool,
+    pub codec: bool,
+    pub allow_nul: bool,
+    pub format: bool,
+    pub numeric_prefix: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -33,24 +78,30 @@ pub struct Plan {
     pub bindings: Vec<Binding>,
     pub operation: &'static str,
     pub identity: bool,
+    pub cacheable: bool,
+    pub leading: Vec<Command>,
+    pub count: Option<Command>,
+}
+#[derive(Clone, Debug)]
+pub struct Command {
+    pub sql: String,
+    pub bindings: Vec<Binding>,
 }
 
 pub fn shape(sql: &str) -> Result<Shape> {
-    if sql.len() > 1_048_576 {
-        return Err("SQL exceeds prototype limit".into());
+    shape_mode(sql, "", false)
+}
+pub fn shape_mode(sql: &str, mode: &str, codec: bool) -> Result<Shape> {
+    use std::ops::ControlFlow;
+    if sql.len() > 16_777_216 {
+        return Err("SQL exceeds native input limit".into());
     }
-    let tokens = Tokenizer::new(&MySqlDialect {}, sql)
+    let dialect = crate::dialect::MysqlMode::new(mode)?;
+    let mut tokens = Tokenizer::new(&dialect, sql)
         .tokenize()
         .map_err(|_| "Invalid MySQL tokens")?;
-    let mut out = Shape {
-        key: String::new(),
-        values: vec![],
-        numeric: vec![],
-        tokens: vec![],
-    };
-    for mut t in tokens {
-        // Comments are not retained in cross-request cache keys.
-        match &t {
+    for token in &mut tokens {
+        match token {
             Token::Whitespace(Whitespace::MultiLineComment(s))
                 if s.starts_with('!') || s.starts_with('+') =>
             {
@@ -58,52 +109,103 @@ pub fn shape(sql: &str) -> Result<Shape> {
             }
             Token::Whitespace(Whitespace::MultiLineComment(_))
             | Token::Whitespace(Whitespace::SingleLineComment { .. }) => {
-                t = Token::Whitespace(Whitespace::Space)
+                *token = Token::Whitespace(Whitespace::Space)
+            }
+            Token::Placeholder(_) => return Err("Pass complete MySQL SQL, not placeholders".into()),
+            Token::StringConcat if !dialect.has("PIPES_AS_CONCAT") => {
+                *token = Token::make_keyword("OR")
             }
             _ => {}
         }
-        let literal = match &t {
-            Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => Some((s.clone(), false)),
-            Token::Number(s, _) => Some((s.clone(), true)),
-            Token::Placeholder(_) => return Err("Pass complete MySQL SQL, not placeholders".into()),
-            Token::Whitespace(Whitespace::MultiLineComment(s))
-                if s.starts_with('!') || s.starts_with('+') =>
-            {
-                return Err("Executable comments and optimizer hints are unsupported".into());
-            }
-            _ => None,
-        };
-        if let Some((v, n)) = literal {
-            if v.contains('\0') {
-                return Err("NUL codec is outside this prototype".into());
-            }
-            out.values.push(v);
-            out.numeric.push(n);
-            let token = Token::Placeholder(format!("${}", out.values.len()));
-            out.key.push_str(&token.to_string());
-            out.tokens.push(token);
-        } else {
-            out.key.push_str(&t.to_string());
-            out.tokens.push(t);
-        }
     }
-    // Kind is part of the key: '1' and 1 must never share incompatible casts.
-    Ok(out)
-}
-pub fn parse(s: &Shape) -> Result<Statement> {
-    let mut statements = Parser::new(&MySqlDialect {})
-        .with_tokens(s.tokens.clone())
+    if let Some(command) = crate::metadata_syntax::parse(&tokens, &dialect)? {
+        return Ok(Shape {
+            key: format!("metadata:{}", command.kind),
+            values: vec![],
+            numeric: vec![],
+            tokens: vec![],
+            statement: Statement::ShowVariables {
+                filter: None,
+                global: false,
+                session: false,
+            },
+            mode: dialect.modes.join(","),
+            codec,
+            metadata: Some(command),
+        });
+    }
+    let mut statements = Parser::new(&dialect)
+        .with_tokens(tokens)
         .parse_statements()
         .map_err(|_| "Unsupported or invalid MySQL syntax")?;
     if statements.len() != 1 {
         return Err("Exactly one SQL statement is required".into());
     }
-    Ok(statements.remove(0))
+    let mut statement = statements.remove(0);
+    struct Binder {
+        values: Vec<String>,
+        numeric: Vec<bool>,
+    }
+    impl VisitorMut for Binder {
+        type Break = String;
+        fn pre_visit_ident(&mut self, id: &mut Ident) -> ControlFlow<String> {
+            if id.value.contains('\u{1f}') {
+                ControlFlow::Break("Reserved control byte in SQL identifier".into())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+        fn pre_visit_value(&mut self, v: &mut ValueWithSpan) -> ControlFlow<String> {
+            let literal = match &v.value {
+                Value::SingleQuotedString(s)
+                | Value::DoubleQuotedString(s)
+                | Value::NationalStringLiteral(s) => Some((s.clone(), false)),
+                Value::Number(s, _) => Some((s.clone(), true)),
+                Value::Null | Value::Boolean(_) => None,
+                _ => return ControlFlow::Break("Unsupported literal form".into()),
+            };
+            if let Some((value, number)) = literal {
+                self.values.push(value);
+                self.numeric.push(number);
+                v.value = Value::Placeholder(format!("${}", self.values.len()));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut binder = Binder {
+        values: vec![],
+        numeric: vec![],
+    };
+    if let ControlFlow::Break(e) = VisitMut::visit(&mut statement, &mut binder) {
+        return Err(e);
+    }
+    let values = binder.values;
+    let numeric = binder.numeric;
+    let key = statement.to_string();
+    let tokens = Tokenizer::new(&MySqlDialect {}, &key)
+        .tokenize()
+        .map_err(|_| "Invalid normalized AST")?;
+    Ok(Shape {
+        key,
+        values,
+        numeric,
+        tokens,
+        statement,
+        mode: dialect.modes.join(","),
+        codec,
+        metadata: None,
+    })
+}
+pub fn parse(s: &Shape) -> Result<Statement> {
+    Ok(s.statement.clone())
 }
 pub fn tables(s: &Statement) -> Result<Vec<String>> {
     let mut out = vec![];
     let result = visit_relations(s, |n| match name(n) {
         Ok(n) => {
+            if n.eq_ignore_ascii_case("dual") {
+                return std::ops::ControlFlow::Continue(());
+            }
             if !out.contains(&n) {
                 out.push(n);
             }
@@ -119,54 +221,111 @@ pub fn tables(s: &Statement) -> Result<Vec<String>> {
 pub fn qi(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
-fn name(n: &ObjectName) -> Result<String> {
+pub(crate) fn name(n: &ObjectName) -> Result<String> {
     if n.0.len() != 1 {
-        return Err("Qualified names are outside the prototype".into());
+        return Err("Qualified application table names are unsupported".into());
     }
     n.0[0]
         .as_ident()
         .map(|x| x.value.clone())
         .ok_or("Unsupported object name".into())
 }
-fn check(ok: bool) -> Result<()> {
+pub(crate) fn check(ok: bool) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        Err("SQL construct is outside the native prototype".into())
+        Err("Unsupported SQL construct".into())
     }
 }
 pub fn compile(stmt: &Statement, shape: &Shape, schema: &Schema) -> Result<Plan> {
+    if shape.metadata.is_some() {
+        return Err("Metadata requires native catalog dispatch".into());
+    }
     let mut c = Compiler {
         shape,
         schema,
         aliases: BTreeMap::new(),
         bindings: vec![],
+        cacheable: true,
+        write_column: None,
+        leading: vec![],
+        upsert: false,
+        local_tables: Default::default(),
     };
     let (sql, operation, identity) = match stmt {
-        Statement::Query(q) => (c.query(q)?, "SELECT", false),
+        Statement::Query(q) => {
+            if let SetExpr::Select(s) = &*q.body
+                && s.projection.len() == 1
+                && s.from.is_empty()
+            {
+                let e = match &s.projection[0] {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        Some(e)
+                    }
+                    _ => None,
+                };
+                if matches!(e,Some(Expr::Function(f)) if f.name.to_string().eq_ignore_ascii_case("FOUND_ROWS"))
+                {
+                    return Ok(Plan {
+                        sql: String::new(),
+                        bindings: vec![],
+                        operation: "FOUND_ROWS",
+                        identity: false,
+                        cacheable: true,
+                        leading: vec![],
+                        count: None,
+                    });
+                }
+            }
+            (c.query(q)?, "SELECT", false)
+        }
         Statement::Insert(i) => {
             let (sql, id) = c.insert(i)?;
-            (sql, "INSERT", id)
+            (sql, if i.replace_into { "REPLACE" } else { "INSERT" }, id)
         }
         Statement::Update(u) => (c.update(u)?, "UPDATE", false),
         Statement::Delete(d) => (c.delete(d)?, "DELETE", false),
         _ => return Err("Only SELECT, INSERT VALUES, UPDATE and DELETE are compiled".into()),
     };
+    let mut count = None;
+    if let Statement::Query(q) = stmt
+        && let SetExpr::Select(s) = &*q.body
+        && s.select_modifiers
+            .as_ref()
+            .is_some_and(|m| m.sql_calc_found_rows)
+    {
+        let regular = std::mem::take(&mut c.bindings);
+        let mut unlimited = q.clone();
+        unlimited.limit_clause = None;
+        let count_sql = c.query(&unlimited)?;
+        count = Some(Command {
+            sql: format!("SELECT COUNT(*) FROM ({count_sql}) AS dsql_found_rows"),
+            bindings: std::mem::replace(&mut c.bindings, regular),
+        });
+    }
     Ok(Plan {
         sql,
         bindings: c.bindings,
         operation,
         identity,
+        cacheable: c.cacheable,
+        leading: c.leading,
+        count,
     })
 }
-struct Compiler<'a> {
-    shape: &'a Shape,
-    schema: &'a Schema,
-    aliases: BTreeMap<String, String>,
-    bindings: Vec<Binding>,
+pub(crate) struct Compiler<'a> {
+    pub(crate) shape: &'a Shape,
+    pub(crate) schema: &'a Schema,
+    pub(crate) aliases: BTreeMap<String, String>,
+    pub(crate) bindings: Vec<Binding>,
+    pub(crate) cacheable: bool,
+    pub(crate) write_column: Option<(String, String)>,
+    pub(crate) leading: Vec<Command>,
+    pub(crate) upsert: bool,
+    pub(crate) local_tables: std::collections::BTreeSet<String>,
 }
 impl Compiler<'_> {
-    fn table(&mut self, t: &TableFactor) -> Result<String> {
+    pub(crate) fn table(&mut self, t: &TableFactor) -> Result<String> {
         match t {
             TableFactor::Table {
                 name: n,
@@ -201,32 +360,68 @@ impl Compiler<'_> {
                     Ok(qi(&n))
                 }
             }
+            TableFactor::Derived {
+                lateral,
+                subquery,
+                alias,
+                sample,
+            } => {
+                check(!*lateral && sample.is_none())?;
+                let alias = alias.as_ref().ok_or("Derived table requires alias")?;
+                check(alias.columns.is_empty())?;
+                Ok(format!(
+                    "({}) AS {}",
+                    self.query(subquery)?,
+                    qi(&alias.name.value)
+                ))
+            }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                check(alias.is_none())?;
+                Ok(format!("({})", self.from(table_with_joins)?))
+            }
             _ => Err("Unsupported table expression".into()),
         }
     }
-    fn from(&mut self, t: &TableWithJoins) -> Result<String> {
+    pub(crate) fn from(&mut self, t: &TableWithJoins) -> Result<String> {
         let mut s = self.table(&t.relation)?;
         for j in &t.joins {
             check(!j.global)?;
             let (op, condition) = match &j.join_operator {
-                JoinOperator::Inner(c) => ("INNER JOIN", c),
-                JoinOperator::LeftOuter(c) => ("LEFT JOIN", c),
+                JoinOperator::Join(c) | JoinOperator::Inner(c) => ("INNER JOIN", Some(c)),
+                JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => ("LEFT JOIN", Some(c)),
+                JoinOperator::Right(c) | JoinOperator::RightOuter(c) => ("RIGHT JOIN", Some(c)),
+                JoinOperator::CrossJoin(c) => ("CROSS JOIN", Some(c)),
                 _ => return Err("Unsupported join".into()),
             };
             let rhs = self.table(&j.relation)?;
-            let on = match condition {
-                JoinConstraint::On(e) => self.expr(e, None)?,
-                _ => return Err("JOIN requires ON".into()),
+            let constraint = match condition {
+                Some(JoinConstraint::On(e)) => format!(" ON {}", self.truth(e)?),
+                Some(JoinConstraint::Using(cols)) => format!(
+                    " USING ({})",
+                    cols.iter()
+                        .map(|n| name(n).map(|n| qi(&n)))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(",")
+                ),
+                Some(JoinConstraint::None) | None => String::new(),
+                _ => return Err("Unsupported join constraint".into()),
             };
-            s.push_str(&format!(" {op} {rhs} ON {on}"));
+            s.push_str(&format!(" {op} {rhs}{constraint}"));
         }
         Ok(s)
     }
-    fn column(&self, ids: &[Ident]) -> Result<(String, String)> {
+    pub(crate) fn column(&self, ids: &[Ident]) -> Result<(String, String)> {
         check(!ids.is_empty() && ids.len() <= 2)?;
         let field = &ids.last().unwrap().value;
         let mut matches = vec![];
         for (alias, table) in &self.aliases {
+            if ids.len() == 1 && !self.local_tables.is_empty() && !self.local_tables.contains(table)
+            {
+                continue;
+            }
             if ids.len() == 2 && alias != &ids[0].value {
                 continue;
             }
@@ -235,6 +430,8 @@ impl Compiler<'_> {
                     if col.name.eq_ignore_ascii_case(field) {
                         let sql = if ids.len() == 2 {
                             format!("{}.{}", qi(alias), qi(&col.name))
+                        } else if self.upsert {
+                            format!("{}.{}", qi(table), qi(&col.name))
                         } else {
                             qi(&col.name)
                         };
@@ -248,18 +445,45 @@ impl Compiler<'_> {
         if matches.len() == 1 {
             Ok(matches.remove(0))
         } else {
-            Err("Unknown or ambiguous column".into())
+            Ok((
+                ids.iter()
+                    .map(|i| qi(&i.value))
+                    .collect::<Vec<_>>()
+                    .join("."),
+                String::new(),
+            ))
         }
     }
-    fn ty(&self, e: &Expr) -> Option<String> {
+    pub(crate) fn ty(&self, e: &Expr) -> Option<String> {
         match e {
-            Expr::Identifier(i) => self.column(std::slice::from_ref(i)).ok().map(|x| x.1),
-            Expr::CompoundIdentifier(i) => self.column(i).ok().map(|x| x.1),
+            Expr::Identifier(i) => self
+                .column(std::slice::from_ref(i))
+                .ok()
+                .map(|x| x.1)
+                .filter(|t| !t.is_empty()),
+            Expr::CompoundIdentifier(i) => {
+                self.column(i).ok().map(|x| x.1).filter(|t| !t.is_empty())
+            }
             _ => None,
         }
     }
-    fn expr(&mut self, e: &Expr, expected: Option<&str>) -> Result<String> {
+    pub(crate) fn expr(&mut self, e: &Expr, expected: Option<&str>) -> Result<String> {
         Ok(match e {
+            Expr::Identifier(i)
+                if i.quote_style.is_none()
+                    && [
+                        "CURRENT_USER",
+                        "SESSION_USER",
+                        "CURRENT_DATE",
+                        "CURRENT_TIME",
+                        "CURRENT_TIMESTAMP",
+                        "LOCALTIME",
+                        "LOCALTIMESTAMP",
+                    ]
+                    .contains(&i.value.to_ascii_uppercase().as_str()) =>
+            {
+                i.value.to_ascii_uppercase()
+            }
             Expr::Identifier(i) => self.column(std::slice::from_ref(i))?.0,
             Expr::CompoundIdentifier(i) => self.column(i)?.0,
             Expr::Value(v) => match &v.value {
@@ -270,20 +494,10 @@ impl Compiler<'_> {
                         .and_then(|x| x.checked_sub(1))
                         .ok_or("Invalid parameter")?;
                     let num = *self.shape.numeric.get(slot).ok_or("Invalid parameter")?;
-                    let ty = expected.unwrap_or(if num { "numeric" } else { "text" });
-                    if let Some(t) = expected {
-                        let numeric_type = matches!(
-                            t,
-                            "bigint"
-                                | "integer"
-                                | "smallint"
-                                | "numeric"
-                                | "real"
-                                | "double precision"
-                        );
-                        let text_type = matches!(t, "text" | "character varying" | "character");
-                        check(!(numeric_type && !num || text_type && num))?;
+                    if num && expected.is_none() {
+                        return Ok(format!("\u{1f}N{slot}\u{1f}"));
                     }
+                    let ty = expected.unwrap_or(if num { "numeric" } else { "text" });
                     let ty = match ty {
                         "bigint"
                         | "integer"
@@ -301,6 +515,10 @@ impl Compiler<'_> {
                     self.bindings.push(Binding {
                         slot,
                         temporal: ty == "date" || ty.starts_with("timestamp"),
+                        codec: self.shape.codec && !(ty == "date" || ty.starts_with("timestamp")),
+                        allow_nul: self.write_column.as_ref().is_some_and(|(_, t)| t == "text"),
+                        format: false,
+                        numeric_prefix: false,
                     });
                     format!("CAST(${} AS {})", self.bindings.len(), ty)
                 }
@@ -309,51 +527,14 @@ impl Compiler<'_> {
                 _ => return Err("Unbound literal".into()),
             },
             Expr::Nested(x) => format!("({})", self.expr(x, expected)?),
-            Expr::BinaryOp { left, op, right } => {
-                let op = match op {
-                    BinaryOperator::Eq => "=",
-                    BinaryOperator::NotEq => "<>",
-                    BinaryOperator::Gt => ">",
-                    BinaryOperator::Lt => "<",
-                    BinaryOperator::GtEq => ">=",
-                    BinaryOperator::LtEq => "<=",
-                    BinaryOperator::Spaceship => "IS NOT DISTINCT FROM",
-                    BinaryOperator::And => "AND",
-                    BinaryOperator::Or => "OR",
-                    BinaryOperator::Plus => "+",
-                    BinaryOperator::Minus => "-",
-                    BinaryOperator::Multiply => "*",
-                    _ => return Err("Unsupported binary operator".into()),
-                };
-                let lt = self.ty(left);
-                let rt = self.ty(right);
-                if let (Some(l), Some(r)) = (&lt, &rt) {
-                    let numeric = |t: &str| {
-                        matches!(
-                            t,
-                            "bigint"
-                                | "integer"
-                                | "smallint"
-                                | "numeric"
-                                | "real"
-                                | "double precision"
-                        )
-                    };
-                    check(numeric(l) == numeric(r))?;
+            Expr::BinaryOp { left, op, right } => self.binary(left, op, right)?,
+            Expr::UnaryOp { op, expr } => match op {
+                UnaryOperator::Not => format!("(NOT {})", self.truth(expr)?),
+                UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitwiseNot => {
+                    format!("({op}{})", self.numeric(expr)?)
                 }
-                format!(
-                    "({} {op} {})",
-                    self.expr(left, rt.as_deref())?,
-                    self.expr(right, lt.as_deref())?
-                )
-            }
-            Expr::UnaryOp { op, expr } => {
-                check(matches!(
-                    op,
-                    UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus
-                ))?;
-                format!("({op} {})", self.expr(expr, expected)?)
-            }
+                _ => return Err("Unsupported unary operation".into()),
+            },
             Expr::IsNull(x) => format!("({} IS NULL)", self.expr(x, None)?),
             Expr::IsNotNull(x) => format!("({} IS NOT NULL)", self.expr(x, None)?),
             Expr::InList {
@@ -362,13 +543,23 @@ impl Compiler<'_> {
                 negated,
             } => {
                 check(!list.is_empty())?;
-                let ty = self.ty(expr);
-                format!(
-                    "({} {}IN ({}))",
-                    self.expr(expr, None)?,
-                    if *negated { "NOT " } else { "" },
-                    self.list(list, ty.as_deref())?
-                )
+                if Self::is_binary(expr) {
+                    let left = self.bytes(expr)?;
+                    let rhs = list
+                        .iter()
+                        .map(|e| self.bytes(e))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(",");
+                    format!("({left} {}IN ({rhs}))", if *negated { "NOT " } else { "" })
+                } else {
+                    let ty = self.ty(expr);
+                    format!(
+                        "({} {}IN ({}))",
+                        self.expr(expr, None)?,
+                        if *negated { "NOT " } else { "" },
+                        self.list(list, ty.as_deref())?
+                    )
+                }
             }
             Expr::Between {
                 expr,
@@ -376,14 +567,24 @@ impl Compiler<'_> {
                 high,
                 negated,
             } => {
-                let ty = self.ty(expr);
-                format!(
-                    "({} {}BETWEEN {} AND {})",
-                    self.expr(expr, None)?,
-                    if *negated { "NOT " } else { "" },
-                    self.expr(low, ty.as_deref())?,
-                    self.expr(high, ty.as_deref())?
-                )
+                if Self::is_binary(expr) {
+                    format!(
+                        "({} {}BETWEEN {} AND {})",
+                        self.bytes(expr)?,
+                        if *negated { "NOT " } else { "" },
+                        self.bytes(low)?,
+                        self.bytes(high)?
+                    )
+                } else {
+                    let ty = self.ty(expr);
+                    format!(
+                        "({} {}BETWEEN {} AND {})",
+                        self.expr(expr, None)?,
+                        if *negated { "NOT " } else { "" },
+                        self.expr(low, ty.as_deref())?,
+                        self.expr(high, ty.as_deref())?
+                    )
+                }
             }
             Expr::Like {
                 expr,
@@ -392,309 +593,135 @@ impl Compiler<'_> {
                 any,
                 escape_char,
             } => {
-                check(!*any && escape_char.is_none())?;
-                format!(
-                    "({} {}LIKE {})",
-                    self.expr(expr, None)?,
-                    if *negated { "NOT " } else { "" },
-                    self.expr(pattern, Some("text"))?
-                )
+                check(!*any)?;
+                let bytes = Self::is_binary(expr) || Self::is_binary(pattern);
+                if bytes {
+                    check(escape_char.is_none())?;
+                    format!(
+                        "({} {}LIKE {})",
+                        self.bytes(expr)?,
+                        if *negated { "NOT " } else { "" },
+                        self.bytes(pattern)?
+                    )
+                } else {
+                    format!(
+                        "({} {}ILIKE {}{})",
+                        self.expr(expr, None)?,
+                        if *negated { "NOT " } else { "" },
+                        self.expr(pattern, Some("text"))?,
+                        if let Some(e) = escape_char {
+                            format!(" ESCAPE {}", self.expr(e, Some("text"))?)
+                        } else {
+                            String::new()
+                        }
+                    )
+                }
+            }
+            Expr::RLike {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => format!(
+                "({} {} {})",
+                self.expr(Self::unbinary(expr), None)?,
+                if *negated { "!~" } else { "~" },
+                self.expr(Self::unbinary(pattern), Some("text"))?
+            ),
+            Expr::Cast {
+                expr,
+                data_type,
+                format,
+                ..
+            } => {
+                check(format.is_none())?;
+                self.cast(expr, data_type)?
+            }
+            Expr::Exists { subquery, negated } => format!(
+                "({}EXISTS ({}))",
+                if *negated { "NOT " } else { "" },
+                self.query(subquery)?
+            ),
+            Expr::Subquery(q) => format!("({})", self.query(q)?),
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => format!(
+                "({} {}IN ({}))",
+                self.expr(expr, None)?,
+                if *negated { "NOT " } else { "" },
+                self.query(subquery)?
+            ),
+            Expr::IsTrue(e) => format!("({} IS TRUE)", self.truth(e)?),
+            Expr::IsFalse(e) => format!("({} IS FALSE)", self.truth(e)?),
+            Expr::IsNotTrue(e) => format!("({} IS NOT TRUE)", self.truth(e)?),
+            Expr::IsNotFalse(e) => format!("({} IS NOT FALSE)", self.truth(e)?),
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                let mut out = String::from("CASE");
+                if let Some(e) = operand {
+                    out.push_str(&format!(" {}", self.expr(e, None)?));
+                }
+                for c in conditions {
+                    out.push_str(&format!(
+                        " WHEN {} THEN {}",
+                        if operand.is_some() {
+                            self.expr(&c.condition, None)?
+                        } else {
+                            self.truth(&c.condition)?
+                        },
+                        self.expr(&c.result, None)?
+                    ));
+                }
+                if let Some(e) = else_result {
+                    out.push_str(&format!(" ELSE {}", self.expr(e, None)?));
+                }
+                out.push_str(" END");
+                out
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let mut args = vec![self.expr(expr, None)?];
+                if let Some(e) = substring_from {
+                    args.push(self.expr(e, Some("integer"))?);
+                }
+                if let Some(e) = substring_for {
+                    args.push(self.expr(e, Some("integer"))?);
+                }
+                format!("SUBSTRING({})", args.join(","))
+            }
+            Expr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => {
+                check(trim_where.is_none() && trim_what.is_none() && trim_characters.is_none())?;
+                format!("TRIM({})", self.expr(expr, None)?)
             }
             Expr::Function(f) => self.function(f)?,
             _ => return Err("Unsupported expression".into()),
         })
     }
-    fn list(&mut self, es: &[Expr], ty: Option<&str>) -> Result<String> {
+    pub(crate) fn list(&mut self, es: &[Expr], ty: Option<&str>) -> Result<String> {
         es.iter()
             .map(|e| self.expr(e, ty))
             .collect::<Result<Vec<_>>>()
             .map(|s| s.join(", "))
     }
-    fn function(&mut self, f: &Function) -> Result<String> {
-        check(
-            !f.uses_odbc_syntax
-                && f.filter.is_none()
-                && f.over.is_none()
-                && f.within_group.is_empty()
-                && f.null_treatment.is_none()
-                && matches!(f.parameters, FunctionArguments::None),
-        )?;
-        let n = name(&f.name)?.to_ascii_uppercase();
-        let a = match &f.args {
-            FunctionArguments::List(a) => a,
-            _ => return Err("Unsupported function arguments".into()),
-        };
-        check(a.clauses.is_empty() && a.duplicate_treatment.is_none())?;
-        let mut args = vec![];
-        for arg in &a.args {
-            args.push(match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => self.expr(e, None)?,
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if n == "COUNT" => "*".into(),
-                _ => return Err("Unsupported function argument".into()),
-            });
-        }
-        let mapped = match (n.as_str(), args.len()) {
-            ("IFNULL", 2) => "COALESCE",
-            ("LENGTH", 1) => "OCTET_LENGTH",
-            ("COALESCE", n) if n > 0 => "COALESCE",
-            ("COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "LOWER" | "UPPER" | "CHAR_LENGTH", 1) => {
-                n.as_str()
-            }
-            ("CONCAT", n) if n > 0 => return Ok(format!("({})", args.join(" || "))),
-            _ => return Err("Unsupported function".into()),
-        };
-        Ok(format!("{mapped}({})", args.join(", ")))
-    }
-    fn query(&mut self, q: &Query) -> Result<String> {
-        check(
-            q.with.is_none()
-                && q.fetch.is_none()
-                && q.locks.is_empty()
-                && q.for_clause.is_none()
-                && q.settings.is_none()
-                && q.format_clause.is_none()
-                && q.pipe_operators.is_empty(),
-        )?;
-        let s = match &*q.body {
-            SetExpr::Select(s) => s,
-            _ => return Err("Only SELECT query bodies are supported".into()),
-        };
-        check(
-            s.optimizer_hints.is_empty()
-                && s.select_modifiers.is_none()
-                && s.top.is_none()
-                && s.exclude.is_none()
-                && s.into.is_none()
-                && s.lateral_views.is_empty()
-                && s.prewhere.is_none()
-                && s.connect_by.is_empty()
-                && s.cluster_by.is_empty()
-                && s.distribute_by.is_empty()
-                && s.sort_by.is_empty()
-                && s.named_window.is_empty()
-                && s.qualify.is_none()
-                && s.value_table_mode.is_none()
-                && matches!(s.flavor, SelectFlavor::Standard),
-        )?;
-        let from = s
-            .from
-            .iter()
-            .map(|t| self.from(t))
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        let mut projection = vec![];
-        for p in &s.projection {
-            projection.push(match p {
-                SelectItem::UnnamedExpr(e) => self.expr(e, None)?,
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    format!("{} AS {}", self.expr(expr, None)?, qi(&alias.value))
-                }
-                SelectItem::Wildcard(o) if o.to_string().is_empty() => "*".into(),
-                _ => return Err("Unsupported projection".into()),
-            });
-        }
-        let distinct = match &s.distinct {
-            None => "",
-            Some(Distinct::Distinct) => "DISTINCT ",
-            _ => return Err("Unsupported DISTINCT".into()),
-        };
-        let mut sql = format!("SELECT {distinct}{}", projection.join(", "));
-        if !from.is_empty() {
-            sql.push_str(&format!(" FROM {from}"));
-        }
-        if let Some(e) = &s.selection {
-            sql.push_str(&format!(" WHERE {}", self.expr(e, None)?));
-        }
-        match &s.group_by {
-            GroupByExpr::Expressions(es, mods) if mods.is_empty() => {
-                check(!es.iter().any(|e| matches!(e, Expr::Value(_))))?;
-                if !es.is_empty() {
-                    sql.push_str(&format!(" GROUP BY {}", self.list(es, None)?));
-                }
-            }
-            _ => return Err("Unsupported GROUP BY".into()),
-        }
-        if let Some(e) = &s.having {
-            sql.push_str(&format!(" HAVING {}", self.expr(e, None)?));
-        }
-        if let Some(o) = &q.order_by {
-            check(o.interpolate.is_none())?;
-            let es = match &o.kind {
-                OrderByKind::Expressions(es) => es,
-                _ => return Err("Unsupported ORDER BY".into()),
-            };
-            let mut rendered = vec![];
-            for e in es {
-                check(e.with_fill.is_none())?;
-                // Reject ordinal ordering until plans model structural literal slots.
-                check(!matches!(e.expr, Expr::Value(_)))?;
-                let mut item = self.expr(&e.expr, None)?;
-                match e.options.sort {
-                    Some(OrderBySort::Asc) => item.push_str(" ASC NULLS FIRST"),
-                    Some(OrderBySort::Desc) => item.push_str(" DESC NULLS LAST"),
-                    None => item.push_str(" ASC NULLS FIRST"),
-                    _ => return Err("Unsupported ordering".into()),
-                };
-                check(e.options.nulls_first.is_none())?;
-                rendered.push(item);
-            }
-            sql.push_str(&format!(" ORDER BY {}", rendered.join(", ")));
-        }
-        if let Some(l) = &q.limit_clause {
-            match l {
-                LimitClause::OffsetCommaLimit { offset, limit } => sql.push_str(&format!(
-                    " LIMIT {} OFFSET {}",
-                    self.expr(limit, Some("bigint"))?,
-                    self.expr(offset, Some("bigint"))?
-                )),
-                LimitClause::LimitOffset {
-                    limit,
-                    offset,
-                    limit_by,
-                } => {
-                    check(limit_by.is_empty())?;
-                    if let Some(l) = limit {
-                        sql.push_str(&format!(" LIMIT {}", self.expr(l, Some("bigint"))?));
-                    }
-                    if let Some(o) = offset {
-                        sql.push_str(&format!(" OFFSET {}", self.expr(&o.value, Some("bigint"))?));
-                    }
-                }
-            }
-        }
-        Ok(sql)
-    }
-    fn target(&mut self, n: &ObjectName) -> Result<String> {
+    pub(crate) fn target(&mut self, n: &ObjectName) -> Result<String> {
         let n = name(n)?;
         check(self.schema.contains_key(&n))?;
         self.aliases.insert(n.clone(), n.clone());
         Ok(n)
-    }
-    fn insert(&mut self, i: &Insert) -> Result<(String, bool)> {
-        check(
-            i.optimizer_hints.is_empty()
-                && i.or.is_none()
-                && !i.ignore
-                && i.table_alias.is_none()
-                && !i.overwrite
-                && i.assignments.is_empty()
-                && i.partitioned.is_none()
-                && i.after_columns.is_empty()
-                && i.on.is_none()
-                && i.returning.is_none()
-                && i.output.is_none()
-                && !i.replace_into
-                && i.priority.is_none()
-                && i.insert_alias.is_none()
-                && i.settings.is_none()
-                && i.format_clause.is_none()
-                && i.multi_table_insert_type.is_none()
-                && i.multi_table_into_clauses.is_empty()
-                && i.multi_table_when_clauses.is_empty()
-                && i.multi_table_else_clause.is_none(),
-        )?;
-        let n = match &i.table {
-            TableObject::TableName(n) => self.target(n)?,
-            _ => return Err("Unsupported INSERT target".into()),
-        };
-        check(!i.columns.is_empty())?;
-        let cols = i.columns.iter().map(name).collect::<Result<Vec<_>>>()?;
-        let meta = self.schema.get(&n).unwrap().clone();
-        let columns = cols
-            .iter()
-            .map(|n| {
-                meta.iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(n))
-                    .cloned()
-                    .ok_or("Unknown INSERT column".into())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        check(columns.iter().all(|c| !c.identity))?; // Explicit identities require a separate reseeding contract.
-        let q = i.source.as_ref().ok_or("INSERT VALUES required")?;
-        check(
-            q.with.is_none()
-                && q.order_by.is_none()
-                && q.limit_clause.is_none()
-                && q.locks.is_empty()
-                && q.fetch.is_none()
-                && q.for_clause.is_none()
-                && q.settings.is_none()
-                && q.format_clause.is_none()
-                && q.pipe_operators.is_empty(),
-        )?;
-        let rows = match &*q.body {
-            SetExpr::Values(v) => &v.rows,
-            _ => return Err("INSERT SELECT is outside this prototype".into()),
-        };
-        let mut values = vec![];
-        for row in rows {
-            check(row.len() == columns.len())?;
-            let mut r = vec![];
-            for (v, c) in row.iter().zip(&columns) {
-                r.push(self.expr(v, Some(&c.ty))?);
-            }
-            values.push(format!("({})", r.join(", ")));
-        }
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES {}",
-            qi(&n),
-            columns
-                .iter()
-                .map(|c| qi(&c.name))
-                .collect::<Vec<_>>()
-                .join(", "),
-            values.join(", ")
-        );
-        let identity = meta.iter().find(|c| c.identity);
-        if let Some(c) = identity {
-            sql.push_str(&format!(" RETURNING {}", qi(&c.name)));
-        }
-        Ok((sql, identity.is_some()))
-    }
-    fn update(&mut self, u: &Update) -> Result<String> {
-        check(
-            u.optimizer_hints.is_empty()
-                && u.table.joins.is_empty()
-                && u.from.is_none()
-                && u.returning.is_none()
-                && u.output.is_none()
-                && u.or.is_none()
-                && u.order_by.is_empty()
-                && u.limit.is_none()
-                && u.assignments.len() == 1,
-        )?;
-        let table = self.table(&u.table.relation)?;
-        let a = &u.assignments[0];
-        let n = match &a.target {
-            AssignmentTarget::ColumnName(n) => name(n)?,
-            _ => return Err("Unsupported assignment".into()),
-        };
-        let (col, ty) = self.column(&[Ident::new(n)])?;
-        let value = self.expr(&a.value, Some(&ty))?;
-        let mut sql = format!("UPDATE {table} SET {col} = {value}");
-        if let Some(e) = &u.selection {
-            sql.push_str(&format!(" WHERE {}", self.expr(e, None)?));
-        }
-        Ok(sql)
-    }
-    fn delete(&mut self, d: &Delete) -> Result<String> {
-        check(
-            d.optimizer_hints.is_empty()
-                && d.tables.is_empty()
-                && d.using.is_none()
-                && d.returning.is_none()
-                && d.output.is_none()
-                && d.order_by.is_empty()
-                && d.limit.is_none(),
-        )?;
-        let from = match &d.from {
-            FromTable::WithFromKeyword(f) | FromTable::WithoutKeyword(f) => f,
-        };
-        check(from.len() == 1 && from[0].joins.is_empty())?;
-        let mut sql = format!("DELETE FROM {}", self.table(&from[0].relation)?);
-        if let Some(e) = &d.selection {
-            sql.push_str(&format!(" WHERE {}", self.expr(e, None)?));
-        }
-        Ok(sql)
     }
 }

@@ -5,7 +5,7 @@
 !native/src
 !native/src/**
 !native/tests
-!native/tests/compiler.rs
+!native/tests/*.rs
 !native/examples
 !native/examples/**
 !native/build

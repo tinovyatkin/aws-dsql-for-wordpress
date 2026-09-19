@@ -1,159 +1,123 @@
-# Native MySQL → DSQL prototype
+# Native MySQL → Aurora DSQL engine
 
-This is an experimental PHP extension implementing a complete query operation in
-Rust. It is not loaded by `db.php` and does not replace the production engine.
+The PHP extension executes an entire database operation in Rust. The WordPress
+`wpdb` bridge supplies the original MySQL string and receives final rows,
+metadata, affected-row count and generated identity. It does not serialize a
+parser AST through PHP, invoke a PHP translator, or use PDO on the native path.
 
 ```text
-PHP query(MySQL string)
-  → Rust tokenizer and value extraction
-  → native bounded translation-plan cache
-  → sqlparser-rs MySQL AST and conservative DSQL compiler on a miss
-  → native schema lookup, parameter binding and temporal conversion
-  → AWS DSQL Rust connector + SQLx + reused PostgreSQL connection
-  → native row decoding
-  → final PHP arrays, affected-row count, insert ID and timing counters
+wpdb → DsqlNativeEngine
+         → sqlparser-rs MySQL AST
+         → literal extraction and bounded translation-plan cache
+         → DSQL compiler, logical catalog and parameter binding
+         → AWS Rust DSQL connector / SQLx / reused TLS connection
+         → value decoding → final Zend arrays
 ```
 
-No PHP lexer, parser, translator, Composer autoloader, PDO call, JSON round-trip,
-subprocess or PHP callback participates in a native query. The original query
-crosses the PHP boundary once; final results are converted directly to Zend
-values. JSON in the benchmark endpoint is only the final HTTP/FastCGI response.
+`sqlparser-rs` provides the typed query AST. A strict token grammar handles the
+MySQL metadata commands it does not represent completely. All input must be
+consumed. The compiler supports the PHP engine's WordPress query contracts;
+unsupported constructs fail explicitly. This is not general MySQL emulation.
 
-The parser is Apache `sqlparser-rs` 0.63.0, selected for its typed AST. The official
-AWS Rust SQLx connector is 0.2.2; `ext-php-rs` 0.15.15 provides the PHP boundary.
-Exact dependencies are recorded in `Cargo.lock`.
+## Build and enable
 
-## Build and use
+The tested deployment target is **Debian 12, x86_64, PHP 8.5.10 NTS**. The
+[Dockerfile](build/Dockerfile) pins Rust and PHP image digests, runs Rust tests,
+builds the extension, checks PHP loading and native logging, and exports a binary
+with SHA-256, source commit, PHP ABI and dynamic-library metadata. The
+[GitHub workflow](../.github/workflows/native-linux.yml) runs this build off-host.
+Build an artifact for the actual PHP ABI and operating system; do not copy a
+macOS library to Linux or load an NTS build into ZTS PHP.
 
-Verified with Rust 1.98.1 and PHP 8.5.10 NTS on macOS arm64. PHP headers,
-`php-config`, a C compiler and libclang are required. Linux builds use the same
-source but have not yet been validated. Run Cargo **from this directory** so it
-reads the macOS dynamic-linker configuration:
-
-```sh
-cd native
-cargo build --release
-cargo test --no-default-features
-cargo clippy --all-targets -- -D warnings
-```
-
-Load only into an explicitly selected test PHP process:
+For local macOS arm64 development, install matching PHP development headers,
+`php-config`, a C compiler and libclang. Build **from this directory** so Cargo
+loads the macOS dynamic-linker configuration:
 
 ```sh
+cargo test --locked --no-default-features
+cargo build --locked --release
 php -d extension="$PWD/target/release/libwp_dsql_native.dylib" example.php
-# Linux artifact: target/release/libwp_dsql_native.so
 ```
+
+On Linux load `wp_dsql_native.so` through the relevant PHP CLI/FPM configuration.
+Restart or gracefully reload FPM after changing the library. Enable the engine
+before WordPress bootstrap:
 
 ```php
-$db = new DsqlNativePrototype(
-    'your-cluster.dsql.eu-central-1.on.aws',
-    'eu-central-1',
-    'your-test-profile',
-    'your_database_role',
-    'public',
-    'your_test_prefix_',
-    'immutable-fixture-revision-1'
-);
-$result = $db->query("SELECT ID, post_title FROM your_test_prefix_posts WHERE ID=1");
-$result['rows'];          // Associative string/null values.
-$result['columns'];       // Projection order, when the result has rows.
-$result['affected_rows'];
-$result['insert_id'];     // String, empty if no generated identity.
-$result['timing'];        // Milliseconds plus cache/reuse indicators; no SQL values.
-$db->close();
+define('DSQL_ENGINE', 'native');
 ```
 
-Provide a real CA bundle through `PGSSLROOTCERT` when sharing a process with the
-PHP comparison adapter. libpq's special `system` setting is not a SQLx file path.
-On macOS, also set `SSL_CERT_FILE` to that bundle to avoid loading the Keychain
-certificate provider for the first time inside a forked FPM child. The benchmark
-harness sets both, without disabling certificate validation or fork safety.
+The normal drop-in configuration supplies endpoint, region, profile, schema,
+role, table prefix, SQL mode and codec policy. The extension must expose the
+expected API version; a missing or mismatched extension fails explicitly.
+Omitting `DSQL_ENGINE` retains the PHP engine as a deployment rollback option.
+There is no automatic PHP fallback after a native operation fails.
 
-## Lifetime and cache behavior
+Use a trusted CA **file path**, for example
+`PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt`, rather than libpq's `system`
+sentinel. TLS verifies both the certificate chain and hostname. On macOS set
+`SSL_CERT_FILE` too, before starting FPM, to avoid initializing Keychain access
+for the first time after a fork.
 
-The runtime starts lazily after FPM forks. Each worker retains one connection per
-configuration, up to eight configurations. Each configuration has a 256-entry
-native LRU; combined key/emitted-SQL size is capped at 32 KiB per retained plan.
-Literal values and comments are not retained in cache keys or plans. Current
-values are bound again on every call. SQLx retains up to 32 server-prepared
-statements, including tested eviction through PostgreSQL protocol messages.
+## Connections, errors and cache lifetime
 
-The pool closes idle connections after 60 seconds and retires them after
-55 minutes. The AWS connector refreshes authentication tokens. Checkout does not
-issue a separate ping: connection failures are reported without replaying writes.
-`BEGIN` pins the connection until `COMMIT` or `ROLLBACK`. Closing/destroying a
-client with an open or failed transaction closes that physical connection so
-state cannot leak into another request. PHP module shutdown closes idle pools and
-stops the runtime. ZTS, pcntl forks after first use, failover and long-duration
-credential/connection renewal have not been validated.
+The Tokio runtime starts lazily in each FPM worker, after the master forks. Each
+worker supports up to eight distinct configurations and two physical connections
+per configuration. A logical client holds its own connection; transactions are
+never multiplexed between clients. Idle connections expire after 60 seconds and
+connections retire after 55 minutes, between operations. The AWS connector
+refreshes signed authentication tokens; an explicit credential file is reread
+when credentials are requested, including after atomic rotation.
 
-A worker supports one active database transaction per configuration. A second
-client attempting to use that configuration while a transaction owns its only
-connection will reach the bounded acquisition timeout; this is not a multiplexed
-transaction service.
+Native 256-entry LRU caches retain compiled plans, without literal values or
+query results. SQLx retains up to 32 prepared statements per connection. The
+native parser still runs for each query; a plan-cache hit skips SQL compilation.
+The WordPress `prepare()` capture records bounded hashes, not SQL strings.
+Logical catalog generations invalidate compiled, metadata and prepared-statement
+caches. Restart workers after controlled schema maintenance to establish a clean
+boundary for already-running requests.
 
-Plans retain physical-schema decisions. **The explicit revision must change after
-any schema change**, or the worker must be restarted. This prototype intentionally
-has no schema writes or automatic schema invalidation. It also lacks the released
-adapter's managed-catalog readiness checks. Keep it on disposable, immutable test
-schemas until those contracts are implemented.
+Only known aborted concurrency conflicts are retried outside caller-owned
+transactions. A multi-statement `REPLACE` retries its entire owned transaction.
+A failed read may reconnect once; an ambiguous write failure is never replayed.
+A lost caller-owned transaction must be rolled back before the client can reconnect.
+Closing a client with an open transaction discards the physical connection.
 
-`dsql_native_reset_worker()` is a benchmark helper that clears pools and plans. It
-refuses to operate while a live native client owns a backend. Normal PHP request
-shutdown preserves idle pools and plans.
+Rust classifies failures, fingerprints redacted SQL shapes and emits the
+`wordpress_dsql_error` JSON event through PHP's native logging API. The WordPress
+bridge supplies request context and code location. SQL values, query text,
+credentials and database exception details are excluded from the event. Existing
+log collectors can continue using the version-1 event contract.
 
-## Implemented scope
+## Installation and maintenance
 
-- SELECT with explicit column resolution, aliases, inner/left joins, WHERE,
-  IN/BETWEEN/LIKE, grouping, basic aggregates, ordering and MySQL LIMIT syntax.
-- IFNULL/COALESCE, CONCAT, lower/upper case, byte and character length.
-- INSERT VALUES (including multiple rows) with explicit non-identity columns and
-  generated identity results; single-assignment UPDATE; simple DELETE.
-- Explicit transactions, string/null results, common numeric and temporal types,
-  temporal zero-date sentinels, bound values and changing-value cache reuse.
+The native engine implements ordinary installation CREATE/DROP, index-job waits,
+identity handling, logical schema metadata, SHOW and supported INFORMATION_SCHEMA
+queries. Restored tables retain the managed-schema guard.
 
-Unsupported syntax is rejected; there is no fallback to PHP or raw SQL execution.
-This is **not complete WordPress compatibility**. Missing work includes SHOW and
-INFORMATION_SCHEMA emulation, controlled DDL/upgrades, the logical schema catalog,
-SQL modes, NUL codec, REPLACE/upserts, FOUND_ROWS, subqueries/unions, richer function
-and coercion behavior, full result metadata (including empty-result columns),
-wpdb integration and OCC retries. Numeric/text coercions and ordinal ORDER/GROUP
-BY are deliberately rejected. Existing DSQL collation differences remain.
+Explicit controlled-upgrade sessions use the existing PHP maintenance engine,
+which owns recovery journals, rebuilds and rollback verification. This deliberate
+maintenance boundary does not move normal queries or diagnostics back into PHP.
+Keep Composer dependencies and maintenance tools installed for upgrades and for
+an explicit rollback to the PHP runtime.
 
-## Reproduce the tests and benchmark
+## Validation
 
-The integration harness uses the repository's existing synthetic lab configuration
-in ignored `.local/settings.json` and `.local/cluster.json`. Fixture creation and
-cleanup additionally verify the cluster's current synthetic-purpose tag via AWS
-CLI. It creates two uniquely named tables and 80 synthetic rows; it never reads a
-WordPress content database.
+`cargo test --no-default-features` checks compilation, metadata grammar, DDL,
+codec framing, redaction and credential-file rotation. PHP scripts under
+`tests/` exercise the full boundary against the separately tagged synthetic DSQL
+fixture. Existing repository WordPress, core differential and plugin fixtures
+also run with `DSQL_ENGINE=native`; standalone suites accept
+`DSQL_TEST_ENGINE=native`.
 
-From the repository root, after building the extension:
+Connection fault tests are ignored by default because they require that fixture:
 
 ```sh
-python3 native/tests/run-fpm.py
+WPDSQL_NATIVE_TESTS=synthetic cargo test --no-default-features --lib \
+  connection_lifetime -- --ignored --test-threads=1
 ```
 
-The harness starts a disposable, loopback-only, single-worker PHP-FPM process with
-OPcache, compares the PHP engine and native extension serially, validates identical
-results, and stops the process afterward. It removes a fixture that it created;
-an existing explicitly created fixture remains available until
-`php native/tests/fixture.php cleanup`. The raw timing records stay under ignored
-`.local/native-fpm-{warm,fresh}.json`.
-
-There are seven compiler test groups and 74 live DSQL integration checks, covering
-read parity, Unicode/quotes, injection-shaped literal values, nulls, generated
-IDs, writes, commit/rollback, failed and abandoned transactions, cache reuse,
-prepared-statement eviction, reset guards and unsupported SQL rejection.
-
-An optional syntax-only corpus probe accepts a JSON array of SQL strings:
-
-```sh
-cd native
-cargo run --no-default-features --example corpus -- /path/to/synthetic-queries.json
-```
-
-All 266 statements in the available synthetic WordPress capture parsed. Parsing
-success does not mean the native compiler implements those statements. See
-[the measured results](benchmark-results.md) for complete-request comparisons and
-limits on what they demonstrate.
+They reject a missing or differently tagged local fixture. Never point these
+write tests at production. See [the release gate](production-readiness.md) for
+validation and rollout requirements. `dsql_native_reset_worker()` is a test
+isolation helper; it refuses to reset pools owned by live clients.

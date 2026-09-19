@@ -8,13 +8,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends libclang-dev cm
 WORKDIR /build/native
 COPY native/Cargo.toml native/Cargo.lock ./
 COPY native/src ./src
-COPY native/tests/compiler.rs ./tests/compiler.rs
+COPY native/tests/*.rs ./tests/
 COPY native/examples ./examples
+COPY native/build/smoke.php /build/smoke.php
 RUN cargo test --locked --no-default-features && cargo build --locked --release
 RUN mkdir /artifact && cp target/release/libwp_dsql_native.so /artifact/wp_dsql_native.so && \
-    php -n -d extension=/artifact/wp_dsql_native.so -r 'if (!class_exists("DsqlNativePrototype")) { exit(1); }' && \
+    php -n -d extension=/artifact/wp_dsql_native.so /build/smoke.php && \
     ldd /artifact/wp_dsql_native.so > /artifact/ldd.txt && \
     readelf --version-info /artifact/wp_dsql_native.so > /artifact/elf-versions.txt
+ARG SOURCE_COMMIT=unknown
+ENV WPDSQL_SOURCE_COMMIT=${SOURCE_COMMIT}
 COPY native/build/manifest.py /build/manifest.py
 RUN python3 /build/manifest.py /artifact
 FROM scratch AS artifact

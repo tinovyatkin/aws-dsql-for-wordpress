@@ -7,29 +7,45 @@ fn schema() -> Schema {
                 name: "ID".into(),
                 ty: "bigint".into(),
                 identity: true,
+                nullable: false,
+                default: None,
+                ordinal: 0,
             },
             Column {
                 name: "post_title".into(),
                 ty: "text".into(),
                 identity: false,
+                nullable: false,
+                default: None,
+                ordinal: 0,
             },
             Column {
                 name: "post_status".into(),
                 ty: "character varying".into(),
                 identity: false,
+                nullable: false,
+                default: None,
+                ordinal: 0,
             },
             Column {
                 name: "stamp".into(),
                 ty: "timestamp without time zone".into(),
                 identity: false,
+                nullable: false,
+                default: None,
+                ordinal: 0,
             },
         ],
     )]
-    .into()
+    .into_iter()
+    .map(|(name, columns)| (name, Table::from(columns)))
+    .collect()
 }
 fn plan(sql: &str) -> Result<Plan> {
     let s = shape(sql)?;
-    compile(&parse(&s)?, &s, &schema())
+    let mut p = compile(&parse(&s)?, &s, &schema())?;
+    p.sql = wp_dsql_native::expression::resolve_numbers(&p.sql, &s.values)?;
+    Ok(p)
 }
 #[test]
 fn complete_select() {
@@ -64,7 +80,7 @@ fn bound_injection() {
 fn mutation_plans() {
     let p=plan("INSERT INTO native_poc_posts (post_title,stamp) VALUES ('hello','0000-00-00 00:00:00'),('other','2026-09-19 12:00:00')").unwrap();
     assert!(p.identity);
-    assert!(p.sql.ends_with("RETURNING \"ID\""));
+    assert!(p.sql.ends_with("RETURNING *"));
     assert!(p.bindings[1].temporal);
     assert!(plan("UPDATE native_poc_posts SET post_title='changed' WHERE ID=1").is_ok());
     assert!(plan("DELETE FROM native_poc_posts WHERE ID=1").is_ok());
@@ -78,12 +94,12 @@ fn unsupported_rejected() {
         "SELECT SLEEP(10)",
         "SELECT /*!50000 1 */ 2",
         "SELECT * FROM native_poc_posts FOR UPDATE",
-        "REPLACE INTO native_poc_posts(post_title) VALUES('x')",
-        "INSERT IGNORE INTO native_poc_posts(post_title) VALUES('x')",
-        "UPDATE native_poc_posts SET ID=1,post_title='x'",
+        "REPLACE INTO native_poc_posts(post_title) VALUES('x'),('y')",
+        "INSERT INTO native_poc_posts(post_title) VALUES('x') ON DUPLICATE KEY UPDATE post_title=VALUES(post_title)",
+        "UPDATE native_poc_posts SET ID=ID+1,post_title=ID",
         "DELETE FROM native_poc_posts LIMIT 1",
-        "SELECT post_title FROM native_poc_posts ORDER BY 1",
-        "SELECT post_title FROM native_poc_posts UNION SELECT post_title FROM native_poc_posts",
+        "SELECT COUNT(*) OVER () FROM native_poc_posts",
+        "SELECT post_title FROM native_poc_posts INTERSECT SELECT post_title FROM native_poc_posts",
     ] {
         assert!(plan(sql).is_err(), "{sql}");
     }
@@ -100,9 +116,24 @@ fn null_and_unicode() {
 fn comments_and_coercions() {
     let s = shape("SELECT /* private-note */ 'secret' AS value").unwrap();
     assert!(!format!("{:?}", s.tokens).contains("private-note"));
-    assert!(plan("SELECT ID FROM native_poc_posts WHERE post_title=123").is_err());
-    assert!(plan("SELECT ID FROM native_poc_posts WHERE ID='123tail'").is_err());
-    assert!(plan("SELECT post_title FROM native_poc_posts GROUP BY 1").is_err());
+    assert!(
+        plan("SELECT ID FROM native_poc_posts WHERE post_title=123")
+            .unwrap()
+            .sql
+            .contains("substring")
+    );
+    assert!(
+        plan("SELECT ID FROM native_poc_posts WHERE ID='123tail'")
+            .unwrap()
+            .sql
+            .contains("AS bigint")
+    );
+    assert!(
+        plan("SELECT post_title FROM native_poc_posts GROUP BY 1")
+            .unwrap()
+            .sql
+            .contains("GROUP BY 1")
+    );
     assert!(
         plan("SELECT LENGTH('🌍') AS bytes")
             .unwrap()
