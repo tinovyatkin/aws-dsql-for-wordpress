@@ -34,7 +34,9 @@ check(first($n->query("SELECT post_title FROM `$t` WHERE ID=1"))==='Synthetic st
 $n->query('BEGIN');
 rejects(fn()=>$n->query("INSERT INTO `$m` (meta_id,post_id,meta_key,meta_value) VALUES (1,1,'secret-value','x')"),'Duplicate key error');
 $n->query('ROLLBACK');check(first($n->query('SELECT 1 AS ok'))==='1','Connection usable after failed transaction rollback');
-foreach(["SELECT * FROM wp_posts","DROP TABLE `$t`","SELECT 1; SELECT 2","SET sql_mode='made_up'","REPLACE INTO `$t` (post_title) VALUES ('x')"] as $q)rejects(fn()=>$n->query($q),'Fail closed');
+foreach(["SELECT * FROM `{$f['prefix']}missing`","ALTER TABLE `$t` ADD COLUMN forbidden text","SELECT 1; SELECT 2","SET sql_mode='made_up'","REPLACE INTO `$t` (post_title) VALUES ('x')"] as $q)rejects(fn()=>$n->query($q),'Fail closed');
+// A schema attempt conservatively invalidates cached plans, even on rejection.
+$n->query("SELECT ID FROM `$t` WHERE post_status='draft' AND ID=3");
 $another=native_client();$r=$another->query("SELECT ID FROM `$t` WHERE post_status='draft' AND ID=3");
 check($r['timing']['backend_reused']===1.0&&$r['timing']['plan_hit']===1.0,'Native backend and plan survive PHP object lifetime');
 for($i=0;$i<40;$i++)check(first($n->query("SELECT $i AS eviction_$i"))===(string)$i,'Prepared statement eviction');

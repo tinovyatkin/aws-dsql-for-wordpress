@@ -28,7 +28,7 @@ try {
     diagnostic_check($display === '', 'Raw SQL never rendered even with show_errors');
     diagnostic_check($wpdb->dsql_error_count === $before + 2, 'Suppressed failures still counted');
     $events = array_slice($wpdb->dsql_errors, -2);
-    diagnostic_check($events[0]['sqlstate'] === '42P01' && $events[0]['stage'] === 'execute', 'Database SQLSTATE and execution stage captured');
+    diagnostic_check($events[0]['sqlstate'] === '42P01' && $events[0]['stage'] === ($wpdb->get_driver() instanceof WPDSQL\Engine\NativeDriver ? 'metadata' : 'execute'), 'Database SQLSTATE and failing stage captured');
     diagnostic_check($events[1]['kind'] === 'adapter' && $events[1]['stage'] === 'translate', 'Pre-database translation rejection captured');
     $text = file_get_contents($log);
     diagnostic_check(substr_count($text, 'wordpress_dsql_error') === 2, 'Exactly one durable event per failure');
