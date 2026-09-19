@@ -222,6 +222,14 @@ from live execution and MySQL result-equivalence testing.
   persistent-cache configuration, or validate heavy concurrency, failover, or
   production load.
 
+## Experimental native engine
+
+An opt-in [Rust extension prototype](native/README.md) keeps SQL parsing,
+translation, connection management and execution inside Rust. It includes
+synthetic DSQL integration tests and a PHP-FPM comparison harness. It is not
+loaded by the released WordPress drop-in and does not yet provide its full
+compatibility surface.
+
 ## License
 
 Licensed under GPL-2.0-or-later; see [license.md](license.md). Included WordPress
