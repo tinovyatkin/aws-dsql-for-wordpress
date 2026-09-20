@@ -12,7 +12,6 @@ final class AutomaticSchema {
     private SchemaGate $gate;
     private ?PDO $pdo=null;
     private ?\DSQL_Schema_Catalog $catalog=null;
-    private bool $failed=false;
     public function __construct(private Config $config,private \Closure $invalidate,private ?\Closure $faultHandler=null,bool $recover=true) {
         if(!$config->schemaUser||!$config->schemaStateDirectory)throw new \RuntimeException('Automatic schema upgrades need a schema role and state directory');
         $this->gate=SchemaGate::get($config->schemaStateDirectory);
@@ -36,7 +35,7 @@ final class AutomaticSchema {
     }
     public static function isDdl(string $sql): bool {return in_array(self::operation($sql),['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true);}
     public function assertQueryAllowed(string $sql): void {
-        if($this->failed&&!in_array(self::operation($sql),['SELECT','SHOW','DESCRIBE','DESC','ROLLBACK'],true))throw new \RuntimeException('An earlier schema upgrade failed; subsequent writes in this request are stopped');
+        if($this->gate->hasFailed()&&!in_array(self::operation($sql),['SELECT','SHOW','DESCRIBE','DESC','ROLLBACK'],true))throw new \RuntimeException('An earlier schema upgrade failed; subsequent writes in this request are stopped');
     }
     private function fault(string $point,array $op=[]): void {if($this->faultHandler)($this->faultHandler)($point,$op);}
     private function path(string $file): string {return $this->gate->directory.'/'.$file;}
@@ -85,18 +84,21 @@ final class AutomaticSchema {
         $this->allowSchemaTime();
         try {$this->gate->exclusive(function()use($sql,$mode){
             $this->connect();if(is_file($this->path('pending.json')))$this->recover();
-            $id='auto-'.bin2hex(random_bytes(16));$this->reserve($id);
+            $id='auto-'.bin2hex(random_bytes(16));
+            // An interrupted reservation must be recoverable even before planning finishes.
+            $this->write('release.json',['id'=>$id,'endpoint'=>$this->config->host,'schema'=>$this->config->schema]);
             try {
+                $this->reserve($id);$this->fault('reserved');
                 $parsed=(new \WPDSQLUpgrade\Schema($sql,$this->config->schema,$mode))->parse();
                 $this->catalog->clear();$before=$this->catalog->get($parsed['table']);
                 if(!$before&&$this->oid($parsed['table']))throw new \RuntimeException('Existing physical table is not catalogued');
                 $plan=AutomaticPlan::build($sql,$before,$this->config->tablePrefix,$this->config->schema,$this->config->valueCodec,$mode);
                 $plan['id']=$id;$plan['endpoint']=$this->config->host;$plan['schema']=$this->config->schema;$plan['phase']='apply';$plan['position']=0;$plan['sql_fingerprint']=hash('sha256',$sql);
                 $this->prepare($plan);
-                if(!$plan['steps']&&$plan['before']==$plan['after']){$this->release($id);return;}
-                $this->write('pending.json',$plan);$this->fault('planned',$plan);$this->run($plan);
+                if(!$plan['steps']&&$plan['before']==$plan['after']){$this->release($id);unlink($this->path('release.json'));return;}
+                $this->write('pending.json',$plan);unlink($this->path('release.json'));$this->fault('planned',$plan);$this->run($plan);
             } catch(\Throwable $error) {
-                if(!is_file($this->path('pending.json')))$this->release($id);
+                if(!is_file($this->path('pending.json'))){$this->release($id);if(is_file($this->path('release.json')))unlink($this->path('release.json'));}
                 throw $error;
             }
         });} catch(\Throwable $error) {
@@ -105,8 +107,7 @@ final class AutomaticSchema {
         } finally {($this->invalidate)();}
     }
     public function markFailed(string $sql,\Throwable $error): void {
-        if($this->failed)return;
-        $this->failed=true;
+        if(!$this->gate->fail())return;
         if($error instanceof SchemaBusy)return;
         $state=$error instanceof \PDOException?(string)$error->getCode():null;
         $reason=$error instanceof \PDOException?'Database rejected an automatic schema operation':$error->getMessage();
@@ -118,7 +119,11 @@ final class AutomaticSchema {
         if(!is_file($this->path('pending.json'))&&!is_file($this->path('release.json')))return;
         $this->allowSchemaTime();
         $this->connect();
-        if(!is_file($this->path('pending.json'))&&is_file($this->path('release.json'))){$marker=json_decode(file_get_contents($this->path('release.json')),true,512,JSON_THROW_ON_ERROR);$this->release($marker['id']);unlink($this->path('release.json'));return;}
+        if(!is_file($this->path('pending.json'))&&is_file($this->path('release.json'))){
+            $marker=json_decode(file_get_contents($this->path('release.json')),true,512,JSON_THROW_ON_ERROR);
+            if($marker['endpoint']!==$this->config->host||$marker['schema']!==$this->config->schema)throw new \RuntimeException('Schema reservation belongs to another database');
+            $this->release($marker['id']);unlink($this->path('release.json'));return;
+        }
         $op=json_decode(file_get_contents($this->path('pending.json')),true,512,JSON_THROW_ON_ERROR);
         if($op['endpoint']!==$this->config->host||$op['schema']!==$this->config->schema)throw new \RuntimeException('Schema journal belongs to another database');
         if($this->scalar('SELECT run_id FROM '.$this->target('__wp_dsql_upgrade_lock')." WHERE id='schema'")!==$op['id'])throw new \RuntimeException('Schema recovery reservation changed');
@@ -143,7 +148,7 @@ final class AutomaticSchema {
         } catch(\Throwable $error){if($this->pdo->inTransaction())$this->pdo->rollBack();throw $error;}
         $this->fault('catalog-published',$op);
         $this->write('last-operation.json',['id'=>$op['id'],'finished'=>gmdate('c'),'rolled_back'=>$op['phase']==='rollback','fingerprint'=>$op['sql_fingerprint']]);
-        $this->write('release.json',['id'=>$op['id']]);
+        $this->write('release.json',['id'=>$op['id'],'endpoint'=>$this->config->host,'schema'=>$this->config->schema]);
         unlink($this->path('pending.json'));$this->fault('journal-completed',$op);
         $this->release($op['id']);unlink($this->path('release.json'));$this->catalog->clear();
     }
@@ -165,7 +170,7 @@ final class AutomaticSchema {
         }
     }
     private function prepare(array &$op): void {
-        $this->connect();$sources=[];
+        $this->connect();$sources=[];$primary=array_column(Plan::indexes($op['before']??['indexes'=>[]])['PRIMARY']??[],'Column_name');
         foreach($op['before']['columns']??[] as $c)$sources[$c['Field']]=Backup::qi($c['Field']);
         foreach($op['steps'] as &$step) {
             $kind=$step['kind'];
@@ -181,7 +186,7 @@ final class AutomaticSchema {
                 if($c['Default']!==null)$this->scalar('SELECT CAST('.$step['default_sql'].' AS '.$type.')');
                 $step['fill_sql']=$step['default_sql'];
                 if($c['DefaultExpression']??false)$step['fill_sql']=$this->pdo->quote((string)$this->scalar('SELECT ('.$step['default_sql'].')::text'));
-                $step['pk']=array_column(Plan::indexes($op['before'])['PRIMARY']??[],'Column_name');
+                $step['pk']=$primary;
                 $count=(int)$this->scalar('SELECT COUNT(*) FROM '.$this->target($step['table']));
                 if($c['Null']==='NO'&&$c['Default']===null&&$count)throw new \RuntimeException('A new required column needs a default for existing rows');
                 if($c['Default']!==null&&$count&&!$step['pk'])throw new \RuntimeException('Automatic backfill needs a primary key');
@@ -191,6 +196,7 @@ final class AutomaticSchema {
                 if($step['column']['Default']!==null)$this->scalar('SELECT CAST('.$step['default_sql'].' AS '.Plan::type($step['column']).')');
             } elseif($kind==='rename_column') {
                 $sources[$step['new']]=$sources[$step['old']];unset($sources[$step['old']]);
+                $primary=array_map(static fn($key)=>$key===$step['old']?$step['new']:$key,$primary);
             } elseif($kind==='rename') {
                 if($this->oid($step['new'])||$this->catalog->raw($step['new']))throw new \RuntimeException('Table rename destination exists');
             } elseif(in_array($kind,['add_index','drop_index'],true)) {
@@ -223,14 +229,14 @@ final class AutomaticSchema {
         }unset($step);
     }
     private function physicalIndex(string $table,string $key,array $group): array {
-        $s=$this->pdo->prepare("SELECT idx.relname AS name,pg_get_indexdef(i.indexrelid) AS definition,i.indisunique,i.indisprimary,a.attname,k.ordinality FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace ns ON ns.oid=t.relnamespace JOIN pg_class idx ON idx.oid=i.indexrelid CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE ns.nspname=? AND t.relname=? AND i.indisvalid AND i.indexprs IS NULL AND i.indpred IS NULL AND k.ordinality<=i.indnkeyatts ORDER BY idx.relname,k.ordinality");$s->execute([$this->config->schema,$table]);$indexes=[];
+        $s=$this->pdo->prepare("SELECT idx.relname AS name,pg_get_indexdef(i.indexrelid) AS definition,i.indisunique::int AS indisunique,i.indisprimary::int AS indisprimary,a.attname,k.ordinality FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace ns ON ns.oid=t.relnamespace JOIN pg_class idx ON idx.oid=i.indexrelid CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE ns.nspname=? AND t.relname=? AND i.indisvalid AND i.indexprs IS NULL AND i.indpred IS NULL AND k.ordinality<=i.indnkeyatts ORDER BY idx.relname,k.ordinality");$s->execute([$this->config->schema,$table]);$indexes=[];
         foreach($s->fetchAll() as $r){$indexes[$r['name']]??=['name'=>$r['name'],'definition'=>$r['definition'],'unique'=>(bool)$r['indisunique'],'primary'=>(bool)$r['indisprimary'],'columns'=>[]];$indexes[$r['name']]['columns'][]=$r['attname'];}
         $matches=array_values(array_filter($indexes,static fn($i)=>!$i['primary']&&$i['unique']===!((bool)$group[0]['Non_unique'])&&$i['columns']===array_column($group,'Column_name')));
         foreach($matches as $index)if($index['name']===$table.'_'.$key)return $index;
         if(count($matches)!==1)throw new \RuntimeException('Physical index mapping is ambiguous');return $matches[0];
     }
     private function columnInfo(string $table,string $column): array|false {return $this->row('SELECT data_type,character_maximum_length,numeric_precision,numeric_scale,is_nullable,column_default,is_identity FROM information_schema.columns WHERE table_schema=? AND table_name=? AND column_name=?',[$this->config->schema,$table,$column]);}
-    private function checkInfo(string $table,string $name): array|false {return $this->row("SELECT oid::text AS oid,convalidated,pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=to_regclass(?) AND conname=? AND contype='c'",[$this->target($table),$name]);}
+    private function checkInfo(string $table,string $name): array|false {return $this->row("SELECT oid::text AS oid,convalidated::int AS convalidated,pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=to_regclass(?) AND conname=? AND contype='c'",[$this->target($table),$name]);}
     private function ensureCheck(string $table,array $column): void {
         $name=$column['dsql_not_null_constraint'];$check=$this->checkInfo($table,$name);
         if($check) {
@@ -248,7 +254,7 @@ final class AutomaticSchema {
             $job=['job_id'=>$stmt->fetchColumn()];$this->fault('validation-submitted',$op);
         }
         $s=$this->pdo->prepare('CALL sys.wait_for_job(?)');$s->execute([$job['job_id']]);
-        if(!$s->fetchColumn())throw new \RuntimeException('Not-null validation failed');
+        if(!in_array($s->fetchColumn(),[true,1,'1','t','true'],true))throw new \RuntimeException('Not-null validation failed');
         if(!$this->checkInfo($table,$column['dsql_not_null_constraint'])['convalidated'])throw new \PDOException('Constraint validation is not yet visible',0);
     }
     private function setDefault(string $table,array $column,string $sql): void {
@@ -257,11 +263,11 @@ final class AutomaticSchema {
     private function waitIndex(string $name): void {
         $deadline=microtime(true)+90;
         do {
-            $state=$this->row('SELECT i.indisvalid,i.indexrelid::text AS oid FROM pg_index i WHERE i.indexrelid=to_regclass(?)',[$this->target($name)]);
+            $state=$this->row('SELECT i.indisvalid::int AS indisvalid,i.indexrelid::text AS oid FROM pg_index i WHERE i.indexrelid=to_regclass(?)',[$this->target($name)]);
             if(!$state)throw new \RuntimeException('Index disappeared during automatic migration');
             if($state['indisvalid'])return;
             $job=$this->row('SELECT job_id,status FROM sys.jobs WHERE object_id=? ORDER BY start_time DESC LIMIT 1',[$state['oid']]);
-            if($job){$s=$this->pdo->prepare('CALL sys.wait_for_job(?)');$s->execute([$job['job_id']]);if(!$s->fetchColumn())throw new \RuntimeException('Index build failed');}
+            if($job){$s=$this->pdo->prepare('CALL sys.wait_for_job(?)');$s->execute([$job['job_id']]);if(!in_array($s->fetchColumn(),[true,1,'1','t','true'],true))throw new \RuntimeException('Index build failed');}
             else usleep(200000);
         }while(microtime(true)<$deadline);
         throw new \PDOException('Index build remains in progress',0);

@@ -45,7 +45,10 @@ php scripts/configure-automatic-schema.php \
 This explicitly grants schema-owner access to that IAM principal; WordPress does
 not get an admin connection. Reverse it with `--revoke=yes`. An admin auth token
 can instead be piped to `--token-stdin=yes`; never put tokens in arguments/files.
-The target contains endpoint, region, profile and schema, not key material.
+The target contains endpoint, region, profile, schema and `classification`, not
+key material. Set `classification` to `production` for production/staging restore
+clusters tagged `Purpose=wordpress-dsql-production-migration`; synthetic targets
+use `synthetic` and `Purpose=synthetic-wordpress-migration`.
 
 Create a writable private state directory **outside the document root**, shared
 by PHP-FPM and authorized WP-CLI processes. Use a setgid group directory (2770)
@@ -73,6 +76,8 @@ lease, and reserves the database upgrade-lock row. A 20-second lock timeout is
 retryable. WordPress HTTP transports suspend shared leases unless an application
 transaction is active, allowing updater loopbacks to migrate new plugin code.
 The next database operation reacquires the lease with fresh schema caches.
+Schema operations and the updater fatal-error loopback get a 120-second PHP/HTTP
+budget for asynchronous jobs; web-server or FPM limits can still terminate them.
 
 Fsynced journals precede mutation. Column backfills and asynchronous index/check
 validation resume after interruption. Known failures reverse reversible steps
@@ -101,7 +106,7 @@ replaces them with physical NOT NULL on rebuilt tables.
 ## Verification
 
 `tests/automaticSchemaTest.php` covers policy. `tests/automatic/` covers live DSQL
-operations, seven crash windows, rollback, duplicate-index preflight, transaction
+operations, eight crash windows, rollback, duplicate-index preflight, transaction
 ownership, lazy connections, cross-process leases, and WordPress installation and
 background plugin updates with dbDelta and preserved rows. Live tests require the
 separately tagged synthetic fixture, never an arbitrary production endpoint.

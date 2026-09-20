@@ -7,6 +7,9 @@ final class SchemaGate {
     private $handle;
     private bool $exclusive=false;
     private bool $suspended=false;
+    private bool $failed=false;
+    public function hasFailed(): bool {return $this->failed;}
+    public function fail(): bool {$first=!$this->failed;$this->failed=true;return $first;}
     private function __construct(public readonly string $directory) {
         if(!is_dir($directory)||!is_writable($directory))throw new \RuntimeException('Automatic schema state directory is unavailable');
         $new=!file_exists($directory.'/access.lock');
@@ -33,9 +36,14 @@ final class SchemaGate {
         $this->resume();
         if($this->exclusive)return $operation();
         // Release this request's shared lease before waiting for other requests.
-        flock($this->handle,LOCK_UN);
-        try {$this->lock(LOCK_EX);$this->exclusive=true;clearstatcache();return $operation();}
-        finally {$this->exclusive=false;$this->lock(LOCK_SH);}
+        flock($this->handle,LOCK_UN);$this->suspended=true;$failure=null;
+        try {$this->lock(LOCK_EX);$this->exclusive=true;$this->suspended=false;clearstatcache();return $operation();}
+        catch(\Throwable $error){$failure=$error;throw $error;}
+        finally {
+            $this->exclusive=false;$this->suspended=true;
+            try {$this->lock(LOCK_SH);$this->suspended=false;}
+            catch(\Throwable $relock){if(!$failure)throw $relock;}
+        }
     }
     public function __destruct() {if(is_resource($this->handle)){flock($this->handle,LOCK_UN);fclose($this->handle);}}
 }

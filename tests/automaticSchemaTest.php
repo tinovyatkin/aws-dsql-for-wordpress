@@ -39,4 +39,17 @@ final class automaticSchemaTest extends TestCase {
         self::assertFalse(AutomaticSchema::isDdl("SELECT 'ALTER TABLE x'"));
         self::assertFalse(AutomaticSchema::isDdl('/* unterminated'));
     }
+    public function testIdentifiersRejectBeforePhysicalTruncation():void {
+        foreach(['ALTER TABLE wp_auto RENAME COLUMN label TO '.str_repeat('x',64),'RENAME TABLE wp_auto TO wp_'.str_repeat('x',61)] as $sql) {
+            try{$this->plan($sql);self::fail('Expected identifier rejection');}
+            catch(RuntimeException $error){self::assertStringContainsString('identifier',$error->getMessage());}
+        }
+    }
+    public function testRepeatedRestoredCreateComparesIndexStructure():void {
+        $before=$this->table();$sql=\WPDSQL\Schema\Model::mysql($before);
+        foreach($before['indexes'] as &$index){$index['Cardinality']='12345';$index['Non_unique']=(string)$index['Non_unique'];$index['Seq_in_index']=(string)$index['Seq_in_index'];}unset($index);
+        $before['source_indexes']=$before['indexes'];
+        $plan=AutomaticPlan::build($sql,$before,'wp_','public',true);
+        self::assertSame([],$plan['steps']);
+    }
 }

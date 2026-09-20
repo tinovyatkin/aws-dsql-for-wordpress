@@ -16,6 +16,16 @@ final class AutomaticPlan {
         $column['Type']=preg_replace('/^(tinyint|smallint|mediumint|int|integer|bigint)\([0-9]+\)/i','$1',$column['Type']);
         $out=[];foreach(['Field','Type','Null','Default','Extra','Collation','HasDefault','DefaultExpression'] as $key)$out[$key]=$column[$key]??null;return $out;
     }
+    private static function indexSignature(array $rows): array {
+        usort($rows,static fn($a,$b)=>(int)$a['Seq_in_index']<=>(int)$b['Seq_in_index']);
+        return array_map(static fn($r)=>[(string)$r['Column_name'],(int)$r['Seq_in_index'],(int)$r['Non_unique'],isset($r['Sub_part'])?(int)$r['Sub_part']:null,strtoupper($r['Index_type']??'BTREE')],$rows);
+    }
+    private static function indexes(array $table): array {
+        $groups=Plan::indexes($table);ksort($groups);return array_map([self::class,'indexSignature'],$groups);
+    }
+    private static function assertIdentifier(string $name): void {
+        if(!preg_match('/^[A-Za-z_][A-Za-z0-9_]{0,62}$/D',$name))throw new \RuntimeException('Unsupported automatic schema identifier');
+    }
     private static function widening(array $old,array $new): bool {
         if(Plan::type($old)!==Plan::type($new))return false;
         $a=strtolower($old['Type']);$b=strtolower($new['Type']);
@@ -39,8 +49,9 @@ final class AutomaticPlan {
         if($ddl['kind']==='create') {
             if($before && $ddl['if_exists'])return $result;
             $after=Schema::apply($ddl,null,$options);$after['target_schema']=$schema;$after['value_codec']=$codec;
+            foreach($after['columns'] as $column)self::assertIdentifier($column['Field']);
             if($before) {
-                if(array_map([self::class,'signature'],$before['columns'])===array_map([self::class,'signature'],$after['columns']) && Plan::indexes($before)===Plan::indexes($after))return $result;
+                if(array_map([self::class,'signature'],$before['columns'])===array_map([self::class,'signature'],$after['columns']) && self::indexes($before)===self::indexes($after))return $result;
                 throw new \RuntimeException('Existing table differs from the requested CREATE definition');
             }
             $result['after']=$after;$result['steps'][]=['kind'=>'create','table'=>$after];return $result;
@@ -60,8 +71,7 @@ final class AutomaticPlan {
             if($op==='add_index') {
                 $key=$change['indexes'][0]['Key_name'];$old=Plan::indexes($current)[$key]??null;
                 if($old) {
-                    $signature=static fn($rows)=>array_map(static fn($r)=>array_intersect_key($r,array_flip(['Column_name','Seq_in_index','Non_unique','Sub_part','Index_type'])),$rows);
-                    if($signature($old)==$signature($change['indexes']))continue;
+                    if(self::indexSignature($old)===self::indexSignature($change['indexes']))continue;
                     throw new \RuntimeException('Existing index differs from the requested definition');
                 }
             }
@@ -71,7 +81,7 @@ final class AutomaticPlan {
                 $c=self::column($after,$change['column']['Field']);
                 if(array_key_last($after['columns'])!==array_search($c['Field'],array_column($after['columns'],'Field'),true))throw new \RuntimeException('Column repositioning requires a controlled migration');
                 if(str_contains($c['Extra'],'auto_increment'))throw new \RuntimeException('Adding an identity requires a controlled migration');
-                if(!preg_match('/^[A-Za-z_][A-Za-z0-9_]{0,62}$/D',$c['Field']))throw new \RuntimeException('Unsupported automatic column identifier');
+                self::assertIdentifier($c['Field']);
                 if($c['Null']==='NO') {
                     $c['dsql_not_null_constraint']='__wpd_nn_'.substr(hash('sha256',$table.'|'.$c['Field']),0,24);
                     foreach($after['columns'] as &$column)if($column['Field']===$c['Field'])$column=$c;unset($column);
@@ -80,6 +90,7 @@ final class AutomaticPlan {
             } elseif(in_array($op,['change','rename_column','default'],true)) {
                 $oldName=$change['old']??$change['name'];$old=self::column($current,$oldName);
                 $newName=$op==='rename_column'?$change['name']:($change['column']['Field']??$oldName);$new=self::column($after,$newName);
+                self::assertIdentifier($newName);
                 if(!self::widening($old,$new)||$old['Extra']!==$new['Extra']||$old['Collation']!==$new['Collation'])throw new \RuntimeException('Type conversion, narrowing or collation change requires a controlled migration');
                 if(array_search($oldName,array_column($current['columns'],'Field'),true)!==array_search($newName,array_column($after['columns'],'Field'),true))throw new \RuntimeException('Column repositioning requires a controlled migration');
                 if($old['Null']==='YES' && $new['Null']==='NO')throw new \RuntimeException('Tightening an existing nullable column requires a controlled migration');
@@ -96,7 +107,7 @@ final class AutomaticPlan {
                 $key=$change['name'];$group=Plan::indexes($current)[$key]??null;
                 if(!$group||$key==='PRIMARY'||!$group[0]['Non_unique'])throw new \RuntimeException('Removing a uniqueness constraint requires a controlled migration');
                 $steps[]=['kind'=>'drop_index','table'=>$table,'key'=>$key,'definition'=>$current];
-            } elseif($op==='rename')$steps[]=['kind'=>'rename','old'=>$table,'new'=>$after['name']];
+            } elseif($op==='rename'){self::assertIdentifier($after['name']);$steps[]=['kind'=>'rename','old'=>$table,'new'=>$after['name']];}
             // utf8mb4/display-width/TEXT widening can be catalog-only after Schema::apply validates semantics.
             $result['steps']=array_merge($result['steps'],$steps);$current=Model::normalize($after);
         }

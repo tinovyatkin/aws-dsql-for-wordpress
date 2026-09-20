@@ -54,7 +54,7 @@ final class Engine {
         elseif(Plan::ddl($before,$this->pdo)===Plan::ddl($after,$this->pdo))$mode='metadata';
         if($before) {
             $owned=[];foreach($before['columns'] as $column)if(isset($column['dsql_not_null_constraint']))$owned[$column['dsql_not_null_constraint']]=$column['Field'];
-            $s=$this->pdo->prepare("SELECT conname,contype,convalidated,pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=?::oid AND contype NOT IN ('p','u')");$s->execute([$oid]);
+            $s=$this->pdo->prepare("SELECT conname,contype,convalidated::int AS convalidated,pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=?::oid AND contype NOT IN ('p','u')");$s->execute([$oid]);
             foreach($s->fetchAll(\PDO::FETCH_ASSOC) as $constraint) {
                 $field=$owned[$constraint['conname']]??null;
                 if(!$field||$constraint['contype']!=='c'||!$constraint['convalidated']||preg_replace('/[\s"]+/','',$constraint['definition'])!=='CHECK(('.$field.'ISNOTNULL))')throw new \RuntimeException('Tables with unmanaged CHECK/foreign-key constraints require a dedicated migration');
