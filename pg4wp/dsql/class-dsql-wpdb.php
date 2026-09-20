@@ -38,6 +38,9 @@ class DSQL_WPDB extends wpdb {
                 tablePrefix: $GLOBALS['table_prefix'] ?? 'wp_',
                 cacheEnabled: !defined('DSQL_TRANSLATION_CACHE') || DSQL_TRANSLATION_CACHE !== false,
                 cacheDirectory: defined('DSQL_TRANSLATION_CACHE_DIR') ? DSQL_TRANSLATION_CACHE_DIR : null,
+                automaticSchema: !$upgrade && defined('DSQL_AUTOMATIC_SCHEMA') && DSQL_AUTOMATIC_SCHEMA,
+                schemaUser: defined('DSQL_SCHEMA_USER') ? DSQL_SCHEMA_USER : null,
+                schemaStateDirectory: defined('DSQL_SCHEMA_STATE_DIRECTORY') ? DSQL_SCHEMA_STATE_DIRECTORY : null,
             ));
             $this->is_mysql = false;
             $this->ready = true;
@@ -45,6 +48,9 @@ class DSQL_WPDB extends wpdb {
             $this->init_charset();
             return true;
         } catch (Throwable $error) {
+            if($error instanceof \WPDSQL\Schema\SchemaBusy && PHP_SAPI!=='cli') {
+                http_response_code(503);header('Cache-Control: no-store, private');header('Retry-After: 20');exit('A database update is in progress. Please retry shortly.');
+            }
             $this->ready = false;
             $failure = $error instanceof QueryException ? $error->nativeFailure() : $error;
             $this->last_error = $failure->getMessage();
@@ -176,6 +182,7 @@ class DSQL_WPDB extends wpdb {
             if(in_array($operation,['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true)){$this->col_meta=[];$this->table_charset=[];}
         }
     }
+    public function clear_dsql_column_metadata(): void {$this->col_meta=[];$this->table_charset=[];}
     public function enable_schema_upgrade(\WPDSQLUpgrade\Session $session): void { $this->get_driver()->enableSchemaUpgrade($session); }
     public function verify_schema_upgrade(): array { return $this->get_driver()->verifySchemaUpgrade(); }
     public function wait_for_indexes(): void { $this->get_driver()->waitForIndexes(); }

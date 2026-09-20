@@ -1,0 +1,22 @@
+<?php
+/*
+Plugin Name: DSQL Automatic Upgrade Probe
+Version: __VERSION__
+*/
+function dsql_automatic_probe_migrate(): void {
+    if(!in_array(wp_get_environment_type(),['local','staging'],true))throw new RuntimeException('Test plugin is restricted to local or staging');
+    if(get_option('dsql_automatic_probe_version')==='__VERSION__')return;
+    global $wpdb;
+    require_once ABSPATH.'wp-admin/includes/upgrade.php';
+    $table=$wpdb->prefix.'automatic_plugin_probe';
+    dbDelta("CREATE TABLE $table (
+        id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+        label varchar(30) NOT NULL DEFAULT '',
+        __COLUMNS__
+        PRIMARY KEY  (id)__INDEXES__
+    ) DEFAULT CHARSET=utf8mb4;");
+    if($wpdb->dsql_error_count)throw new RuntimeException('Probe migration encountered a SQL error');
+    update_option('dsql_automatic_probe_version','__VERSION__',false);
+}
+register_activation_hook(__FILE__,'dsql_automatic_probe_migrate');
+add_action('plugins_loaded','dsql_automatic_probe_migrate');

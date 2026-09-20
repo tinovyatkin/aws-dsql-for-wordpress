@@ -15,3 +15,7 @@ $wpdb = new DSQL_WPDB($dsqlUpgrade ? $dsqlUpgrade->data['target']['user'] : DB_U
 if ($dsqlUpgrade) {
     $wpdb->enable_schema_upgrade($dsqlUpgrade);
 }
+
+if (!$dsqlUpgrade && defined('DSQL_AUTOMATIC_SCHEMA') && DSQL_AUTOMATIC_SCHEMA && function_exists('add_action')) {
+    \WPDSQL\Schema\AutomaticWordPress::register();
+}
