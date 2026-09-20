@@ -148,6 +148,31 @@ mod php {
                 client.reseed_identity(table, column)
             })
         }
+        /// Invalidate every cached representation after the PHP schema coordinator publishes.
+        pub fn invalidate_schema(&mut self) -> PhpResult<()> {
+            native_call(&mut self.client, |client| {
+                if client.in_transaction() {
+                    return Err("Cannot refresh schema inside a caller-owned transaction".into());
+                }
+                client.invalidate_schema()
+            })
+        }
+        /// Preserve native diagnostic emission for the infrequent coordinated DDL path.
+        pub fn record_schema_error(&mut self, state: Option<String>) -> PhpResult<()> {
+            self.client.set_error_context("schema", "");
+            if let Some(state) = state {
+                if state.len() != 5
+                    || !state
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                {
+                    return Err(error("Invalid schema SQLSTATE".into()));
+                }
+                self.client.error.sqlstate = Some(state);
+                self.client.error.database = true;
+            }
+            Ok(())
+        }
         pub fn query_count(&self) -> i64 {
             self.client.queries as i64
         }

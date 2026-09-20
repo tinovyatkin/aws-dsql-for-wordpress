@@ -40,6 +40,7 @@ class Driver {
 
     /** The optional factory/clock support injected transports and deterministic lifecycle tests. */
     public function __construct(private readonly Config $config, ?\Closure $connector = null, ?\Closure $clock = null) {
+        if($config->automaticSchema && get_class($this)!==NativeDriver::class)throw new \InvalidArgumentException('Automatic schema mode requires the native query engine');
         $this->connector = $connector ?? static fn() => AwsConnection::connect($config);
         $this->clock = $clock ?? static fn() => microtime(true);
         $this->schema = $config->schema;

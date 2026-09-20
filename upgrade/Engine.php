@@ -53,9 +53,14 @@ final class Engine {
         elseif($after['name']!==$before['name']&&count($ddl['changes'])===1&&$ddl['changes'][0]['op']==='rename')$mode='rename';
         elseif(Plan::ddl($before,$this->pdo)===Plan::ddl($after,$this->pdo))$mode='metadata';
         if($before) {
-            $s=$this->pdo->prepare("SELECT COUNT(*) FROM pg_constraint WHERE conrelid=?::oid AND contype NOT IN ('p','u')");$s->execute([$oid]);
-            if((int)$s->fetchColumn())throw new \RuntimeException('Tables with CHECK/foreign-key constraints require a dedicated migration');
+            $owned=[];foreach($before['columns'] as $column)if(isset($column['dsql_not_null_constraint']))$owned[$column['dsql_not_null_constraint']]=$column['Field'];
+            $s=$this->pdo->prepare("SELECT conname,contype,convalidated,pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=?::oid AND contype NOT IN ('p','u')");$s->execute([$oid]);
+            foreach($s->fetchAll(\PDO::FETCH_ASSOC) as $constraint) {
+                $field=$owned[$constraint['conname']]??null;
+                if(!$field||$constraint['contype']!=='c'||!$constraint['convalidated']||preg_replace('/[\s"]+/','',$constraint['definition'])!=='CHECK(('.$field.'ISNOTNULL))')throw new \RuntimeException('Tables with unmanaged CHECK/foreign-key constraints require a dedicated migration');
+            }
         }
+        if($after && in_array($mode,['create','rebuild'],true)){foreach($after['columns'] as &$column)unset($column['dsql_not_null_constraint']);unset($column);}
         $id=bin2hex(random_bytes(8));
         $op=['id'=>$id,'mode'=>$mode,'sql'=>$sql,'before'=>$before,'after'=>$after,'original'=>$ddl['table'],'source_oid'=>$oid,
              'source_fingerprint'=>$before?$this->catalog->fingerprint($ddl['table'],'wp_live'):null,

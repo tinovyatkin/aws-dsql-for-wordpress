@@ -16,6 +16,9 @@ final class Config {
         public readonly string $tablePrefix = 'wp_',
         public readonly bool $cacheEnabled = true,
         public readonly ?string $cacheDirectory = null,
+        public readonly bool $automaticSchema = false,
+        public readonly ?string $schemaUser = null,
+        public readonly ?string $schemaStateDirectory = null,
     ) {
         if (!in_array($schema, ['public', 'wp_live'], true)) {
             throw new \InvalidArgumentException('Unsupported application schema');

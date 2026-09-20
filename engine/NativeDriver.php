@@ -4,6 +4,8 @@ namespace WPDSQL\Engine;
 /** wpdb/PHP result adaptation only. SQL handling and transport remain native. */
 final class NativeDriver extends Driver {
     private \DsqlNativeEngine $native;
+    private ?\WPDSQL\Schema\AutomaticSchema $automatic=null;
+    private int $automaticQueries=0;
     public function __construct(private readonly Config $nativeConfig) {
         if (!class_exists('DsqlNativeEngine', false)) {
             throw new \RuntimeException('The selected native DSQL engine requires its matching PHP extension');
@@ -18,6 +20,10 @@ final class NativeDriver extends Driver {
             $nativeConfig->user, $nativeConfig->schema, $nativeConfig->tablePrefix,
             'native-engine-v1', $file, $nativeConfig->valueCodec, $nativeConfig->sqlMode, $nativeConfig->cacheEnabled,
         );
+        if($nativeConfig->automaticSchema) {
+            if(!method_exists($this->native,'invalidateSchema'))throw new \RuntimeException('Automatic schema upgrades require the matching native extension');
+            $this->automatic=new \WPDSQL\Schema\AutomaticSchema($nativeConfig,fn()=>$this->native->invalidateSchema());
+        }
     }
     private function call(callable $operation): mixed {
         try { return $operation(); }
@@ -31,6 +37,25 @@ final class NativeDriver extends Driver {
         }
     }
     public function query(string $query,bool $deferIndexWait=false): Result {
+        if($this->automatic) {
+            try {
+                $this->automatic->assertQueryAllowed($query);
+                if(\WPDSQL\Schema\AutomaticSchema::isDdl($query)) {
+                    $this->automaticQueries++;
+                    if($this->inTransaction())throw new \RuntimeException('Schema changes inside a caller-owned transaction require a controlled migration');
+                    $this->automatic->execute($query,$this->sqlMode());
+                    return new Result([],[],0,\WPDSQL\Schema\AutomaticSchema::operation($query),true,0,$query,$this->sqlMode());
+                }
+            } catch(\Throwable $error) {
+                $this->automatic->markFailed($query,$error);
+                $state=$error instanceof \PDOException?(string)$error->getCode():null;
+                if(!is_string($state)||!preg_match('/^[A-Z0-9]{5}$/D',$state))$state=null;
+                $this->native->recordSchemaError($state);
+                $reason=$error instanceof \PDOException?'Automatic DSQL schema operation failed'.($state?' ('.$state.')':''):$error->getMessage();
+                $failure=$state?new NativeDatabaseException($reason,$state):new \RuntimeException($reason);
+                throw new QueryException($failure,'schema',\WPDSQL\Schema\AutomaticSchema::operation($query),0);
+            }
+        }
         $out=$this->call(fn()=>$this->native->query($query));
         return new Result($out['rows'],$out['metadata'],(int)$out['affected_rows'],
             $out['operation'],(bool)$out['command'],(int)$out['insert_id'],$query,$this->sqlMode());
@@ -39,7 +64,7 @@ final class NativeDriver extends Driver {
     public function close(): void {$this->native->close();}
     public function isConnected(): bool {return $this->native->isConnected();}
     public function inTransaction(): bool {return $this->native->inTransaction();}
-    public function queryCount(): int {return $this->native->queryCount();}
+    public function queryCount(): int {return $this->native->queryCount()+$this->automaticQueries;}
     public function sqlMode(): string {return $this->native->sqlMode();}
     public function cacheStats(): array {return $this->native->cacheStats()+['disk_hits'=>0,'writes'=>0,'errors'=>0,'prepared_hits'=>0,'persistent_cache'=>$this->nativeConfig->cacheEnabled,'native_cache'=>true];}
     public function rememberPrepared(string $sql): void {$this->native->rememberPrepared($sql);}
