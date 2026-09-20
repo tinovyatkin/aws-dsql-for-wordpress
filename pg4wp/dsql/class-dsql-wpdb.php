@@ -182,6 +182,7 @@ class DSQL_WPDB extends wpdb {
             if(in_array($operation,['CREATE','ALTER','DROP','RENAME','TRUNCATE'],true)){$this->col_meta=[];$this->table_charset=[];}
         }
     }
+    public function clear_dsql_column_metadata(): void {$this->col_meta=[];$this->table_charset=[];}
     public function enable_schema_upgrade(\WPDSQLUpgrade\Session $session): void { $this->get_driver()->enableSchemaUpgrade($session); }
     public function verify_schema_upgrade(): array { return $this->get_driver()->verifySchemaUpgrade(); }
     public function wait_for_indexes(): void { $this->get_driver()->waitForIndexes(); }

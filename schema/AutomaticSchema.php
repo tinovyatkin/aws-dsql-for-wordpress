@@ -19,6 +19,10 @@ final class AutomaticSchema {
         if(defined('ABSPATH')&&str_starts_with($this->gate->directory.'/',rtrim(realpath(ABSPATH)?:ABSPATH,'/').'/'))throw new \RuntimeException('Schema journals must be outside the WordPress document root');
         if($recover && (is_file($this->path('pending.json'))||is_file($this->path('release.json'))))$this->gate->exclusive(fn()=>$this->recover());
     }
+    public function ensureAccess(): void {
+        $this->gate->resume();
+        if(is_file($this->path('pending.json'))||is_file($this->path('release.json')))$this->gate->exclusive(fn()=>$this->recover());
+    }
     public static function operation(string $sql): string {
         // Routing only; schema statements are subsequently parsed in full.
         $offset=0;$length=strlen($sql);
@@ -43,8 +47,10 @@ final class AutomaticSchema {
     }
     private function connect(): PDO {
         if($this->pdo)return $this->pdo;
-        $c=$this->config;
-        $this->pdo=AwsConnection::connect(new Config(host:$c->host,user:$c->schemaUser,database:$c->database,region:$c->region,profile:$c->profile,credentialsFile:$c->credentialsFile,schema:$c->schema,valueCodec:$c->valueCodec,tablePrefix:$c->tablePrefix));
+        $c=$this->config;$region=$c->region;
+        if(!$region&&preg_match('/\.dsql\.([a-z0-9-]+)\.on\.aws$/D',$c->host,$match))$region=$match[1];
+        $file=$c->credentialsFile?:(getenv('AWS_SHARED_CREDENTIALS_FILE')?:null);
+        $this->pdo=AwsConnection::connect(new Config(host:$c->host,user:$c->schemaUser,database:$c->database,region:$region,profile:$c->profile,credentialsFile:$file,schema:$c->schema,valueCodec:$c->valueCodec,tablePrefix:$c->tablePrefix));
         $this->pdo->exec('SET search_path TO '.Backup::qi($c->schema).', pg_catalog');
         if($this->pdo->query('SELECT current_user')->fetchColumn()!==$c->schemaUser)throw new \RuntimeException('Unexpected schema connection role');
         require_once dirname(__DIR__).'/pg4wp/dsql/class-dsql-schema-catalog.php';
@@ -69,8 +75,14 @@ final class AutomaticSchema {
         catch(\PDOException $e){if(in_array((string)$e->getCode(),['23505','40001'],true))throw new SchemaBusy('Another database schema controller is active');throw $e;}
     }
     private function release(string $id): void {$this->exec('DELETE FROM '.$this->target('__wp_dsql_upgrade_lock')." WHERE id='schema' AND run_id=?",[$id]);}
+    private function allowSchemaTime(): void {
+        // Async DSQL jobs can outlast PHP's ordinary 30-second page budget.
+        $limit=(int)ini_get('max_execution_time');
+        if($limit>0&&$limit<120&&is_callable('set_time_limit'))set_time_limit(120);
+    }
     public function execute(string $sql,string $mode): void {
         $this->assertQueryAllowed($sql);
+        $this->allowSchemaTime();
         try {$this->gate->exclusive(function()use($sql,$mode){
             $this->connect();if(is_file($this->path('pending.json')))$this->recover();
             $id='auto-'.bin2hex(random_bytes(16));$this->reserve($id);
@@ -101,6 +113,10 @@ final class AutomaticSchema {
         $this->write('last-error.json',['timestamp'=>gmdate('c'),'fingerprint'=>hash('sha256',$sql),'reason'=>$reason,'sqlstate'=>$state]);
     }
     public function recover(): void {
+        // Another waiting request may already have completed recovery.
+        clearstatcache();
+        if(!is_file($this->path('pending.json'))&&!is_file($this->path('release.json')))return;
+        $this->allowSchemaTime();
         $this->connect();
         if(!is_file($this->path('pending.json'))&&is_file($this->path('release.json'))){$marker=json_decode(file_get_contents($this->path('release.json')),true,512,JSON_THROW_ON_ERROR);$this->release($marker['id']);unlink($this->path('release.json'));return;}
         $op=json_decode(file_get_contents($this->path('pending.json')),true,512,JSON_THROW_ON_ERROR);

@@ -108,7 +108,10 @@ as PostgreSQL BYTEA escapes. SQL input retains the existing UTF-8 requirement.
 
 The native engine implements ordinary installation CREATE/DROP, index-job waits,
 identity handling, logical schema metadata, SHOW and supported INFORMATION_SCHEMA
-queries. Restored tables retain the managed-schema guard.
+queries. Restored tables retain the managed-schema guard unless the operator
+enables [automatic schema handling](../docs/automatic-schema.md). That opt-in
+routes supported DDL through the recoverable PHP coordinator, using a separate
+schema-owner connection. Ordinary SQL, connections and error logging stay native.
 
 Explicit controlled-upgrade sessions use the existing PHP maintenance engine,
 which owns recovery journals, rebuilds and rollback verification. This deliberate

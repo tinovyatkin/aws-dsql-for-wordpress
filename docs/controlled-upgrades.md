@@ -1,7 +1,9 @@
 # Controlled WordPress schema upgrades
 
 The upgrade runner permits explicit, version-pinned WP-CLI updates while ordinary
-WordPress requests remain blocked. Production automatic updates should remain off.
+WordPress requests remain blocked. For supported routine changes, [automatic schema handling](automatic-schema.md)
+allows ordinary updates; this runner remains necessary for physical rebuilds
+and other operations outside that policy.
 This milestone supports a conventional single-site WordPress installation, its
 core `dbDelta()` migrations and the tested active-plugin migration paths. It is
 not a universal MySQL DDL implementation or an automatic rollback of arbitrary PHP.

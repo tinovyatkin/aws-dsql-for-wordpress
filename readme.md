@@ -2,7 +2,7 @@
 
 A WordPress database adapter for **Amazon Aurora DSQL**, with a standalone
 MySQL compatibility engine, cached SQL translation, migration tooling, and
-controlled schema upgrades.
+automatic common schema changes and controlled upgrades.
 
 WordPress uses its official `wp-content/db.php` extension point. The DSQL driver
 extends the installed core `wpdb` class. The optional native Rust engine uses
@@ -180,12 +180,23 @@ columns, and application access can use a non-admin database role.
 See [the migration workflow and rollback boundary](docs/backup-restore-migration.md).
 The CLI never changes the live WordPress connection.
 
-## Controlled schema upgrades
+## Schema upgrades
+
+Version 0.12 offers opt-in automatic schema handling with the native engine.
+Ordinary WordPress plugin installation, activation, background updates and
+`dbDelta()` can create tables, add columns/defaults and indexes, rename objects,
+and perform supported metadata widening. Durable journals resume interrupted
+changes. Unsupported operations fail individually; there is no requirement to
+blanket-disable WordPress file modifications or updates after setup. See
+[automatic schema upgrades](docs/automatic-schema.md) for the exact policy, role
+configuration and recovery commands.
+
+### Controlled migrations
 
 The CLI-only upgrade runner supports schema planning, verified table
 rebuilds, synchronized MySQL metadata, retained originals, separate upgrade
-credentials, and recovery from interrupted DDL. Core/plugin versions must be
-pinned, and all writers must be paused before an upgrade. See
+credentials, and recovery from interrupted DDL. For operations requiring this
+runner, pin the target release and pause all writers for the migration. See
 [controlled upgrades](docs/controlled-upgrades.md) for setup, commands, tested
 scope, and remaining limitations.
 
@@ -208,13 +219,11 @@ from live execution and MySQL result-equivalence testing.
 
 ## Known limits
 
-- **Unattended schema upgrades are not supported.** Migrated tables use a verified
-  MySQL metadata catalog, so unchanged schemas compare correctly. Schema changes
-  on those tables require the controlled CLI runner; ordinary requests cannot
-  perform them. Keep automatic core/plugin updates disabled.
-  New installations retain logical MySQL metadata. Older tables without a saved
-  catalog use explicitly inferred PostgreSQL metadata until a verified source
-  definition is provided.
+- Automatic schema changes require explicit native-engine configuration and a
+  catalogued schema. Destructive drops, physical type conversions, primary-key
+  replacement, and unsupported SQL still need a controlled migration. An error
+  blocks further writes in that request, including schema-version bookkeeping;
+  it does not guarantee rollback of arbitrary plugin PHP or earlier statements.
 - The DSQL emitter supports a tested subset of the MySQL grammar and fails on
   unimplemented constructs. Arbitrary plugin SQL, multisite, MySQL collations,
   unsigned integer semantics, and unusual schema changes need separate work

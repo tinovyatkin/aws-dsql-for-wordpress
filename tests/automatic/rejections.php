@@ -15,7 +15,7 @@ try {
  if($d->query("SELECT label FROM $t WHERE id=1")->fetchColumn()!=='duplicate'||is_file($dir.'/pending.json'))throw new RuntimeException('Failed migration changed data or left a journal');
  echo "PASS duplicate-index preflight and sticky version-write guard\n";
  $d->close();$d=new WPDSQL\Engine\NativeDriver($config);
- $d->query('BEGIN');expect_rejection(fn()=>$d->query("ALTER TABLE $t ADD tx_field int"),'caller-owned transaction');
+ $d->query('BEGIN');if(WPDSQL\Engine\NativeDriver::suspendSchemaForHttp())throw new RuntimeException('Transaction lease was suspended');expect_rejection(fn()=>$d->query("ALTER TABLE $t ADD tx_field int"),'caller-owned transaction');
  expect_rejection(fn()=>$d->query('COMMIT'),'earlier schema');$d->query('ROLLBACK');
  if($d->inTransaction()||$d->query("SHOW COLUMNS FROM $t LIKE 'tx_field'")->fetchAll())throw new RuntimeException('Transaction ownership changed');
  echo "PASS caller-owned transaction rejects schema mutation and requires rollback\n";

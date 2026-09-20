@@ -6,6 +6,7 @@ final class NativeDriver extends Driver {
     private \DsqlNativeEngine $native;
     private ?\WPDSQL\Schema\AutomaticSchema $automatic=null;
     private int $automaticQueries=0;
+    private static ?\WeakMap $schemaClients=null;
     public function __construct(private readonly Config $nativeConfig) {
         if (!class_exists('DsqlNativeEngine', false)) {
             throw new \RuntimeException('The selected native DSQL engine requires its matching PHP extension');
@@ -23,10 +24,18 @@ final class NativeDriver extends Driver {
         if($nativeConfig->automaticSchema) {
             if(!method_exists($this->native,'invalidateSchema'))throw new \RuntimeException('Automatic schema upgrades require the matching native extension');
             $this->automatic=new \WPDSQL\Schema\AutomaticSchema($nativeConfig,fn()=>$this->native->invalidateSchema());
+            self::$schemaClients??=new \WeakMap();self::$schemaClients[$this]=true;
         }
     }
+    /** WordPress's updater must let its loopback request migrate the new plugin. */
+    public static function suspendSchemaForHttp(): bool {
+        if(!self::$schemaClients||!\WPDSQL\Schema\SchemaGate::canSuspend())return false;
+        foreach(self::$schemaClients as $client=>$unused)if($client->inTransaction())return false;
+        foreach(self::$schemaClients as $client=>$unused)$client->native->invalidateSchema();
+        \WPDSQL\Schema\SchemaGate::suspendForHttp();return true;
+    }
     private function call(callable $operation): mixed {
-        try { return $operation(); }
+        try { $this->automatic?->ensureAccess();return $operation(); }
         catch (\Throwable $error) {
             $info=$this->native->errorInfo();
             $state=$info['sqlstate']??null;
@@ -39,6 +48,7 @@ final class NativeDriver extends Driver {
     public function query(string $query,bool $deferIndexWait=false): Result {
         if($this->automatic) {
             try {
+                $this->automatic->ensureAccess();
                 $this->automatic->assertQueryAllowed($query);
                 if(\WPDSQL\Schema\AutomaticSchema::isDdl($query)) {
                     $this->automaticQueries++;
@@ -61,7 +71,7 @@ final class NativeDriver extends Driver {
             $out['operation'],(bool)$out['command'],(int)$out['insert_id'],$query,$this->sqlMode());
     }
     public function checkConnection(): void {$this->call(fn()=>$this->native->checkConnection());}
-    public function close(): void {$this->native->close();}
+    public function close(): void {$this->native->close();if(self::$schemaClients)unset(self::$schemaClients[$this]);}
     public function isConnected(): bool {return $this->native->isConnected();}
     public function inTransaction(): bool {return $this->native->inTransaction();}
     public function queryCount(): int {return $this->native->queryCount()+$this->automaticQueries;}
@@ -87,7 +97,7 @@ final class NativeDriver extends Driver {
         return $this->native->logError($query,\DSQL_Diagnostics::context(),\DSQL_Diagnostics::source(),$stage,max(0,microtime(true)-$started)*1000);
     }
     public function waitForIndexes(): void {}
-    public function reseedIdentity(string $table,string $column): void {$this->call(fn()=>$this->native->reseedIdentity($table,$column));}
+    public function reseedIdentity(string $table,string $column): void {$this->automatic?->assertQueryAllowed('UPDATE');$this->call(fn()=>$this->native->reseedIdentity($table,$column));}
     public function enableSchemaUpgrade(\WPDSQLUpgrade\Session $session): void {
         throw new \RuntimeException('Controlled schema upgrades must start through the guarded maintenance runner');
     }
