@@ -49,6 +49,8 @@ pub(crate) struct Backend {
     generation: Mutex<Option<String>>,
     schema: Mutex<Schema>,
     leases: std::sync::atomic::AtomicUsize,
+    opened: Arc<std::sync::atomic::AtomicU64>,
+    health_checks: Arc<std::sync::atomic::AtomicU64>,
 }
 static RUNTIME: OnceLock<Mutex<Option<Arc<Runtime>>>> = OnceLock::new();
 static BACKENDS: OnceLock<Mutex<HashMap<Config, Arc<Backend>>>> = OnceLock::new();
@@ -150,14 +152,20 @@ fn backend(config: &Config) -> Result<(Arc<Backend>, bool)> {
     }
     let options = builder.build().map_err(|_| "Invalid DSQL options")?;
     let schema = config.schema.clone();
+    let opened = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let health_checks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let on_open = opened.clone();
+    let on_health = health_checks.clone();
     let opts = PgPoolOptions::new()
         .max_connections(2)
         .test_before_acquire(false)
         .min_connections(0)
-        .before_acquire(|connection, metadata| {
+        .before_acquire(move |connection, metadata| {
+            let on_health = on_health.clone();
             Box::pin(async move {
                 if metadata.idle_for > Duration::from_secs(5) {
                     use sqlx::Connection;
+                    on_health.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     connection.ping().await?;
                 }
                 Ok(true)
@@ -167,11 +175,13 @@ fn backend(config: &Config) -> Result<(Arc<Backend>, bool)> {
         .idle_timeout(Duration::from_secs(900))
         .max_lifetime(Duration::from_secs(3300))
         .after_connect(move |conn, _| {
+            let on_open = on_open.clone();
             let sql = format!("SET search_path TO {}, pg_catalog", compiler::qi(&schema));
             Box::pin(async move {
                 sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                     .execute(conn)
                     .await?;
+                on_open.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             })
         });
@@ -191,6 +201,8 @@ fn backend(config: &Config) -> Result<(Arc<Backend>, bool)> {
         generation: Mutex::new(None),
         schema: Mutex::new(Schema::new()),
         leases: std::sync::atomic::AtomicUsize::new(0),
+        opened,
+        health_checks,
     });
     all.insert(config.clone(), b.clone());
     Ok((b, false))
@@ -253,6 +265,8 @@ pub struct Client {
     connection_check_ms: f64,
     connection_acquire_ms: f64,
     connection_acquisitions: u64,
+    connections_opened: u64,
+    connection_health_checks: u64,
 }
 impl Client {
     pub fn new(config: Config) -> Result<Self> {
@@ -281,6 +295,8 @@ impl Client {
             connection_check_ms: 0.,
             connection_acquire_ms: 0.,
             connection_acquisitions: 0,
+            connections_opened: 0,
+            connection_health_checks: 0,
         })
     }
     pub fn remember_prepared(&mut self, sql: &[u8]) {
@@ -360,6 +376,8 @@ impl Client {
             ("check_ms".into(), self.connection_check_ms),
             ("acquire_ms".into(), self.connection_acquire_ms),
             ("acquisitions".into(), self.connection_acquisitions as f64),
+            ("opened".into(), self.connections_opened as f64),
+            ("health_checks".into(), self.connection_health_checks as f64),
         ])
     }
     pub fn check_connection(&mut self) -> Result<bool> {
@@ -380,6 +398,9 @@ impl Client {
         let mut reused = true;
         if self.backend.is_none() {
             let (b, r) = backend(&self.config)?;
+            if !r {
+                self.connections_opened += b.opened.load(std::sync::atomic::Ordering::Relaxed);
+            }
             self.backend = Some(b);
             reused = r;
         }
@@ -391,8 +412,19 @@ impl Client {
             self.metadata.clear();
         }
         if self.connection.is_none() {
+            let b = self.backend.as_ref().unwrap();
+            let opened = b.opened.load(std::sync::atomic::Ordering::Relaxed);
+            let checks = b.health_checks.load(std::sync::atomic::Ordering::Relaxed);
             let start = Instant::now();
-            let acquired = rt.block_on(self.backend.as_ref().unwrap().pool.acquire());
+            let acquired = rt.block_on(b.pool.acquire());
+            self.connections_opened += b
+                .opened
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(opened);
+            self.connection_health_checks += b
+                .health_checks
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(checks);
             self.connection_acquire_ms += start.elapsed().as_secs_f64() * 1000.;
             self.connection_acquisitions += 1;
             self.connection = Some(acquired.map_err(db_error)?);

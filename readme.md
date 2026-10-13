@@ -262,6 +262,6 @@ catalog query and reused through the generation-scoped worker cache. Catalog
 generation checks and automatic-upgrade invalidation remain enabled.
 
 `NativeDriver::connectionStats()` returns request-cumulative `check_ms`,
-`acquire_ms`, and `acquisitions`, including wpdb's connection check before its
+`acquire_ms`, `acquisitions`, `opened`, and `health_checks`, including wpdb's connection check before its
 query timer. Acquisition time is a subset of check time; do not add them. No SQL
 text, parameters or connection credentials are included.
