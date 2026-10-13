@@ -12,6 +12,9 @@ final class NativeDriver extends Driver {
             throw new \RuntimeException('The selected native DSQL engine requires its matching PHP extension');
         }
         if (\DsqlNativeEngine::apiVersion() !== 1) throw new \RuntimeException('Native DSQL engine API mismatch');
+        if (!method_exists(\DsqlNativeEngine::class, 'connectionStats')) {
+            throw new \RuntimeException('Native DSQL connection telemetry requires the matching 0.13 engine');
+        }
         parent::__construct($nativeConfig);
         $region=$nativeConfig->region;
         if (!$region && preg_match('/\.dsql\.([a-z0-9-]+)\.on\.aws$/D',$nativeConfig->host,$m)) $region=$m[1];
