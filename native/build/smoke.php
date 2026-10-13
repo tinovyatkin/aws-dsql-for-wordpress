@@ -4,4 +4,5 @@ if (!class_exists('DsqlNativeEngine', false) || DsqlNativeEngine::apiVersion() !
 $db=new DsqlNativeEngine('test.dsql.eu-central-1.on.aws','eu-central-1','default','admin','public','wp_','abi-smoke');
 $event=$db->logError("SELECT 'redaction-probe'",'cli','unclassified','reported',0);
 if($event['event']!=='wordpress_dsql_error'||strlen($event['fingerprint'])!==64||$db->isConnected())exit(1);
+if($db->connectionStats()!==['check_ms'=>0.0,'acquire_ms'=>0.0,'acquisitions'=>0.0])exit(2);
 $db->close();

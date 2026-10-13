@@ -123,6 +123,9 @@ mod php {
             self.client.set_error_context("connect", "");
             native_call(&mut self.client, |client| client.check_connection()).map(|_| true)
         }
+        pub fn connection_stats(&self) -> PhpResult<HashMap<String, f64>> {
+            Ok(self.client.connection_stats())
+        }
         pub fn is_connected(&self) -> bool {
             self.client.connected()
         }

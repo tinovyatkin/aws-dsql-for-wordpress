@@ -72,6 +72,8 @@ final class NativeDriver extends Driver {
     }
     public function checkConnection(): void {$this->call(fn()=>$this->native->checkConnection());}
     public function close(): void {$this->native->close();if(self::$schemaClients)unset(self::$schemaClients[$this]);}
+    /** Request totals include connection acquisition before wpdb starts its query timer. */
+    public function connectionStats(): array {return $this->native->connectionStats();}
     public function isConnected(): bool {return $this->native->isConnected();}
     public function inTransaction(): bool {return $this->native->inTransaction();}
     public function queryCount(): int {return $this->native->queryCount()+$this->automaticQueries;}

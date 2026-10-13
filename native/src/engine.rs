@@ -164,7 +164,7 @@ fn backend(config: &Config) -> Result<(Arc<Backend>, bool)> {
             })
         })
         .acquire_timeout(Duration::from_secs(15))
-        .idle_timeout(Duration::from_secs(60))
+        .idle_timeout(Duration::from_secs(900))
         .max_lifetime(Duration::from_secs(3300))
         .after_connect(move |conn, _| {
             let sql = format!("SET search_path TO {}, pg_catalog", compiler::qi(&schema));
@@ -250,6 +250,9 @@ pub struct Client {
     pub misses: u64,
     pub prepared_hits: u64,
     prepared: std::collections::BTreeSet<[u8; 32]>,
+    connection_check_ms: f64,
+    connection_acquire_ms: f64,
+    connection_acquisitions: u64,
 }
 impl Client {
     pub fn new(config: Config) -> Result<Self> {
@@ -275,6 +278,9 @@ impl Client {
             misses: 0,
             prepared_hits: 0,
             prepared: Default::default(),
+            connection_check_ms: 0.,
+            connection_acquire_ms: 0.,
+            connection_acquisitions: 0,
         })
     }
     pub fn remember_prepared(&mut self, sql: &[u8]) {
@@ -348,7 +354,21 @@ impl Client {
         String::from_utf8(self.escape_bytes(value.as_bytes())?)
             .map_err(|_| "Escaping produced invalid UTF-8".into())
     }
+    /// Cumulative, value-free telemetry includes wpdb's pre-query connection check.
+    pub fn connection_stats(&self) -> HashMap<String, f64> {
+        HashMap::from([
+            ("check_ms".into(), self.connection_check_ms),
+            ("acquire_ms".into(), self.connection_acquire_ms),
+            ("acquisitions".into(), self.connection_acquisitions as f64),
+        ])
+    }
     pub fn check_connection(&mut self) -> Result<bool> {
+        let start = Instant::now();
+        let result = self.check_connection_inner();
+        self.connection_check_ms += start.elapsed().as_secs_f64() * 1000.;
+        result
+    }
+    fn check_connection_inner(&mut self) -> Result<bool> {
         if self.closed {
             return Err("DSQL client is closed".into());
         }
@@ -371,10 +391,11 @@ impl Client {
             self.metadata.clear();
         }
         if self.connection.is_none() {
-            self.connection = Some(
-                rt.block_on(self.backend.as_ref().unwrap().pool.acquire())
-                    .map_err(db_error)?,
-            );
+            let start = Instant::now();
+            let acquired = rt.block_on(self.backend.as_ref().unwrap().pool.acquire());
+            self.connection_acquire_ms += start.elapsed().as_secs_f64() * 1000.;
+            self.connection_acquisitions += 1;
+            self.connection = Some(acquired.map_err(db_error)?);
             self.backend
                 .as_ref()
                 .unwrap()
@@ -624,32 +645,39 @@ impl Client {
             self.misses += 1;
             self.error.stage = "metadata".into();
             let timer = Instant::now();
-            for table in compiler::tables(stmt)? {
-                if !self.metadata.contains_key(&table)
-                    && let Some(cached) = b
-                        .schema
-                        .lock()
-                        .map_err(|_| "Schema cache lock failed")?
-                        .get(&table)
-                        .cloned()
-                {
-                    self.metadata.insert(table.clone(), cached);
+            let tables = compiler::tables(stmt)?;
+            let mut missing = Vec::new();
+            {
+                let shared = b.schema.lock().map_err(|_| "Schema cache lock failed")?;
+                for table in tables {
+                    if self.metadata.contains_key(&table) {
+                        continue;
+                    }
+                    if let Some(cached) = shared.get(&table) {
+                        self.metadata.insert(table, cached.clone());
+                    } else {
+                        missing.push(table);
+                    }
                 }
-                if !self.metadata.contains_key(&table) {
-                    let result = rt.block_on(load_table(
-                        &mut *self.connection.as_mut().unwrap(),
-                        &self.config.schema,
-                        &table,
-                    ));
-                    let table_meta = self
-                        .metadata_result(result)?
-                        .ok_or("DSQL operation failed (42P01); table is missing")?;
-                    b.schema
-                        .lock()
-                        .map_err(|_| "Schema cache lock failed")?
-                        .insert(table.clone(), table_meta.clone());
-                    self.metadata.insert(table, table_meta);
+            }
+            if !missing.is_empty() {
+                let result = rt.block_on(load_tables(
+                    &mut *self.connection.as_mut().unwrap(),
+                    &self.config.schema,
+                    &missing,
+                ));
+                let loaded = self.metadata_result(result)?;
+                // Do not publish a partial schema if one requested relation is absent.
+                if missing.iter().any(|table| !loaded.contains_key(table)) {
+                    return Err("DSQL operation failed (42P01); table is missing".into());
                 }
+                b.schema
+                    .lock()
+                    .map_err(|_| "Schema cache lock failed")?
+                    .extend(loaded.clone());
+                self.metadata.extend(loaded);
+                stats.insert("metadata_tables_loaded".into(), missing.len() as f64);
+                stats.insert("metadata_round_trips".into(), 1.);
             }
             stats.insert("metadata_ms".into(), timer.elapsed().as_secs_f64() * 1000.);
             self.error.stage = "translate".into();
@@ -1176,48 +1204,69 @@ pub fn reset_worker() -> Result<()> {
     Ok(())
 }
 
-async fn load_table(
+/// One catalog round trip for all missing relations, including columns and keys.
+/// Only physical metadata enters the existing generation-scoped worker cache.
+async fn load_tables(
     c: &mut sqlx::PgConnection,
     schema: &str,
-    table: &str,
-) -> std::result::Result<Option<compiler::Table>, sqlx::Error> {
-    let relation = format!("{}.{}", compiler::qi(schema), compiler::qi(table));
-    let rows=sqlx::query("SELECT attname,attnum,attrelid::text AS relation_id,atttypid::regtype::text AS ty,attidentity::text AS identity,NOT attnotnull AS nullable FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum").bind(&relation).fetch_all(&mut *c).await?;
-    let oid = rows
-        .first()
-        .and_then(|r| r.try_get::<String, _>("relation_id").ok())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    let columns = rows
-        .into_iter()
-        .map(|r| {
-            Ok(Column {
-                name: r.try_get("attname")?,
-                ty: r.try_get("ty")?,
-                identity: !r.try_get::<String, _>("identity")?.is_empty(),
-                nullable: r.try_get("nullable")?,
+    tables: &[String],
+) -> std::result::Result<Schema, sqlx::Error> {
+    if tables.is_empty() {
+        return Ok(Schema::new());
+    }
+    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT 'column'::text AS kind,t.relname::text AS table_name,t.oid::text AS relation_id,         a.attname::text AS name,a.attnum::integer AS ordinal,a.atttypid::regtype::text AS ty,         (a.attidentity<>'') AS identity,NOT a.attnotnull AS nullable,         NULL::text AS index_id,false AS is_primary,false AS is_unique          FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class t ON t.oid=a.attrelid          JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=",
+    );
+    q.push_bind(schema).push(" AND t.relname IN (");
+    for (i, table) in tables.iter().enumerate() {
+        if i > 0 {
+            q.push(",");
+        }
+        q.push_bind(table);
+    }
+    q.push(") AND a.attnum>0 AND NOT a.attisdropped UNION ALL         SELECT 'index'::text,t.relname::text,t.oid::text,a.attname::text,k.ordinality::integer,        NULL::text,false,false,i.indexrelid::text,i.indisprimary,i.indisunique         FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class t ON t.oid=i.indrelid         JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace         CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality)         JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum         WHERE n.nspname=");
+    q.push_bind(schema).push(" AND t.relname IN (");
+    for (i, table) in tables.iter().enumerate() {
+        if i > 0 {
+            q.push(",");
+        }
+        q.push_bind(table);
+    }
+    q.push(") AND i.indisvalid AND k.ordinality<=i.indnkeyatts         ORDER BY table_name,kind,index_id,ordinal");
+    let rows = q.build().fetch_all(c).await?;
+    let mut result = Schema::new();
+    let mut keys: BTreeMap<String, BTreeMap<String, compiler::Index>> = BTreeMap::new();
+    for row in rows {
+        let table: String = row.try_get("table_name")?;
+        let entry = result.entry(table.clone()).or_default();
+        entry.oid = row
+            .try_get::<String, _>("relation_id")?
+            .parse()
+            .unwrap_or(0);
+        if row.try_get::<String, _>("kind")? == "column" {
+            entry.columns.push(Column {
+                name: row.try_get("name")?,
+                ty: row.try_get("ty")?,
+                identity: row.try_get("identity")?,
+                nullable: row.try_get("nullable")?,
                 default: None,
-                ordinal: r.try_get("attnum")?,
-            })
-        })
-        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
-    if columns.is_empty() {
-        return Ok(None);
+                ordinal: row.try_get::<i32, _>("ordinal")? as i16,
+            });
+        } else {
+            let id: String = row.try_get("index_id")?;
+            let key = keys.entry(table).or_default().entry(id).or_default();
+            key.primary = row.try_get("is_primary")?;
+            key.unique = row.try_get("is_unique")?;
+            key.columns.push(row.try_get("name")?);
+        }
     }
-    let rows=sqlx::query("SELECT i.indexrelid::text AS id,i.indisprimary,i.indisunique,a.attname FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum WHERE t.relname=$1 AND n.nspname=$2 AND i.indisvalid AND k.ordinality<=i.indnkeyatts ORDER BY i.indisprimary DESC,i.indexrelid,k.ordinality").bind(table).bind(schema).fetch_all(c).await?;
-    let mut keys: BTreeMap<String, compiler::Index> = BTreeMap::new();
-    for r in rows {
-        let id: String = r.try_get("id")?;
-        let key = keys.entry(id).or_default();
-        key.primary = r.try_get("indisprimary")?;
-        key.unique = r.try_get("indisunique")?;
-        key.columns.push(r.try_get("attname")?);
+    for (table, table_keys) in keys {
+        if let Some(entry) = result.get_mut(&table) {
+            entry.keys = table_keys.into_values().collect();
+        }
     }
-    Ok(Some(compiler::Table {
-        columns,
-        keys: keys.into_values().collect(),
-        oid,
-    }))
+    result.retain(|_, table| !table.columns.is_empty());
+    Ok(result)
 }
 
 #[cfg(test)]

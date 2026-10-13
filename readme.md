@@ -252,3 +252,16 @@ compatibility surface.
 Licensed under GPL-2.0-or-later; see [license.md](license.md). Included WordPress
 parser sources retain their [upstream license](parser/mysql/WordPress/LICENSE)
 and copyright notices.
+
+### Connection and metadata performance
+
+Native workers retain idle pooled connections for 15 minutes, with a 55-minute
+maximum lifetime and existing connection validation/error handling. Missing
+physical metadata for all tables in a statement is loaded in a single bound
+catalog query and reused through the generation-scoped worker cache. Catalog
+generation checks and automatic-upgrade invalidation remain enabled.
+
+`NativeDriver::connectionStats()` returns request-cumulative `check_ms`,
+`acquire_ms`, and `acquisitions`, including wpdb's connection check before its
+query timer. Acquisition time is a subset of check time; do not add them. No SQL
+text, parameters or connection credentials are included.
