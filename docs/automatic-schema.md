@@ -63,7 +63,9 @@ define('DSQL_SCHEMA_USER', 'wp_upgrader');
 define('DSQL_SCHEMA_STATE_DIRECTORY', '/var/lib/wordpress/automatic-schema');
 ```
 
-Install the matching 0.12 extension and Composer dependencies. Remove blanket
+Install the native extension from the same release as the PHP drop-in, together
+with its Composer dependencies. The driver checks the required native API before
+opening a connection. Remove blanket
 `DISALLOW_FILE_MODS` and `AUTOMATIC_UPDATER_DISABLED` restrictions. Use
 `WP_AUTO_UPDATE_CORE='minor'` for minor core updates and retain normal per-plugin
 choices. `DISALLOW_FILE_EDIT=true` can disable inline editors without blocking
