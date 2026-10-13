@@ -64,7 +64,7 @@ for the first time after a fork.
 The Tokio runtime starts lazily in each FPM worker, after the master forks. Each
 worker supports up to eight distinct configurations and two physical connections
 per configuration. A logical client holds its own connection; transactions are
-never multiplexed between clients. Idle connections expire after 60 seconds and
+never multiplexed between clients. Idle connections expire after 15 minutes and
 connections retire after 55 minutes, between operations. The AWS connector
 refreshes signed authentication tokens; an explicit credential file is reread
 when credentials are requested, including after atomic rotation.

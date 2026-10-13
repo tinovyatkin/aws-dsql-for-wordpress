@@ -12,6 +12,9 @@ final class NativeDriver extends Driver {
             throw new \RuntimeException('The selected native DSQL engine requires its matching PHP extension');
         }
         if (\DsqlNativeEngine::apiVersion() !== 1) throw new \RuntimeException('Native DSQL engine API mismatch');
+        if (!method_exists(\DsqlNativeEngine::class, 'connectionStats')) {
+            throw new \RuntimeException('Native DSQL connection telemetry requires the matching 0.13 engine');
+        }
         parent::__construct($nativeConfig);
         $region=$nativeConfig->region;
         if (!$region && preg_match('/\.dsql\.([a-z0-9-]+)\.on\.aws$/D',$nativeConfig->host,$m)) $region=$m[1];
@@ -72,6 +75,8 @@ final class NativeDriver extends Driver {
     }
     public function checkConnection(): void {$this->call(fn()=>$this->native->checkConnection());}
     public function close(): void {$this->native->close();if(self::$schemaClients)unset(self::$schemaClients[$this]);}
+    /** Request totals include connection acquisition before wpdb starts its query timer. */
+    public function connectionStats(): array {return $this->native->connectionStats();}
     public function isConnected(): bool {return $this->native->isConnected();}
     public function inTransaction(): bool {return $this->native->inTransaction();}
     public function queryCount(): int {return $this->native->queryCount()+$this->automaticQueries;}
