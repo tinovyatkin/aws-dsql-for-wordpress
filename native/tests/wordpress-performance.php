@@ -19,6 +19,8 @@ $a=$make();$first=$a->query($sql);
 $check(($first['timing']['metadata_tables_loaded']??0)===2.0 && ($first['timing']['metadata_round_trips']??0)===1.0,'two-table metadata uses one catalog round trip');
 $check($a->query($sql)['rows']===$first['rows'],'same-client plan preserves rows');
 $a->close();
+// SQLx returns dropped leases asynchronously, including a liveness check.
+usleep(250000);
 $b=$make();$warm=$b->query($sql);
 $check($warm['rows']===$first['rows'] && ($warm['timing']['plan_hit']??0)===1.0,'new client reuses generation-scoped plan');
 $check($b->connectionStats()['opened']===0.0,'new client reuses physical connection');
