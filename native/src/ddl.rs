@@ -571,7 +571,7 @@ fn execute_inner(client: &mut Client, shape: &Shape) -> Result<Output> {
                     let job = out
                         .rows
                         .first()
-                        .and_then(|r| r.values().next())
+                        .and_then(|r| r.first())
                         .and_then(|v| v.as_ref())
                         .and_then(|s| std::str::from_utf8(s).ok())
                         .ok_or("DSQL index job missing")?
@@ -580,7 +580,7 @@ fn execute_inner(client: &mut Client, shape: &Shape) -> Result<Output> {
                     let ready = status
                         .rows
                         .first()
-                        .and_then(|r| r.values().next())
+                        .and_then(|r| r.first())
                         .and_then(|v| v.as_ref())
                         .is_some_and(|v| v == b"1" || v == b"t" || v == b"true");
                     if !ready {

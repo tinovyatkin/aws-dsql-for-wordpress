@@ -17,8 +17,13 @@ fn output(rows: Vec<Row>, columns: Vec<String>, operation: &str) -> Output {
         rows: rows
             .into_iter()
             .map(|r| {
-                r.into_iter()
-                    .map(|(k, v)| (k, catalog_expr::string(&v).map(String::into_bytes)))
+                columns
+                    .iter()
+                    .map(|k| {
+                        r.get(k)
+                            .and_then(catalog_expr::string)
+                            .map(String::into_bytes)
+                    })
                     .collect()
             })
             .collect(),

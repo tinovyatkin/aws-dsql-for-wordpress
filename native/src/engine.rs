@@ -209,7 +209,8 @@ fn backend(config: &Config) -> Result<(Arc<Backend>, bool)> {
 }
 #[derive(Default, Clone)]
 pub struct Output {
-    pub rows: Vec<BTreeMap<String, Option<Vec<u8>>>>,
+    /// Cells follow column ordinals, including duplicate names.
+    pub rows: Vec<Vec<Option<Vec<u8>>>>,
     pub columns: Vec<String>,
     pub metadata: Vec<BTreeMap<String, serde_json::Value>>,
     pub affected: u64,
@@ -221,7 +222,7 @@ pub struct Output {
 impl Output {
     pub fn scalar(name: &str, value: Option<String>) -> Self {
         Self {
-            rows: vec![[(name.into(), value.map(String::into_bytes))].into()],
+            rows: vec![vec![value.map(String::into_bytes)]],
             columns: vec![name.into()],
             affected: 1,
             operation: "SELECT".into(),
@@ -815,11 +816,13 @@ impl Client {
         let timer = Instant::now();
         if self.config.value_codec {
             for row in &mut out.rows {
-                for (name, value) in row {
-                    let binary = out.metadata.iter().any(|m| {
-                        m.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
-                            && m.get("native_type").and_then(|v| v.as_str()) == Some("bytea")
-                    });
+                for (i, value) in row.iter_mut().enumerate() {
+                    let binary = out
+                        .metadata
+                        .get(i)
+                        .and_then(|m| m.get("native_type"))
+                        .and_then(|v| v.as_str())
+                        == Some("bytea");
                     if !binary && let Some(value) = value {
                         let text =
                             std::str::from_utf8(value).map_err(|_| "Non-UTF8 textual result")?;
@@ -849,7 +852,7 @@ impl Client {
             out.insert_id = out
                 .rows
                 .first()
-                .and_then(|r| out.columns.first().and_then(|n| r.get(n)))
+                .and_then(|r| r.first())
                 .and_then(|v| v.as_ref())
                 .and_then(|v| std::str::from_utf8(v).ok())
                 .unwrap_or("0")
@@ -1126,19 +1129,16 @@ async fn execute_command(
     }
     Ok(out)
 }
-fn decode(row: PgRow) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
-    let mut out = BTreeMap::new();
+fn decode(row: PgRow) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut out = Vec::with_capacity(row.len());
     for (i, col) in row.columns().iter().enumerate() {
         if row.try_get_raw(i).map_err(db_error)?.is_null() {
-            out.insert(col.name().into(), None);
+            out.push(None);
             continue;
         }
         let ty = col.type_info().name();
         if ty == "BYTEA" {
-            out.insert(
-                col.name().into(),
-                Some(row.try_get::<Vec<u8>, _>(i).map_err(db_error)?),
-            );
+            out.push(Some(row.try_get::<Vec<u8>, _>(i).map_err(db_error)?));
             continue;
         }
         let s = match ty {
@@ -1215,7 +1215,7 @@ fn decode(row: PgRow) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
         } else {
             s
         };
-        out.insert(col.name().into(), Some(s.into_bytes()));
+        out.push(Some(s.into_bytes()));
     }
     Ok(out)
 }

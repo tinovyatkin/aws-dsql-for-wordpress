@@ -15,6 +15,9 @@ final class NativeDriver extends Driver {
         if (!method_exists(\DsqlNativeEngine::class, 'connectionStats')) {
             throw new \RuntimeException('Native DSQL connection telemetry requires the matching 0.13 engine');
         }
+        if (version_compare(\DsqlNativeEngine::engineVersion(), '0.14.0', '<')) {
+            throw new \RuntimeException('Ordered DSQL result columns require the matching 0.14 engine');
+        }
         parent::__construct($nativeConfig);
         $region=$nativeConfig->region;
         if (!$region && preg_match('/\.dsql\.([a-z0-9-]+)\.on\.aws$/D',$nativeConfig->host,$m)) $region=$m[1];
@@ -71,7 +74,7 @@ final class NativeDriver extends Driver {
         }
         $out=$this->call(fn()=>$this->native->query($query));
         return new Result($out['rows'],$out['metadata'],(int)$out['affected_rows'],
-            $out['operation'],(bool)$out['command'],(int)$out['insert_id'],$query,$this->sqlMode());
+            $out['operation'],(bool)$out['command'],(int)$out['insert_id'],$query,$this->sqlMode(),$out['numeric_rows']??null);
     }
     public function checkConnection(): void {$this->call(fn()=>$this->native->checkConnection());}
     public function close(): void {$this->native->close();if(self::$schemaClients)unset(self::$schemaClients[$this]);}
