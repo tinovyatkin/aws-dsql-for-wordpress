@@ -15,7 +15,7 @@ writer. Migration and controlled-upgrade tests cover data verification and
 recovery from interrupted schema changes. Compatibility must be evaluated for
 each site's plugins, schema, and workload; this is not a drop-in MySQL replacement.
 
-Release 0.14 preserves duplicate column labels for positional result access,
+Native engine 0.14 preserves duplicate column labels for positional result access,
 including WordPress user-role counts. Named/object results keep the final value
 for a repeated label. The native module remains API-v1 compatible; deploy the
 matching module before selecting the 0.14 PHP bridge.
