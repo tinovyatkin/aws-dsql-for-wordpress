@@ -21,13 +21,13 @@ pub fn rows(out: Output) -> Result<Vec<Row>> {
         .map(|row| {
             columns
                 .iter()
-                .map(|k| {
+                .zip(row)
+                .map(|(k, value)| {
                     Ok((
                         k.clone(),
-                        match row.get(k).and_then(|v| v.as_ref()) {
+                        match value {
                             Some(v) => Value::String(
-                                String::from_utf8(v.clone())
-                                    .map_err(|_| "Non-UTF8 catalog field")?,
+                                String::from_utf8(v).map_err(|_| "Non-UTF8 catalog field")?,
                             ),
                             None => Value::Null,
                         },

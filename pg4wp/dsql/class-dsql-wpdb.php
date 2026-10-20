@@ -120,6 +120,26 @@ class DSQL_WPDB extends wpdb {
             }
         }
     }
+    /** wpdb's object rows cannot represent repeated labels; numeric APIs use ordinals. */
+    public function get_var($query = null, $x = 0, $y = 0) {
+        $value = parent::get_var($query, $x, $y);
+        $rows = $this->result instanceof Result ? $this->result->numericRows() : null;
+        if ($rows === null) return $value;
+        $value = $rows[$y][$x] ?? null;
+        return $value !== '' ? $value : null;
+    }
+    public function get_row($query = null, $output = OBJECT, $y = 0) {
+        $row = parent::get_row($query, $output, $y);
+        if ($query && $output === ARRAY_N && $this->result instanceof Result
+            && ($rows = $this->result->numericRows()) !== null) return $rows[$y] ?? null;
+        return $row;
+    }
+    public function get_results($query = null, $output = OBJECT) {
+        $rows = parent::get_results($query, $output);
+        if ($query && $output === ARRAY_N && $this->result instanceof Result
+            && ($numeric = $this->result->numericRows()) !== null) return $numeric;
+        return $rows;
+    }
     public function flush() {
         $this->last_result = [];
         $this->col_info = null;

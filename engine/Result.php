@@ -13,7 +13,10 @@ final class Result {
         public readonly int $insertId = 0,
         private readonly string $sourceSql = '',
         private readonly string $sourceMode = '',
+        private readonly ?array $numericRows = null,
     ) {}
+    /** Ordered cells are supplied separately only when labels collide. */
+    public function numericRows(): ?array { return $this->numericRows; }
     public function sourceQuery(): string {return $this->sourceSql;}
     public function sourceSqlMode(): string {return $this->sourceMode;}
     public function rowCount(): int { return $this->affectedRows; }
@@ -24,8 +27,9 @@ final class Result {
             throw new \InvalidArgumentException('Unsupported result fetch mode');
         }
         if (!isset($this->rows[$this->position])) { return false; }
-        $row = $this->rows[$this->position++];
-        return match ($mode) { \PDO::FETCH_NUM => array_values($row), \PDO::FETCH_OBJ => (object) $row, default => $row };
+        $position = $this->position++;
+        $row = $this->rows[$position];
+        return match ($mode) { \PDO::FETCH_NUM => $this->numericRows[$position] ?? array_values($row), \PDO::FETCH_OBJ => (object) $row, default => $row };
     }
     public function fetchAll(int $mode = \PDO::FETCH_ASSOC): array {
         $rows = [];

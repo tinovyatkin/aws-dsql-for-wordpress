@@ -46,7 +46,7 @@ fn fixture_config() -> (Config, String) {
     )
 }
 fn first(out: Output) -> Vec<u8> {
-    out.rows[0].values().next().unwrap().clone().unwrap()
+    out.rows[0][0].clone().unwrap()
 }
 #[test]
 #[ignore = "requires the explicitly selected synthetic AWS fixture"]

@@ -78,16 +78,35 @@ mod php {
             let out = native_call(&mut self.client, |client| client.query(sql))?;
             let mut result = HashMap::new();
             let mut php_rows = Vec::new();
-            for mut row in out.rows {
+            let duplicate_names = out
+                .columns
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                < out.columns.len();
+            let mut numeric_rows = Vec::new();
+            for row in out.rows {
                 let mut table = ext_php_rs::types::ZendHashTable::new();
-                for name in &out.columns {
-                    if let Some(value) = row.remove(name) {
-                        table.insert(name.as_str(), value.map(ext_php_rs::binary::Binary::new))?;
-                    }
+                let numeric = duplicate_names.then(|| row.clone());
+                for (name, value) in out.columns.iter().zip(row) {
+                    table.insert(name.as_str(), value.map(ext_php_rs::binary::Binary::new))?;
+                }
+                if let Some(values) = numeric {
+                    numeric_rows.push(
+                        values
+                            .into_iter()
+                            .map(|v| v.map(ext_php_rs::binary::Binary::new))
+                            .collect::<Vec<_>>(),
+                    );
                 }
                 php_rows.push(table);
             }
             result.insert("rows".into(), php_rows.into_zval(false)?);
+            // Additive API v1 field: old bridges still receive their named rows.
+            // Only duplicate labels need a second representation at the PHP boundary.
+            if duplicate_names {
+                result.insert("numeric_rows".into(), numeric_rows.into_zval(false)?);
+            }
             result.insert("columns".into(), out.columns.into_zval(false)?);
             result.insert(
                 "metadata".into(),

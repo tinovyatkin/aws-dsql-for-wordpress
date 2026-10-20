@@ -101,6 +101,18 @@ final class engineTest extends TestCase {
         self::assertNull($r->fetchColumn()); self::assertFalse($r->fetchColumn());
         self::assertFalse($r->getColumnMeta(9));
     }
+    public function test_duplicate_labels_preserve_numeric_cells_and_nulls(): void {
+        $columns=[['name'=>'same'],['name'=>'same'],['name'=>'empty'],['name'=>'binary']];
+        $values=['first',null,'',"a\0b"];
+        $make=static fn()=>new Result([['same'=>null,'empty'=>'','binary'=>"a\0b"]],$columns,1,'SELECT',numericRows:[$values]);
+        self::assertSame([$values],$make()->fetchAll(PDO::FETCH_NUM));
+        self::assertSame('first',$make()->fetchColumn(0));
+        self::assertNull($make()->fetchColumn(1));
+        self::assertSame(['same'=>null,'empty'=>'','binary'=>"a\0b"],$make()->fetch());
+        self::assertSame(['same'=>null,'empty'=>'','binary'=>"a\0b"],get_object_vars($make()->fetch(PDO::FETCH_OBJ)));
+        self::assertSame(4,$make()->columnCount());
+        self::assertSame('same',$make()->getColumnMeta(1)['name']);
+    }
     public function test_empty_command_results_are_fetchable(): void {
         $r = new Result([], [], 0, 'CREATE', true);
         self::assertFalse($r->fetchColumn()); self::assertSame([], $r->fetchAll());
