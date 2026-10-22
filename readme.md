@@ -20,6 +20,14 @@ including WordPress user-role counts. Named/object results keep the final value
 for a repeated label. The native module remains API-v1 compatible; deploy the
 matching module before selecting the 0.14 PHP bridge.
 
+PHP bridge 0.14.1 adds value-free, constant-memory `NativeDriver::timingStats()`
+for request totals and native query phases. It uses the existing 0.14 native
+extension without recompilation. `total_ms` includes measured driver operations
+and failed queries; native connection and phase times are components, not extra
+durations to add to that total. Native execution includes network/result transfer
+and retries, rather than measuring database CPU time alone. Phase breakdowns are
+available for successful ordinary queries; total time also covers other paths.
+
 ## WordPress SQLite foundation
 
 This project builds on the work of the
