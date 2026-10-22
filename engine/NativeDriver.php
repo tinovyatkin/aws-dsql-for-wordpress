@@ -95,7 +95,6 @@ final class NativeDriver extends Driver {
         return $this->requestTiming->snapshot() + [
             'connection_ms'=>(float)($connection['check_ms']??0),
             'connections_opened'=>(int)($connection['opened']??0),
-            'physical_queries'=>$this->queryCount(),
         ];
     }
     public function isConnected(): bool {return $this->native->isConnected();}
