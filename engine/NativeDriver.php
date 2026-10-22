@@ -4,10 +4,12 @@ namespace WPDSQL\Engine;
 /** wpdb/PHP result adaptation only. SQL handling and transport remain native. */
 final class NativeDriver extends Driver {
     private \DsqlNativeEngine $native;
+    private RequestTiming $requestTiming;
     private ?\WPDSQL\Schema\AutomaticSchema $automatic=null;
     private int $automaticQueries=0;
     private static ?\WeakMap $schemaClients=null;
     public function __construct(private readonly Config $nativeConfig) {
+        $this->requestTiming = new RequestTiming();
         if (!class_exists('DsqlNativeEngine', false)) {
             throw new \RuntimeException('The selected native DSQL engine requires its matching PHP extension');
         }
@@ -41,6 +43,9 @@ final class NativeDriver extends Driver {
         \WPDSQL\Schema\SchemaGate::suspendForHttp();return true;
     }
     private function call(callable $operation): mixed {
+        return $this->requestTiming->measure(fn()=>$this->invoke($operation));
+    }
+    private function invoke(callable $operation): mixed {
         try { $this->automatic?->ensureAccess();return $operation(); }
         catch (\Throwable $error) {
             $info=$this->native->errorInfo();
@@ -52,6 +57,9 @@ final class NativeDriver extends Driver {
         }
     }
     public function query(string $query,bool $deferIndexWait=false): Result {
+        return $this->requestTiming->measure(fn()=>$this->executeQuery($query,$deferIndexWait), true);
+    }
+    private function executeQuery(string $query,bool $deferIndexWait): Result {
         if($this->automatic) {
             try {
                 $this->automatic->ensureAccess();
@@ -73,6 +81,7 @@ final class NativeDriver extends Driver {
             }
         }
         $out=$this->call(fn()=>$this->native->query($query));
+        $this->requestTiming->recordNative($out['timing']??[]);
         return new Result($out['rows'],$out['metadata'],(int)$out['affected_rows'],
             $out['operation'],(bool)$out['command'],(int)$out['insert_id'],$query,$this->sqlMode(),$out['numeric_rows']??null);
     }
@@ -80,6 +89,15 @@ final class NativeDriver extends Driver {
     public function close(): void {$this->native->close();if(self::$schemaClients)unset(self::$schemaClients[$this]);}
     /** Request totals include connection acquisition before wpdb starts its query timer. */
     public function connectionStats(): array {return $this->native->connectionStats();}
+    /** Request-scoped totals include bootstrap queries and pre-query connection checks. */
+    public function timingStats(): array {
+        $connection = $this->native->connectionStats();
+        return $this->requestTiming->snapshot() + [
+            'connection_ms'=>(float)($connection['check_ms']??0),
+            'connections_opened'=>(int)($connection['opened']??0),
+            'physical_queries'=>$this->queryCount(),
+        ];
+    }
     public function isConnected(): bool {return $this->native->isConnected();}
     public function inTransaction(): bool {return $this->native->inTransaction();}
     public function queryCount(): int {return $this->native->queryCount()+$this->automaticQueries;}
