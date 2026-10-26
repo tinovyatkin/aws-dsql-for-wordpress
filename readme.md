@@ -1,12 +1,15 @@
 # AWS DSQL for WordPress
 
-A WordPress database adapter for **Amazon Aurora DSQL**, with a standalone
-MySQL compatibility engine, cached SQL translation, migration tooling, and
-automatic common schema changes and controlled upgrades.
+A WordPress database adapter for **Amazon Aurora DSQL**, with a **native Rust
+engine as its primary production implementation**. Rust handles MySQL parsing,
+SQL translation, parameter binding, pooled connections, execution, result
+decoding and SQL-error logging. Database connections use AWS’s Rust DSQL
+connector and SQLx.
 
-WordPress uses its official `wp-content/db.php` extension point. The DSQL driver
-extends the installed core `wpdb` class. The optional native Rust engine uses
-AWS’s SQLx connector; the PHP engine uses AWS’s PDO connector. It does not rewrite or patch WordPress core. Aurora DSQL is the only
+WordPress uses its official `wp-content/db.php` extension point and a PHP bridge
+that extends core `wpdb`. PHP also provides the recoverable schema-upgrade
+coordinator and the maintenance engine used for controlled migrations and
+explicit rollback. WordPress core is not patched. Aurora DSQL is the only
 supported database backend.
 
 The repository includes synthetic integration tests for installation, login,
@@ -28,14 +31,21 @@ durations to add to that total. Native execution includes network/result transfe
 and retries, rather than measuring database CPU time alone. Phase breakdowns are
 available for successful ordinary queries; total time also covers other paths.
 
+## Developed for blonde.travel
+
+This adapter was developed for [blonde.travel](https://blonde.travel/), a
+WordPress travel publication. Its Rust engine has been running in production
+there since **19 September 2026**, over a month as of October 2026.
+
 ## WordPress SQLite foundation
 
 This project builds on the work of the
 [WordPress SQLite Database Integration contributors](https://github.com/WordPress/sqlite-database-integration).
-It includes their standalone PHP MySQL parser, pinned to a specific upstream
-revision and generated from MySQL's Bison grammar. Their separation of WordPress
-integration from database execution, logical MySQL schema model, and compatibility
-contracts also informed the engine and schema architecture here.
+The PHP maintenance engine includes their standalone MySQL parser, pinned to a
+specific upstream revision and generated from MySQL's Bison grammar. Their
+separation of WordPress integration from database execution, logical MySQL
+schema model, and compatibility contracts also informed the engine and schema
+architecture here.
 
 The DSQL SQL emitter, cached translation plans, AWS connection handling, and
 migration and upgrade runners are implemented for Aurora DSQL. This is an
@@ -50,36 +60,40 @@ and adaptations.
 WordPress core and plugins
         │ usual wpdb / MySQL queries
         ▼
-wp-content/db.php → DSQL_WPDB → standalone MySQL-on-DSQL engine
-                                      │ cached translation plans
+wp-content/db.php → DSQL_WPDB (PHP bridge)
+        │ ordinary database operations
+        ▼
+Native Rust engine → parsing, cached translation plans, binding and results
         │
         ▼
-Native Rust engine (or PHP maintenance engine)
-        │
-        ▼
-AWS connector → Aurora DSQL ← AWS Node.js connector ← independent worker
+AWS Rust DSQL connector / SQLx → Aurora DSQL
+                                  ▲
+                    AWS Node.js connector ← independent worker
 ```
 
 One logical MySQL schema model serves installation, restored
 metadata, AST-derived DDL and introspection. The standalone engine owns connection
-renewal, SQL execution, session state, retries and buffered results. Version 0.10
-defers physical connections until a query needs one and reads renderer column
-metadata directly from the PostgreSQL catalog, retaining per-request freshness. See
-[the engine API](docs/standalone-engine.md) and
+renewal, SQL execution, session state, retries and buffered results. Connections
+are acquired lazily, and physical metadata is reused with schema-generation
+checks. See [the PHP maintenance engine API](docs/standalone-engine.md) and
 [the logical schema and catalog migration](docs/logical-schema.md).
 
-The PHP implementation below remains available for controlled maintenance and
-explicit rollback. The [native Rust engine](native/README.md) performs parsing,
-translation, parameter binding, connections, row decoding and SQL-error logging
-inside one extension. Enable it with `DSQL_ENGINE=native` after installing a
-binary built for the host’s PHP ABI.
+The [native Rust engine](native/README.md) is the runtime used for ordinary
+production queries. Enable it with `DSQL_ENGINE=native` after installing a binary
+built for the host’s PHP ABI and operating system. Engine selection is still
+explicit: omitting that setting selects the PHP engine, and a failed native
+operation does not automatically fall back to PHP.
 
-The DSQL implementation:
+Supported automatic schema changes use the recoverable PHP coordinator;
+controlled migration sessions use the PHP maintenance engine and AWS’s PDO
+connector. Keep the Composer dependencies installed for these paths.
 
-- uses IAM authentication and verified TLS through the AWS PHP connector;
-- subclasses `wpdb` directly and preserves its public string-based API;
-- parses value-free MySQL templates with WordPress's standalone MySQL parser, then emits DSQL
-  SQL with current PDO bindings;
+The native DSQL implementation:
+
+- uses IAM authentication and verified TLS through AWS’s Rust connector and SQLx;
+- integrates with the `wpdb` bridge while preserving its public string-based API;
+- parses MySQL queries into a typed `sqlparser-rs` AST, with a strict token grammar
+  for metadata commands, then emits parameterized DSQL SQL;
 - caches compiled instructions across requests without caching values or results;
 - translates auto-increment columns into DSQL identities with explicit `CACHE 1`;
 - submits indexes using `CREATE INDEX ASYNC` and waits for their completion;
@@ -96,6 +110,31 @@ before the first write relying on those indexes. Core's explicit default-categor
 ID is reseeded during that single-writer installation phase.
 
 ## Quick start
+
+### Native Rust runtime
+
+Follow the [native build and loading guide](native/README.md#build-and-enable)
+and the [WordPress drop-in configuration guide](docs/installation.md):
+
+1. Build and load the extension for the actual host OS and PHP ABI. The repository
+   provides a pinned Linux Docker build and a GitHub Actions artifact workflow.
+2. Install the Composer dependencies and the `wp-content/db.php` drop-in, then
+   configure the DSQL endpoint, IAM identity, schema and trusted CA file.
+3. Select the primary runtime before WordPress bootstrap:
+
+```php
+define('DSQL_ENGINE', 'native');
+```
+
+Use a trusted CA file path for the Rust connector. The `PGSSLROOTCERT=system`
+setting in the PHP fixture below is specific to libpq.
+
+### Disposable PHP-engine fixture
+
+The following bootstrap creates a synthetic WordPress installation using the PHP
+engine by default; it does not build or enable the Rust extension. To exercise
+the native runtime against that fixture, load the extension in both CLI and web
+PHP and add the engine setting above to its WordPress configuration.
 
 Requires AWS CLI with an authorized profile, PHP 8.2+ with `pdo_pgsql` and
 `mbstring`, WP-CLI,
@@ -215,10 +254,16 @@ scope, and remaining limitations.
 
 ## MySQL translation and caching
 
-SQL translation uses WordPress's standalone PHP MySQL parser, generated from
-MySQL's Bison grammar. Repeated query shapes reuse bounded, value-free plans; persistent
-hits avoid loading the parser. See [configuration, supported forms, and verification](docs/sql-translation.md)
-and [parser sources, maintenance, and the Rust evaluation](docs/mysql-parser.md).
+The primary Rust engine uses `sqlparser-rs` and bounded, value-free translation
+plans cached per PHP-FPM worker. Parsing runs for each query; a plan-cache hit
+skips SQL compilation. SQLx also caches prepared statements on pooled connections.
+Logical schema generations invalidate plans and metadata when the schema changes.
+See [native caching and connection lifetime](native/README.md#connections-errors-and-cache-lifetime).
+
+The PHP maintenance engine uses WordPress's standalone MySQL parser, generated
+from MySQL's Bison grammar. Its persistent plan-cache hits avoid loading that
+parser. See [PHP translation configuration and supported forms](docs/sql-translation.md)
+and [PHP parser provenance and maintenance](docs/mysql-parser.md).
 
 ## Core SQL coverage
 
@@ -252,21 +297,7 @@ from live execution and MySQL result-equivalence testing.
   persistent-cache configuration, or validate heavy concurrency, failover, or
   production load.
 
-## Experimental native engine
-
-An opt-in [Rust extension prototype](native/README.md) keeps SQL parsing,
-translation, connection management and execution inside Rust. It includes
-synthetic DSQL integration tests and a PHP-FPM comparison harness. It is not
-loaded by the released WordPress drop-in and does not yet provide its full
-compatibility surface.
-
-## License
-
-Licensed under GPL-2.0-or-later; see [license.md](license.md). Included WordPress
-parser sources retain their [upstream license](parser/mysql/WordPress/LICENSE)
-and copyright notices.
-
-### Connection and metadata performance
+## Connection and metadata performance
 
 Native workers retain idle pooled connections for 15 minutes, with a 55-minute
 maximum lifetime and existing connection validation/error handling. Missing
@@ -278,3 +309,9 @@ generation checks and automatic-upgrade invalidation remain enabled.
 `acquire_ms`, `acquisitions`, `opened`, and `health_checks`, including wpdb's connection check before its
 query timer. Acquisition time is a subset of check time; do not add them. No SQL
 text, parameters or connection credentials are included.
+
+## License
+
+Licensed under GPL-2.0-or-later; see [license.md](license.md). Included WordPress
+parser sources retain their [upstream license](parser/mysql/WordPress/LICENSE)
+and copyright notices.
