@@ -27,6 +27,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// A parked connection unused for this long is verified between requests.
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(240);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A connection that has not answered since it was parked gets this long to start
+/// answering a replayable read; past it the read is replayed on a new connection.
+const UNPROVEN_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Closing is a courtesy to the server; a dead socket must not hold up the worker.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// A connection parked longer than this may have been dropped by the network.
 const PROBE_AFTER_IDLE: Duration = Duration::from_secs(5);
@@ -74,6 +79,15 @@ struct Parked {
     connection: PgConnection,
     created: Instant,
     since: Instant,
+    /// Schema generation its prepared statements belong to; `None` when it has none yet.
+    epoch: Option<String>,
+}
+/// Ends a connection without letting an unresponsive peer delay the caller.
+async fn close_quietly(connection: PgConnection) {
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, connection.close()).await;
+}
+fn timed_out() -> sqlx::Error {
+    sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))
 }
 pub(crate) struct Backend {
     options: DsqlConnectOptions,
@@ -261,9 +275,11 @@ async fn keep_connection_fresh(backend: Weak<Backend>, wake: Arc<Notify>) {
             let alive = tokio::time::timeout(PROBE_TIMEOUT, parked.connection.ping()).await;
             if matches!(alive, Ok(Ok(()))) {
                 parked.since = Instant::now();
+                // It keeps its epoch: a generation change while it was out is detected
+                // when a request next takes it.
                 candidate = Some(parked);
             } else {
-                parked.connection.close().await.ok();
+                close_quietly(parked.connection).await;
                 replace = true;
             }
         }
@@ -273,6 +289,7 @@ async fn keep_connection_fresh(backend: Weak<Backend>, wake: Arc<Notify>) {
                 connection,
                 created: Instant::now(),
                 since: Instant::now(),
+                epoch: None,
             });
         }
         let Some(candidate) = candidate else { continue };
@@ -292,7 +309,7 @@ async fn keep_connection_fresh(backend: Weak<Backend>, wake: Arc<Notify>) {
         };
         drop(b);
         if let Some(connection) = retired {
-            connection.close().await.ok();
+            close_quietly(connection).await;
         }
     }
 }
@@ -508,38 +525,65 @@ impl Client {
                 return Err("Native worker connection limit reached".into());
             }
             let start = Instant::now();
-            let parked = b.parked.lock().map(|mut slot| slot.take());
-            let held = match parked {
-                Ok(Some(parked)) if parked.created.elapsed() < MAX_LIFETIME => Ok((
-                    parked.connection,
-                    parked.created,
-                    parked.since.elapsed() > PROBE_AFTER_IDLE,
-                )),
-                Ok(expired) => {
-                    if let Some(parked) = expired {
-                        rt.block_on(parked.connection.close()).ok();
-                    }
-                    self.connections_opened += 1;
-                    rt.block_on(open(&b.options, &b.search_path))
-                        .map(|connection| (connection, Instant::now(), false))
-                }
-                Err(_) => Err("Connection slot lock failed".into()),
-            };
+            let held = self.take_connection(&b, &rt);
             self.connection_acquire_ms += start.elapsed().as_secs_f64() * 1000.;
             self.connection_acquisitions += 1;
-            let (connection, created, probe) = held.inspect_err(|_| {
+            let (connection, created, probe, epoch) = held.inspect_err(|_| {
                 b.leases.fetch_sub(1, Ordering::SeqCst);
             })?;
             self.connection = Some(connection);
             self.created = created;
             self.probe = probe;
-            self.epoch = b
-                .generation
-                .lock()
-                .map_err(|_| "Schema generation lock failed")?
-                .clone();
+            self.epoch = epoch;
         }
         Ok(reused)
+    }
+    /// The worker's parked connection if it is still usable, otherwise a new one. A parked
+    /// connection prepared statements under an older schema generation (the background
+    /// keep-alive may have held it while a request detected the change); those are cleared
+    /// here, so its epoch is never simply relabelled as current.
+    #[allow(clippy::type_complexity)]
+    fn take_connection(
+        &mut self,
+        b: &Arc<Backend>,
+        rt: &Runtime,
+    ) -> Result<(PgConnection, Instant, bool, Option<String>)> {
+        let current = b
+            .generation
+            .lock()
+            .map_err(|_| "Schema generation lock failed")?
+            .clone();
+        let parked = b
+            .parked
+            .lock()
+            .map_err(|_| "Connection slot lock failed")?
+            .take();
+        match parked {
+            Some(mut parked) if parked.created.elapsed() < MAX_LIFETIME => {
+                if parked.epoch.is_none() || parked.epoch == current {
+                    return Ok((
+                        parked.connection,
+                        parked.created,
+                        parked.since.elapsed() > PROBE_AFTER_IDLE,
+                        current,
+                    ));
+                }
+                let cleared = rt.block_on(tokio::time::timeout(
+                    PROBE_TIMEOUT,
+                    parked.connection.clear_cached_statements(),
+                ));
+                if matches!(cleared, Ok(Ok(()))) {
+                    // The exchange also proved the connection alive.
+                    return Ok((parked.connection, parked.created, false, current));
+                }
+                rt.block_on(close_quietly(parked.connection));
+            }
+            Some(expired) => rt.block_on(close_quietly(expired.connection)),
+            None => {}
+        }
+        self.connections_opened += 1;
+        rt.block_on(open(&b.options, &b.search_path))
+            .map(|connection| (connection, Instant::now(), false, current))
     }
     /// A read outside a transaction is simply replayed on a new connection if the parked
     /// one turns out to be dead. Anything else cannot be replayed, so it is probed first.
@@ -550,9 +594,15 @@ impl Client {
         self.probe = false;
         let start = Instant::now();
         self.connection_health_checks += 1;
-        let alive = runtime()
-            .block_on(self.connection.as_mut().unwrap().ping())
-            .is_ok();
+        // Bounded: a connection that stopped answering without closing must not hold
+        // the worker. It is then discarded and replaced.
+        let alive = matches!(
+            runtime().block_on(tokio::time::timeout(
+                PROBE_TIMEOUT,
+                self.connection.as_mut().unwrap().ping()
+            )),
+            Ok(Ok(()))
+        );
         let result = if alive {
             Ok(())
         } else {
@@ -568,7 +618,7 @@ impl Client {
                 b.leases.fetch_sub(1, Ordering::SeqCst);
             }
             self.probe = false;
-            runtime().block_on(c.close()).ok();
+            runtime().block_on(close_quietly(c));
         }
     }
     pub fn query(&mut self, sql: &str) -> Result<Output> {
@@ -886,9 +936,12 @@ impl Client {
         self.settle(replayable)?;
         let timer = Instant::now();
         let mut out = loop {
+            // A connection not heard from since it was parked may have gone silent without
+            // closing. Bound a replayable read on it, then replay it on a new connection.
+            let bounded = replayable && self.probe;
             let connection = self.connection.as_mut().unwrap();
             let mut affected = 0;
-            let result = rt.block_on(async {
+            let work = async {
                 if owned {
                     sqlx::raw_sql("BEGIN").execute(&mut *connection).await?;
                 }
@@ -903,7 +956,13 @@ impl Client {
                 }
                 last.affected = affected;
                 Ok::<_, sqlx::Error>(last)
-            });
+            };
+            let result = if bounded {
+                rt.block_on(tokio::time::timeout(UNPROVEN_READ_TIMEOUT, work))
+                    .unwrap_or_else(|_| Err(timed_out()))
+            } else {
+                rt.block_on(work)
+            };
             self.queries += commands.len() as u64;
             // Whatever the outcome, the connection has now been exercised.
             let unproven = std::mem::take(&mut self.probe);
@@ -1019,8 +1078,12 @@ impl Client {
             return self.raw(sql, values);
         }
         let command = BoundCommand { sql, values };
-        let mut result =
-            runtime().block_on(execute_command(self.connection.as_mut().unwrap(), &command));
+        let mut result = runtime()
+            .block_on(tokio::time::timeout(
+                UNPROVEN_READ_TIMEOUT,
+                execute_command(self.connection.as_mut().unwrap(), &command),
+            ))
+            .unwrap_or_else(|_| Err(timed_out()));
         if result.as_ref().is_err_and(is_transport) {
             self.discard_connection();
             self.check_connection()?;
@@ -1131,12 +1194,24 @@ impl Client {
                 .map_err(|_| "Connection slot lock failed")?
                 .take();
             if let Some(mut parked) = parked {
-                runtime()
-                    .block_on(parked.connection.clear_cached_statements())
-                    .map_err(db_error)?;
-                let mut slot = b.parked.lock().map_err(|_| "Connection slot lock failed")?;
-                if slot.is_none() {
-                    *slot = Some(parked);
+                let cleared = runtime().block_on(tokio::time::timeout(
+                    PROBE_TIMEOUT,
+                    parked.connection.clear_cached_statements(),
+                ));
+                let surplus = if matches!(cleared, Ok(Ok(()))) {
+                    parked.epoch = Some(generation.clone());
+                    let mut slot = b.parked.lock().map_err(|_| "Connection slot lock failed")?;
+                    if slot.is_none() {
+                        *slot = Some(parked);
+                        None
+                    } else {
+                        Some(parked.connection)
+                    }
+                } else {
+                    Some(parked.connection)
+                };
+                if let Some(connection) = surplus {
+                    runtime().block_on(close_quietly(connection));
                 }
             }
         }
@@ -1205,13 +1280,14 @@ impl Client {
                             connection,
                             created: self.created,
                             since: Instant::now(),
+                            epoch: self.epoch.clone(),
                         });
                         None
                     }
                     _ => Some(connection),
                 };
                 if let Some(connection) = surplus {
-                    rt.block_on(connection.close()).ok();
+                    rt.block_on(close_quietly(connection));
                 }
             } else {
                 self.discard_connection();
@@ -1463,7 +1539,7 @@ pub fn reset_worker() -> Result<()> {
             }
             let parked = backend.parked.lock().ok().and_then(|mut slot| slot.take());
             if let Some(parked) = parked {
-                rt.block_on(parked.connection.close()).ok();
+                rt.block_on(close_quietly(parked.connection));
             }
         }
     }

@@ -423,3 +423,34 @@ fn signalled_worker_reuses_its_catalog_until_the_signal_moves() {
     reset_worker().unwrap();
     std::fs::remove_dir_all(&directory).unwrap();
 }
+#[test]
+#[ignore = "requires the explicitly selected synthetic AWS fixture"]
+fn parked_connection_from_an_older_generation_is_cleared_before_reuse() {
+    let (cfg, table) = fixture_config();
+    let read = format!("SELECT post_title FROM `{table}` WHERE ID=1");
+    let mut a = Client::new(cfg.clone()).unwrap();
+    let original = first(a.query(&read).unwrap());
+    a.close();
+    let (b, _) = backend(&cfg).unwrap();
+    // As if the keep-alive held the connection while a request moved the generation.
+    {
+        let mut slot = b.parked.lock().unwrap();
+        let parked = slot.as_mut().unwrap();
+        assert!(parked.connection.cached_statements_size() > 0);
+        assert_eq!(&parked.epoch, &*b.generation.lock().unwrap());
+        parked.epoch = Some("an-older-generation".into());
+    }
+    let mut c = Client::new(cfg.clone()).unwrap();
+    c.check_connection().unwrap();
+    assert_eq!(c.connection.as_ref().unwrap().cached_statements_size(), 0);
+    assert_eq!(c.connections_opened, 0, "cleared, not replaced");
+    assert_eq!(first(c.query(&read).unwrap()), original);
+    c.close();
+    // A connection from the current generation keeps its statements.
+    let mut d = Client::new(cfg).unwrap();
+    d.check_connection().unwrap();
+    assert!(d.connection.as_ref().unwrap().cached_statements_size() > 0);
+    d.close();
+    drop(b);
+    reset_worker().unwrap();
+}
