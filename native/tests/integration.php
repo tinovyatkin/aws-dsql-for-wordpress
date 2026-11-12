@@ -39,7 +39,8 @@ foreach(["SELECT * FROM `{$f['prefix']}missing`","ALTER TABLE `$t` ADD COLUMN fo
 $n->query("SELECT ID FROM `$t` WHERE post_status='draft' AND ID=3");
 $another=native_client();$r=$another->query("SELECT ID FROM `$t` WHERE post_status='draft' AND ID=3");
 check($r['timing']['backend_reused']===1.0&&$r['timing']['plan_hit']===1.0,'Native backend and plan survive PHP object lifetime');
-for($i=0;$i<40;$i++)check(first($n->query("SELECT $i AS eviction_$i"))===(string)$i,'Prepared statement eviction');
+// More distinct statements than one connection retains (256), so the oldest are closed.
+for($i=0;$i<300;$i++)check(first($n->query("SELECT $i AS eviction_$i"))===(string)$i,'Prepared statement eviction');
 rejects(fn()=>dsql_native_reset_worker(),'Live client reset guard');
 $another->close();
 $n->close();rejects(fn()=>$n->query('SELECT 1'),'Closed client');$p->close();dsql_native_reset_worker();

@@ -2,7 +2,7 @@
 
 A WordPress database adapter for **Amazon Aurora DSQL**, with a **native Rust
 engine as its primary production implementation**. Rust handles MySQL parsing,
-SQL translation, parameter binding, pooled connections, execution, result
+SQL translation, parameter binding, retained connections, execution, result
 decoding and SQL-error logging. Database connections use AWS’s Rust DSQL
 connector and SQLx.
 
@@ -22,6 +22,14 @@ Native engine 0.14 preserves duplicate column labels for positional result acces
 including WordPress user-role counts. Named/object results keep the final value
 for a repeated label. The native module remains API-v1 compatible; deploy the
 matching module before selecting the 0.14 PHP bridge.
+
+Native engine and bridge 0.15 remove first-use and per-request overhead: one kept
+connection per worker, refreshed between requests before DSQL's one-hour limit;
+256 prepared statements per connection without per-column catalog lookups; table
+metadata read once per worker; and, with automatic schema handling, a catalog
+check per schema change instead of per request. The 0.15 engine accepts the 0.14
+bridge and the 0.15 bridge accepts a 0.14 engine, so either can be deployed first.
+See [native caching and connection lifetime](native/README.md#connections-errors-and-cache-lifetime).
 
 PHP bridge 0.14.1 adds value-free, constant-memory `NativeDriver::timingStats()`
 for request totals and native query phases. It uses the existing 0.14 native
@@ -256,7 +264,7 @@ scope, and remaining limitations.
 
 The primary Rust engine uses `sqlparser-rs` and bounded, value-free translation
 plans cached per PHP-FPM worker. Parsing runs for each query; a plan-cache hit
-skips SQL compilation. SQLx also caches prepared statements on pooled connections.
+skips SQL compilation. SQLx also caches prepared statements on each connection.
 Logical schema generations invalidate plans and metadata when the schema changes.
 See [native caching and connection lifetime](native/README.md#connections-errors-and-cache-lifetime).
 
@@ -299,15 +307,18 @@ from live execution and MySQL result-equivalence testing.
 
 ## Connection and metadata performance
 
-Native workers retain idle pooled connections for 15 minutes, with a 55-minute
-maximum lifetime and existing connection validation/error handling. Missing
-physical metadata for all tables in a statement is loaded in a single bound
-catalog query and reused through the generation-scoped worker cache. Catalog
-generation checks and automatic-upgrade invalidation remain enabled.
+Each native worker keeps one connection and replaces it between requests before
+DSQL's one-hour limit, so requests rarely open one. Physical metadata is read in
+two catalog statements, for the whole schema when it has up to 32 tables, and
+reused through the generation-scoped worker cache. Catalog generation checks and
+automatic-upgrade invalidation remain enabled; with automatic schema handling a
+worker checks once per schema change instead of once per request.
 
 `NativeDriver::connectionStats()` returns request-cumulative `check_ms`,
 `acquire_ms`, `acquisitions`, `opened`, and `health_checks`, including wpdb's connection check before its
-query timer. Acquisition time is a subset of check time; do not add them. No SQL
+query timer. `opened` counts connections this request had to open itself, and
+`health_checks` the liveness checks it waited for; background work is not included.
+Acquisition time is a subset of check time; do not add them. No SQL
 text, parameters or connection credentials are included.
 
 ## License

@@ -1,6 +1,6 @@
 [package]
 name = "wp-dsql-native"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 license = "GPL-2.0-or-later"
 publish = false
@@ -17,7 +17,7 @@ ext-php-rs = { version = "=0.15.15", optional = true }
 sqlparser = { version = "=0.63.0", features = ["visitor"] }
 aurora-dsql-sqlx-connector = { version = "=0.2.2", features = ["pool", "occ"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring", "chrono", "bigdecimal"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 lru = "0.16"
 chrono = "0.4"
 aws-config = "1.12"

@@ -24,11 +24,19 @@ final class NativeDriver extends Driver {
         $region=$nativeConfig->region;
         if (!$region && preg_match('/\.dsql\.([a-z0-9-]+)\.on\.aws$/D',$nativeConfig->host,$m)) $region=$m[1];
         $file=$nativeConfig->credentialsFile ?: (getenv('AWS_SHARED_CREDENTIALS_FILE') ?: null);
-        $this->native=new \DsqlNativeEngine(
+        $arguments=[
             $nativeConfig->host, $region ?: '', $nativeConfig->profile ?: 'default',
             $nativeConfig->user, $nativeConfig->schema, $nativeConfig->tablePrefix,
             'native-engine-v1', $file, $nativeConfig->valueCodec, $nativeConfig->sqlMode, $nativeConfig->cacheEnabled,
-        );
+        ];
+        // The schema coordinator journals every operation in its state directory, so the
+        // directory's modification time tells every worker on the host that the schema moved.
+        // With that signal a 0.15 engine keeps its validated catalog between requests;
+        // without it, and on older engines, each request reads the catalog generation.
+        $signal=$nativeConfig->automaticSchema&&$nativeConfig->schemaStateDirectory
+            ? (realpath($nativeConfig->schemaStateDirectory) ?: null) : null;
+        if($signal!==null&&version_compare(\DsqlNativeEngine::engineVersion(),'0.15.0','>='))$arguments[]=$signal;
+        $this->native=new \DsqlNativeEngine(...$arguments);
         if($nativeConfig->automaticSchema) {
             if(!method_exists($this->native,'invalidateSchema'))throw new \RuntimeException('Automatic schema upgrades require the matching native extension');
             $this->automatic=new \WPDSQL\Schema\AutomaticSchema($nativeConfig,fn()=>$this->native->invalidateSchema());

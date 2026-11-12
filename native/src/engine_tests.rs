@@ -41,6 +41,7 @@ fn fixture_config() -> (Config, String) {
             value_codec: false,
             sql_mode: String::new(),
             cache_enabled: true,
+            schema_signal: None,
         },
         fixture["posts"].as_str().unwrap().into(),
     )
@@ -55,9 +56,9 @@ fn connection_lifetime_transaction_and_conflict_contracts() {
     let mut a = Client::new(cfg.clone()).unwrap();
     let sql = format!("SELECT post_title FROM `{table}` WHERE ID=1");
     let original = first(a.query(&sql).unwrap());
-    a.acquired = Instant::now() - Duration::from_secs(3600);
+    a.created = Instant::now() - Duration::from_secs(3600);
     assert_eq!(first(a.query(&sql).unwrap()), original);
-    assert!(a.acquired.elapsed() < Duration::from_secs(60));
+    assert!(a.created.elapsed() < Duration::from_secs(60));
     a.query("BEGIN").unwrap();
     a.query(&format!(
         "UPDATE `{table}` SET post_title='synthetic-uncommitted' WHERE ID=1"
@@ -143,6 +144,7 @@ fn failed_metadata_keeps_transaction_ownership() {
         value_codec: false,
         sql_mode: String::new(),
         cache_enabled: true,
+        schema_signal: None,
     };
     let mut client = Client::new(cfg).unwrap();
     client.transaction = true;
@@ -239,4 +241,185 @@ fn json_and_binary_bindings_preserve_value_bytes() {
         .unwrap();
         assert_eq!(bound.values, [expected]);
     }
+}
+#[test]
+fn index_keys_exclude_included_columns_and_expressions() {
+    let columns: Vec<Column> = [(1, "ID"), (2, "post_name"), (3, "post_date")]
+        .into_iter()
+        .map(|(ordinal, name)| Column {
+            name: name.into(),
+            ty: "text".into(),
+            identity: false,
+            nullable: false,
+            default: None,
+            ordinal,
+        })
+        .collect();
+    // DSQL stores every column in a primary-key index; only the first is a key.
+    assert_eq!(key_columns("1 1 2 3", &columns), ["ID"]);
+    assert_eq!(key_columns("2 3 2 1", &columns), ["post_date", "post_name"]);
+    // An expression key has no attribute number, and a dropped column has no name.
+    assert_eq!(key_columns("2 0 2", &columns), ["post_name"]);
+    assert_eq!(key_columns("1 9", &columns), Vec::<String>::new());
+    assert_eq!(key_columns("", &columns), Vec::<String>::new());
+}
+#[test]
+fn worker_catalog_is_trusted_only_while_its_signal_is_unchanged() {
+    use crate::catalog::schema_signal;
+    let directory = std::env::temp_dir().join(format!("wp-dsql-signal-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.to_str().unwrap();
+    assert_eq!(schema_signal(None), None);
+    assert_eq!(schema_signal(Some("/nonexistent/wp-dsql-signal")), None);
+    let before = schema_signal(Some(path)).expect("directory has a modification time");
+    assert_eq!(schema_signal(Some(path)), Some(before));
+    // The schema coordinator publishes each journal by creating and renaming a file.
+    std::thread::sleep(Duration::from_millis(30));
+    std::fs::write(directory.join("pending.json.tmp"), b"{}").unwrap();
+    std::fs::rename(
+        directory.join("pending.json.tmp"),
+        directory.join("pending.json"),
+    )
+    .unwrap();
+    let after = schema_signal(Some(path)).unwrap();
+    assert_ne!(before, after);
+    let shared = crate::catalog::SharedCatalog::validated("generation".into(), before);
+    assert!(shared.current(Some(before)));
+    assert!(!shared.current(Some(after)));
+    assert!(!shared.current(None));
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+/// A stand-in for the schema coordinator's state directory, last touched a while ago.
+fn signal_directory(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("wp-dsql-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    settle_signal(&directory);
+    directory
+}
+fn settle_signal(directory: &std::path::Path) {
+    std::fs::File::open(directory)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(10))
+        .unwrap();
+}
+fn parked_times(b: &Backend) -> Option<(Instant, Instant)> {
+    let slot = b.parked.lock().unwrap();
+    slot.as_ref().map(|parked| (parked.created, parked.since))
+}
+fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+#[test]
+#[ignore = "requires the explicitly selected synthetic AWS fixture"]
+fn worker_connection_is_refreshed_verified_and_probed_between_requests() {
+    // With a schema signal a request's first statement is its own, not a catalog read.
+    let (mut cfg, table) = fixture_config();
+    let directory = signal_directory("probe");
+    cfg.schema_signal = Some(directory.to_str().unwrap().into());
+    let read = format!("SELECT post_title FROM `{table}` WHERE ID=1");
+    let write = format!("UPDATE `{table}` SET post_title=post_title WHERE ID=1");
+    let mut a = Client::new(cfg.clone()).unwrap();
+    let original = first(a.query(&read).unwrap());
+    assert_eq!(a.connections_opened, 1);
+    a.close();
+    let (b, _) = backend(&cfg).unwrap();
+    let (opened, _) = parked_times(&b).expect("a finished request parks its connection");
+
+    // An ageing connection is replaced without any request asking for it.
+    b.parked.lock().unwrap().as_mut().unwrap().created = Instant::now() - REFRESH_AGE;
+    b.wake.notify_one();
+    assert!(wait_for(
+        || parked_times(&b).is_some_and(|(created, _)| created > opened)
+    ));
+    let mut c = Client::new(cfg.clone()).unwrap();
+    assert_eq!(first(c.query(&read).unwrap()), original);
+    assert_eq!(c.connections_opened, 0, "the request found a connection");
+    c.close();
+
+    // A long-idle connection is verified in the background and keeps its identity.
+    let (replaced, _) = parked_times(&b).unwrap();
+    let stale = Instant::now() - KEEPALIVE_IDLE;
+    b.parked.lock().unwrap().as_mut().unwrap().since = stale;
+    b.wake.notify_one();
+    assert!(wait_for(
+        || parked_times(&b).is_some_and(|(_, since)| since > stale)
+    ));
+    assert_eq!(parked_times(&b).unwrap().0, replaced);
+
+    // After a short idle a read goes straight out; only a write is probed first.
+    let idle = Instant::now() - PROBE_AFTER_IDLE - Duration::from_secs(1);
+    b.parked.lock().unwrap().as_mut().unwrap().since = idle;
+    let mut d = Client::new(cfg.clone()).unwrap();
+    assert_eq!(first(d.query(&read).unwrap()), original);
+    assert_eq!((d.connection_health_checks, d.connections_opened), (0, 0));
+    d.close();
+    b.parked.lock().unwrap().as_mut().unwrap().since = idle;
+    let mut e = Client::new(cfg.clone()).unwrap();
+    e.query(&write).unwrap();
+    assert_eq!((e.connection_health_checks, e.connections_opened), (1, 0));
+
+    // A connection discarded with an open transaction is replaced before the next request.
+    e.query("BEGIN").unwrap();
+    e.query(&write).unwrap();
+    e.close();
+    assert!(wait_for(|| parked_times(&b).is_some()));
+    let mut f = Client::new(cfg).unwrap();
+    assert_eq!(first(f.query(&read).unwrap()), original);
+    assert_eq!(f.connections_opened, 0);
+    f.close();
+    drop(b);
+    reset_worker().unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+#[test]
+#[ignore = "requires the explicitly selected synthetic AWS fixture"]
+fn signalled_worker_reuses_its_catalog_until_the_signal_moves() {
+    let (mut cfg, table) = fixture_config();
+    let directory = signal_directory("live");
+    cfg.schema_signal = Some(directory.to_str().unwrap().into());
+    let read = format!("SELECT post_title FROM `{table}` WHERE ID=1");
+    let mut a = Client::new(cfg.clone()).unwrap();
+    let original = first(a.query(&read).unwrap());
+    a.close();
+
+    // A later request reads no catalog at all: an armed metadata fault is never reached.
+    FAIL_METADATA_AFTER.with(|remaining| remaining.set(Some(0)));
+    let mut b = Client::new(cfg.clone()).unwrap();
+    assert_eq!(first(b.query(&read).unwrap()), original);
+    b.close();
+    assert_eq!(
+        FAIL_METADATA_AFTER.with(|remaining| remaining.get()),
+        Some(0)
+    );
+
+    // Any journal written by a schema coordinator moves the signal; the catalog is read again.
+    std::thread::sleep(Duration::from_millis(30));
+    std::fs::write(directory.join("last-operation.json"), b"{}").unwrap();
+    let mut c = Client::new(cfg.clone()).unwrap();
+    assert!(c.query(&read).err().unwrap().contains("transport"));
+    assert_eq!(FAIL_METADATA_AFTER.with(|remaining| remaining.get()), None);
+    assert_eq!(first(c.query(&read).unwrap()), original);
+
+    // A signal that moved moments ago is not relied on; once settled it is again.
+    assert!(c.backend_catalog().unwrap().is_none());
+    c.close();
+    settle_signal(&directory);
+
+    // An error that looks like schema drift also ends the trust in the retained copy.
+    let mut d = Client::new(cfg.clone()).unwrap();
+    assert!(d.backend_catalog().unwrap().is_none());
+    assert_eq!(first(d.query(&read).unwrap()), original);
+    assert!(d.backend_catalog().unwrap().is_some());
+    let missing = format!("SELECT 1 FROM `{}absent`", cfg.prefix);
+    assert!(d.query(&missing).err().unwrap().contains("42P01"));
+    assert!(d.backend_catalog().unwrap().is_none());
+    d.close();
+    reset_worker().unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
 }

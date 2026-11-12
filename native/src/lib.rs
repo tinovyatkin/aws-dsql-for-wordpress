@@ -49,6 +49,7 @@ mod php {
             value_codec: Option<bool>,
             sql_mode: Option<String>,
             cache_enabled: Option<bool>,
+            schema_signal: Option<String>,
         ) -> PhpResult<Self> {
             Ok(Self {
                 client: Client::new(Config {
@@ -63,6 +64,7 @@ mod php {
                     value_codec: value_codec.unwrap_or(false),
                     sql_mode: sql_mode.unwrap_or_default(),
                     cache_enabled: cache_enabled.unwrap_or(true),
+                    schema_signal,
                 })
                 .map_err(error)?,
             })
