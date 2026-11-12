@@ -8,6 +8,14 @@ final class DSQL_Schema_Catalog {
     private array $cache=[];
     private ?bool $present=null;
     public function __construct(private PDO $pdo) {}
+    /**
+     * Native workers keep their validated catalog between requests and watch the schema
+     * state directory's modification time. Every publication moves it, including the
+     * controlled-upgrade path, which keeps its journals elsewhere.
+     */
+    private static function signal(): void {
+        if(defined('DSQL_SCHEMA_STATE_DIRECTORY')&&is_dir(DSQL_SCHEMA_STATE_DIRECTORY))@touch(DSQL_SCHEMA_STATE_DIRECTORY);
+    }
     public function create(bool $managed=true): void {
         $this->pdo->exec('CREATE TABLE "'.self::TABLE.'" (table_name text PRIMARY KEY, metadata text NOT NULL, fingerprint text NOT NULL)');
         $s=$this->pdo->prepare('INSERT INTO "'.self::TABLE.'" (table_name,metadata,fingerprint) VALUES (?,?,?)');
@@ -28,7 +36,7 @@ final class DSQL_Schema_Catalog {
     public function put(array $table): void {
         $metadata=$this->metadata($table);
         $s=$this->pdo->prepare('INSERT INTO "'.self::TABLE.'" (table_name,metadata,fingerprint) VALUES (?,?,?)');
-        $s->execute([$table['name'],json_encode($metadata,JSON_THROW_ON_ERROR),$this->fingerprint($table['name'],$table['target_schema']??'public')]);unset($this->cache[$table['name']]);
+        $s->execute([$table['name'],json_encode($metadata,JSON_THROW_ON_ERROR),$this->fingerprint($table['name'],$table['target_schema']??'public')]);unset($this->cache[$table['name']]);self::signal();
     }
     public function raw(string $table): ?array {
         if(!$this->exists())return null;
@@ -48,10 +56,10 @@ final class DSQL_Schema_Catalog {
         $this->pdo->beginTransaction();
         try{$this->remove($previous);$this->put($table);$this->pdo->commit();}
         catch(Throwable $error){if($this->pdo->inTransaction())$this->pdo->rollBack();throw $error;}
-        $this->clear();
+        $this->clear();self::signal();
     }
     public function remove(string $table): void {
-        $s=$this->pdo->prepare('DELETE FROM "'.self::TABLE.'" WHERE table_name=?');$s->execute([$table]);unset($this->cache[$table]);
+        $s=$this->pdo->prepare('DELETE FROM "'.self::TABLE.'" WHERE table_name=?');$s->execute([$table]);unset($this->cache[$table]);self::signal();
     }
     public function clear(): void {$this->cache=[];$this->present=null;}
     public function exists(): bool {
@@ -88,7 +96,7 @@ final class DSQL_Schema_Catalog {
         $metadata=$this->metadata($table);
         $s=$this->pdo->prepare('UPDATE "'.self::TABLE.'" SET metadata=?,fingerprint=? WHERE table_name=? AND metadata=? AND fingerprint=?');
         $s->execute([json_encode($metadata,JSON_THROW_ON_ERROR),$this->fingerprint($table['name'],$table['target_schema']??'public'),$table['name'],$raw['metadata'],'pending']);
-        if($s->rowCount()!==1)throw new RuntimeException('Installation catalog changed concurrently');$this->clear();
+        if($s->rowCount()!==1)throw new RuntimeException('Installation catalog changed concurrently');$this->clear();self::signal();
     }
     /** Explicit controlled-session migration; legacy JSON is journaled before each conditional update. */
     public function migrate(string $journalDirectory,?Closure $afterWrite=null): int {
@@ -107,6 +115,6 @@ final class DSQL_Schema_Catalog {
         if(!$this->raw(self::CONTROL)){
             $s=$this->pdo->prepare('INSERT INTO "'.self::TABLE.'" (table_name,metadata,fingerprint) VALUES (?,?,?)');$s->execute([self::CONTROL,json_encode(['schema_version'=>2,'managed'=>true],JSON_THROW_ON_ERROR),'control']);
         }
-        $this->clear();return $count;
+        $this->clear();self::signal();return $count;
     }
 }

@@ -62,19 +62,46 @@ for the first time after a fork.
 ## Connections, errors and cache lifetime
 
 The Tokio runtime starts lazily in each FPM worker, after the master forks. Each
-worker supports up to eight distinct configurations and two physical connections
-per configuration. A logical client holds its own connection; transactions are
-never multiplexed between clients. Idle connections expire after 15 minutes and
-connections retire after 55 minutes, between operations. The AWS connector
-refreshes signed authentication tokens; an explicit credential file is reread
-when credentials are requested, including after atomic rotation.
+worker supports up to eight distinct configurations. A worker runs one request
+at a time, so it keeps one connection per configuration and hands it from one
+request to the next; a second simultaneous client opens its own, and a third is
+refused. A logical client holds its own connection; transactions are never
+multiplexed between clients. An IAM token is signed for each new connection; an
+explicit credential file is reread when credentials are requested, including
+after atomic rotation.
+
+DSQL ends every connection after one hour. The runtime thread stays alive between
+requests and replaces the kept connection once it is 50 minutes old, verifies it
+after four idle minutes, and opens a new one after a discard, so the TLS and
+authentication handshake rarely falls inside a request. No connection is used
+beyond 55 minutes. A connection that sat unused for more than five seconds is not
+pinged before a read outside a transaction: if it has gone away, the read is
+replayed once on a new connection. Any other first statement is preceded by a
+liveness check, because it cannot be replayed safely.
 
 Native 256-entry LRU caches retain compiled plans, without literal values or
-query results. SQLx retains up to 32 prepared statements per connection. The
-native parser still runs for each query; a plan-cache hit skips SQL compilation.
-The WordPress `prepare()` capture records bounded hashes, not SQL strings.
+query results. SQLx retains up to 256 prepared statements per connection; beyond
+that it closes one statement for every new one. A statement is described only
+after it has run, from SQLx's cache: describing it first makes SQLx look up the
+origin of every result column in `pg_catalog`, about 2 ms per column on DSQL.
+The native parser still runs for each query; a plan-cache hit skips SQL
+compilation. The WordPress `prepare()` capture records bounded hashes, not SQL
+strings.
+
+Physical table metadata is read in two catalog statements: every table and valid
+index of the schema, then columns by relation. A schema of up to 32 tables is
+read whole, once per worker and schema generation; a larger one is read only for
+the tables a statement needs.
+
 Logical catalog generations invalidate compiled, metadata and prepared-statement
-caches. Restart workers after controlled schema maintenance to establish a clean
+caches. With [automatic schema handling](../docs/automatic-schema.md) the bridge
+passes the schema state directory to the engine, and a worker then keeps its
+validated catalog between requests. It reads the catalog again when the
+directory's modification time moves (every schema operation journals there, and
+every PHP catalog publication touches it), after a missing-relation,
+missing-column or changed-result-type error, and in any case after 15 minutes.
+Without that directory each request reads the catalog generation, as before.
+Restart workers after controlled schema maintenance to establish a clean
 boundary for already-running requests.
 
 Only known aborted concurrency conflicts are retried outside caller-owned
@@ -148,4 +175,4 @@ WPDSQL_NATIVE_TESTS=synthetic cargo test --no-default-features --lib \
 They reject a missing or differently tagged local fixture. Never point these
 write tests at production. See [the release gate](production-readiness.md) for
 validation and rollout requirements. `dsql_native_reset_worker()` is a test
-isolation helper; it refuses to reset pools owned by live clients.
+isolation helper; it refuses to reset a worker that still has live clients.

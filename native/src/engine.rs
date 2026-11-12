@@ -1,17 +1,44 @@
 use crate::compiler::{self, Column, Plan, Result, Schema};
-use aurora_dsql_sqlx_connector::{DsqlConnectOptionsBuilder, Region, pool};
+use aurora_dsql_sqlx_connector::{DsqlConnectOptions, DsqlConnectOptionsBuilder, Region};
 use lru::LruCache;
 use sqlx::{
-    Column as _, Row, TypeInfo, ValueRef,
-    postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow},
+    Column as _, Connection as _, Row, TypeInfo, ValueRef,
+    postgres::{PgConnectOptions, PgConnection, PgRow},
 };
 use std::{
     collections::{BTreeMap, HashMap},
     num::NonZeroUsize,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::Notify};
+
+/// Prepared statements kept per connection, the same bound as the compiled-plan cache.
+/// Past it SQLx closes one statement for every new one, a third round trip per query.
+const STATEMENT_CACHE: usize = 256;
+/// DSQL ends every connection after one hour; none is used beyond this age.
+const MAX_LIFETIME: Duration = Duration::from_secs(3300);
+/// From this age the worker's parked connection is replaced between requests.
+const REFRESH_AGE: Duration = Duration::from_secs(3000);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// A parked connection unused for this long is verified between requests.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(240);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A connection that has not answered since it was parked gets this long to start
+/// answering a replayable read; past it the read is replayed on a new connection.
+const UNPROVEN_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Closing is a courtesy to the server; a dead socket must not hold up the worker.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A connection parked longer than this may have been dropped by the network.
+const PROBE_AFTER_IDLE: Duration = Duration::from_secs(5);
+/// Simultaneous clients of one worker configuration, each on its own connection.
+const MAX_LEASES: usize = 2;
+/// Up to this many tables a schema's physical metadata is read whole, once per generation.
+const WHOLE_SCHEMA_TABLES: usize = 32;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Config {
@@ -26,6 +53,10 @@ pub struct Config {
     pub value_codec: bool,
     pub sql_mode: String,
     pub cache_enabled: bool,
+    /// Directory whose modification time changes with every coordinated schema operation.
+    /// With it a worker keeps its validated catalog across requests; without it each
+    /// request reads the catalog generation from the database.
+    pub schema_signal: Option<String>,
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
@@ -43,14 +74,44 @@ impl Config {
         Ok(())
     }
 }
+/// The worker's connection while no client holds it.
+struct Parked {
+    connection: PgConnection,
+    created: Instant,
+    since: Instant,
+    /// Schema generation its prepared statements belong to; `None` when it has none yet.
+    epoch: Option<String>,
+}
+/// Ends a connection without letting an unresponsive peer delay the caller.
+async fn close_quietly(connection: PgConnection) {
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, connection.close()).await;
+}
+/// A deadline for blocking calls. Being async, the timer is created when `block_on` polls
+/// it, inside the runtime: `tokio::time::timeout` built outside runtime context panics,
+/// and PHP metadata entry points do not otherwise enter it.
+async fn within<F: std::future::Future>(
+    limit: Duration,
+    future: F,
+) -> std::result::Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout(limit, future).await
+}
+fn timed_out() -> sqlx::Error {
+    sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))
+}
 pub(crate) struct Backend {
-    pool: PgPool,
+    options: DsqlConnectOptions,
+    search_path: String,
+    /// A PHP worker runs one request at a time, so one retained connection serves it.
+    /// Holding it here, not in a pool, makes the hand-over synchronous and its age known.
+    parked: Mutex<Option<Parked>>,
     plans: Mutex<LruCache<String, Plan>>,
     generation: Mutex<Option<String>>,
     schema: Mutex<Schema>,
-    leases: std::sync::atomic::AtomicUsize,
-    opened: Arc<std::sync::atomic::AtomicU64>,
-    health_checks: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) catalog: Mutex<Option<crate::catalog::SharedCatalog>>,
+    clients: AtomicUsize,
+    leases: AtomicUsize,
+    wake: Arc<Notify>,
+    refresher: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 static RUNTIME: OnceLock<Mutex<Option<Arc<Runtime>>>> = OnceLock::new();
 static BACKENDS: OnceLock<Mutex<HashMap<Config, Arc<Backend>>>> = OnceLock::new();
@@ -134,7 +195,7 @@ fn backend(config: &Config) -> Result<(Arc<Backend>, bool)> {
         .host(&config.host)
         .username(&config.user)
         .database("postgres")
-        .statement_cache_capacity(32);
+        .statement_cache_capacity(STATEMENT_CACHE);
     let mut builder = DsqlConnectOptionsBuilder::default();
     builder
         .pg_connect_options(pg)
@@ -151,61 +212,115 @@ fn backend(config: &Config) -> Result<(Arc<Backend>, bool)> {
         ));
     }
     let options = builder.build().map_err(|_| "Invalid DSQL options")?;
-    let schema = config.schema.clone();
-    let opened = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let health_checks = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let on_open = opened.clone();
-    let on_health = health_checks.clone();
-    let opts = PgPoolOptions::new()
-        .max_connections(2)
-        .test_before_acquire(false)
-        .min_connections(0)
-        .before_acquire(move |connection, metadata| {
-            let on_health = on_health.clone();
-            Box::pin(async move {
-                if metadata.idle_for > Duration::from_secs(5) {
-                    use sqlx::Connection;
-                    on_health.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    connection.ping().await?;
-                }
-                Ok(true)
-            })
-        })
-        .acquire_timeout(Duration::from_secs(15))
-        .idle_timeout(Duration::from_secs(900))
-        .max_lifetime(Duration::from_secs(3300))
-        .after_connect(move |conn, _| {
-            let on_open = on_open.clone();
-            let sql = format!("SET search_path TO {}, pg_catalog", compiler::qi(&schema));
-            Box::pin(async move {
-                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-                    .execute(conn)
-                    .await?;
-                on_open.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            })
-        });
-    let p = runtime()
-        .block_on(pool::connect_with(&options, opts))
-        .map_err(|e| match e {
-            aurora_dsql_sqlx_connector::DsqlError::ConnectionError(e)
-            | aurora_dsql_sqlx_connector::DsqlError::DatabaseError(e) => db_error(e),
-            aurora_dsql_sqlx_connector::DsqlError::TokenError(_) => {
-                "DSQL credential resolution or signing failed".into()
-            }
-            _ => "DSQL connection configuration failed".into(),
-        })?;
+    let wake = Arc::new(Notify::new());
     let b = Arc::new(Backend {
-        pool: p,
+        options,
+        search_path: format!(
+            "SET search_path TO {}, pg_catalog",
+            compiler::qi(&config.schema)
+        ),
+        parked: Mutex::new(None),
         plans: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
         generation: Mutex::new(None),
         schema: Mutex::new(Schema::new()),
-        leases: std::sync::atomic::AtomicUsize::new(0),
-        opened,
-        health_checks,
+        catalog: Mutex::new(None),
+        clients: AtomicUsize::new(0),
+        leases: AtomicUsize::new(0),
+        wake: wake.clone(),
+        refresher: Mutex::new(None),
     });
+    let task = runtime().spawn(keep_connection_fresh(Arc::downgrade(&b), wake));
+    *b.refresher.lock().map_err(|_| "Pool registry poisoned")? = Some(task);
     all.insert(config.clone(), b.clone());
     Ok((b, false))
+}
+/// One authenticated connection on the application search path. The IAM token is signed
+/// for each connection, so no refresh task has to outlive a request.
+async fn open(options: &DsqlConnectOptions, search_path: &str) -> Result<PgConnection> {
+    use aurora_dsql_sqlx_connector::DsqlError;
+    let attempt = async {
+        let mut connection = aurora_dsql_sqlx_connector::connection::connect_with(options)
+            .await
+            .map_err(|e| match e {
+                DsqlError::ConnectionError(e) | DsqlError::DatabaseError(e) => db_error(e),
+                DsqlError::TokenError(_) => {
+                    String::from("DSQL credential resolution or signing failed")
+                }
+                _ => "DSQL connection configuration failed".into(),
+            })?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(search_path))
+            .execute(&mut connection)
+            .await
+            .map_err(db_error)?;
+        Ok(connection)
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, attempt)
+        .await
+        .unwrap_or_else(|_| Err("DSQL connection transport failed".into()))
+}
+/// Runs on the worker's runtime thread, which stays alive between PHP requests. It replaces
+/// the parked connection before DSQL's one-hour limit and opens one after a discard, so the
+/// TLS and authentication handshake rarely falls inside a request.
+async fn keep_connection_fresh(backend: Weak<Backend>, wake: Arc<Notify>) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(REFRESH_INTERVAL) => {}
+            _ = wake.notified() => {}
+        }
+        let Some(b) = backend.upgrade() else { return };
+        // Decide under the lock, act outside it: the lock is never held across an await.
+        let (mut replace, idle) = match b.parked.lock() {
+            Ok(mut slot) => match slot.as_ref() {
+                Some(parked) if parked.created.elapsed() >= REFRESH_AGE => (true, None),
+                Some(parked) if parked.since.elapsed() >= KEEPALIVE_IDLE => (false, slot.take()),
+                Some(_) => (false, None),
+                None => (b.leases.load(Ordering::SeqCst) == 0, None),
+            },
+            Err(_) => return,
+        };
+        // A connection nobody has used for a while is checked here, not by a visitor.
+        let mut candidate = None;
+        if let Some(mut parked) = idle {
+            let alive = tokio::time::timeout(PROBE_TIMEOUT, parked.connection.ping()).await;
+            if matches!(alive, Ok(Ok(()))) {
+                parked.since = Instant::now();
+                // It keeps its epoch: a generation change while it was out is detected
+                // when a request next takes it.
+                candidate = Some(parked);
+            } else {
+                close_quietly(parked.connection).await;
+                replace = true;
+            }
+        }
+        // While a replacement connects, an ageing connection stays available to requests.
+        if replace && let Ok(connection) = open(&b.options, &b.search_path).await {
+            candidate = Some(Parked {
+                connection,
+                created: Instant::now(),
+                since: Instant::now(),
+                epoch: None,
+            });
+        }
+        let Some(candidate) = candidate else { continue };
+        let retired = match b.parked.lock() {
+            Ok(mut slot) => match slot.take() {
+                // A request parked a usable connection in the meantime; keep that one.
+                Some(current) if current.created.elapsed() < REFRESH_AGE => {
+                    *slot = Some(current);
+                    Some(candidate.connection)
+                }
+                old => {
+                    *slot = Some(candidate);
+                    old.map(|parked| parked.connection)
+                }
+            },
+            Err(_) => Some(candidate.connection),
+        };
+        drop(b);
+        if let Some(connection) = retired {
+            close_quietly(connection).await;
+        }
+    }
 }
 #[derive(Default, Clone)]
 pub struct Output {
@@ -250,8 +365,11 @@ pub struct Client {
     backend: Option<Arc<Backend>>,
     pub(crate) metadata: Schema,
     pub(crate) catalog: Option<crate::catalog::Catalog>,
-    connection: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
-    acquired: Instant,
+    connection: Option<PgConnection>,
+    /// When the held connection was opened, by whichever client or task opened it.
+    created: Instant,
+    /// The held connection sat parked long enough that it may no longer be alive.
+    probe: bool,
     epoch: Option<String>,
     transaction: bool,
     closed: bool,
@@ -281,7 +399,8 @@ impl Client {
             metadata: Schema::new(),
             catalog: None,
             connection: None,
-            acquired: Instant::now(),
+            created: Instant::now(),
+            probe: false,
             epoch: None,
             transaction: false,
             closed: false,
@@ -399,59 +518,116 @@ impl Client {
         let mut reused = true;
         if self.backend.is_none() {
             let (b, r) = backend(&self.config)?;
-            if !r {
-                self.connections_opened += b.opened.load(std::sync::atomic::Ordering::Relaxed);
-            }
+            b.clients.fetch_add(1, Ordering::SeqCst);
             self.backend = Some(b);
             reused = r;
         }
-        if self.connection.is_some()
-            && !self.transaction
-            && self.acquired.elapsed() >= Duration::from_secs(3300)
+        if self.connection.is_some() && !self.transaction && self.created.elapsed() >= MAX_LIFETIME
         {
             self.discard_connection();
             self.metadata.clear();
         }
         if self.connection.is_none() {
-            let b = self.backend.as_ref().unwrap();
-            let opened = b.opened.load(std::sync::atomic::Ordering::Relaxed);
-            let checks = b.health_checks.load(std::sync::atomic::Ordering::Relaxed);
+            let b = self.backend.as_ref().unwrap().clone();
+            if b.leases.fetch_add(1, Ordering::SeqCst) >= MAX_LEASES {
+                b.leases.fetch_sub(1, Ordering::SeqCst);
+                return Err("Native worker connection limit reached".into());
+            }
             let start = Instant::now();
-            let acquired = rt.block_on(b.pool.acquire());
-            self.connections_opened += b
-                .opened
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(opened);
-            self.connection_health_checks += b
-                .health_checks
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(checks);
+            let held = self.take_connection(&b, &rt);
             self.connection_acquire_ms += start.elapsed().as_secs_f64() * 1000.;
             self.connection_acquisitions += 1;
-            self.connection = Some(acquired.map_err(db_error)?);
-            self.backend
-                .as_ref()
-                .unwrap()
-                .leases
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.epoch = self
-                .backend
-                .as_ref()
-                .unwrap()
-                .generation
-                .lock()
-                .map_err(|_| "Schema generation lock failed")?
-                .clone();
-            self.acquired = Instant::now();
+            let (connection, created, probe, epoch) = held.inspect_err(|_| {
+                b.leases.fetch_sub(1, Ordering::SeqCst);
+            })?;
+            self.connection = Some(connection);
+            self.created = created;
+            self.probe = probe;
+            self.epoch = epoch;
         }
         Ok(reused)
+    }
+    /// The worker's parked connection if it is still usable, otherwise a new one. A parked
+    /// connection prepared statements under an older schema generation (the background
+    /// keep-alive may have held it while a request detected the change); those are cleared
+    /// here, so its epoch is never simply relabelled as current.
+    #[allow(clippy::type_complexity)]
+    fn take_connection(
+        &mut self,
+        b: &Arc<Backend>,
+        rt: &Runtime,
+    ) -> Result<(PgConnection, Instant, bool, Option<String>)> {
+        let current = b
+            .generation
+            .lock()
+            .map_err(|_| "Schema generation lock failed")?
+            .clone();
+        let parked = b
+            .parked
+            .lock()
+            .map_err(|_| "Connection slot lock failed")?
+            .take();
+        match parked {
+            Some(mut parked) if parked.created.elapsed() < MAX_LIFETIME => {
+                if parked.epoch.is_none() || parked.epoch == current {
+                    return Ok((
+                        parked.connection,
+                        parked.created,
+                        parked.since.elapsed() > PROBE_AFTER_IDLE,
+                        current,
+                    ));
+                }
+                let cleared = rt.block_on(within(
+                    PROBE_TIMEOUT,
+                    parked.connection.clear_cached_statements(),
+                ));
+                if matches!(cleared, Ok(Ok(()))) {
+                    // The exchange also proved the connection alive.
+                    return Ok((parked.connection, parked.created, false, current));
+                }
+                rt.block_on(close_quietly(parked.connection));
+            }
+            Some(expired) => rt.block_on(close_quietly(expired.connection)),
+            None => {}
+        }
+        self.connections_opened += 1;
+        rt.block_on(open(&b.options, &b.search_path))
+            .map(|connection| (connection, Instant::now(), false, current))
+    }
+    /// A read outside a transaction is simply replayed on a new connection if the parked
+    /// one turns out to be dead. Anything else cannot be replayed, so it is probed first.
+    fn settle(&mut self, replayable: bool) -> Result<()> {
+        if !self.probe || replayable || self.connection.is_none() {
+            return Ok(());
+        }
+        self.probe = false;
+        let start = Instant::now();
+        self.connection_health_checks += 1;
+        // Bounded: a connection that stopped answering without closing must not hold
+        // the worker. It is then discarded and replaced.
+        let alive = matches!(
+            runtime().block_on(within(
+                PROBE_TIMEOUT,
+                self.connection.as_mut().unwrap().ping()
+            )),
+            Ok(Ok(()))
+        );
+        let result = if alive {
+            Ok(())
+        } else {
+            self.discard_connection();
+            self.check_connection_inner().map(|_| ())
+        };
+        self.connection_check_ms += start.elapsed().as_secs_f64() * 1000.;
+        result
     }
     fn discard_connection(&mut self) {
         if let Some(c) = self.connection.take() {
             if let Some(b) = &self.backend {
-                b.leases.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                b.leases.fetch_sub(1, Ordering::SeqCst);
             }
-            runtime().block_on(c.close()).ok();
+            self.probe = false;
+            runtime().block_on(close_quietly(c));
         }
     }
     pub fn query(&mut self, sql: &str) -> Result<Output> {
@@ -475,6 +651,11 @@ impl Client {
                     .and_then(|s| s.split(')').next())
                     .filter(|s| s.len() == 5 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
                 {
+                    // A missing relation or column, a changed result type: the schema may
+                    // have moved under the worker's retained catalog. Read it again next time.
+                    if ["42P01", "42703", "42804", "0A000"].contains(&code) {
+                        self.forget_shared_catalog();
+                    }
                     self.error.sqlstate = Some(code.into());
                     self.error.database = true;
                 }
@@ -595,8 +776,10 @@ impl Client {
                 self.queries += 1;
                 return Ok(Output::command(command));
             }
+            self.settle(false)?;
+            // The simple protocol needs no prepared statement: one round trip, always.
             let result =
-                rt.block_on(sqlx::query(command).execute(&mut **self.connection.as_mut().unwrap()));
+                rt.block_on(sqlx::raw_sql(command).execute(self.connection.as_mut().unwrap()));
             self.queries += 1;
             if command == "BEGIN" {
                 result.map_err(db_error)?;
@@ -636,7 +819,10 @@ impl Client {
             _ => "SHOW",
         }
         .into();
+        // Catalog validation is metadata work too; report it with the table lookups.
+        let timer = Instant::now();
         self.ensure_catalog()?;
+        stats.insert("metadata_ms".into(), timer.elapsed().as_secs_f64() * 1000.);
         if crate::ddl::is_ddl(&shape.statement) {
             self.error.stage = "schema".into();
         }
@@ -694,8 +880,9 @@ impl Client {
                 }
             }
             if !missing.is_empty() {
+                self.settle(false)?;
                 let result = rt.block_on(load_tables(
-                    &mut *self.connection.as_mut().unwrap(),
+                    self.connection.as_mut().unwrap(),
                     &self.config.schema,
                     &missing,
                 ));
@@ -704,15 +891,16 @@ impl Client {
                 if missing.iter().any(|table| !loaded.contains_key(table)) {
                     return Err("DSQL operation failed (42P01); table is missing".into());
                 }
+                stats.insert("metadata_tables_loaded".into(), loaded.len() as f64);
+                stats.insert("metadata_round_trips".into(), 2.);
                 b.schema
                     .lock()
                     .map_err(|_| "Schema cache lock failed")?
                     .extend(loaded.clone());
                 self.metadata.extend(loaded);
-                stats.insert("metadata_tables_loaded".into(), missing.len() as f64);
-                stats.insert("metadata_round_trips".into(), 1.);
             }
-            stats.insert("metadata_ms".into(), timer.elapsed().as_secs_f64() * 1000.);
+            *stats.entry("metadata_ms".into()).or_insert(0.) +=
+                timer.elapsed().as_secs_f64() * 1000.;
             self.error.stage = "translate".into();
             let timer = Instant::now();
             let p = compiler::compile(stmt, &shape, &self.metadata)?;
@@ -752,13 +940,19 @@ impl Client {
             (commands, !plan.leading.is_empty() && !self.transaction)
         };
         self.error.stage = "execute".into();
+        let safe_read = matches!(plan.operation, "SELECT" | "FOUND_ROWS") && !self.transaction;
+        let replayable = safe_read && !owned;
+        self.settle(replayable)?;
         let timer = Instant::now();
         let mut out = loop {
+            // A connection not heard from since it was parked may have gone silent without
+            // closing. Bound a replayable read on it, then replay it on a new connection.
+            let bounded = replayable && self.probe;
             let connection = self.connection.as_mut().unwrap();
             let mut affected = 0;
-            let result = rt.block_on(async {
+            let work = async {
                 if owned {
-                    sqlx::query("BEGIN").execute(&mut **connection).await?;
+                    sqlx::raw_sql("BEGIN").execute(&mut *connection).await?;
                 }
                 let mut last = Output::default();
                 for command in &commands {
@@ -767,28 +961,41 @@ impl Client {
                     last = r;
                 }
                 if owned {
-                    sqlx::query("COMMIT").execute(&mut **connection).await?;
+                    sqlx::raw_sql("COMMIT").execute(&mut *connection).await?;
                 }
                 last.affected = affected;
                 Ok::<_, sqlx::Error>(last)
-            });
+            };
+            let result = if bounded {
+                rt.block_on(within(UNPROVEN_READ_TIMEOUT, work))
+                    .unwrap_or_else(|_| Err(timed_out()))
+            } else {
+                rt.block_on(work)
+            };
             self.queries += commands.len() as u64;
+            // Whatever the outcome, the connection has now been exercised.
+            let unproven = std::mem::take(&mut self.probe);
             match result {
                 Ok(out) => break out,
                 Err(e) => {
                     let conflict = aurora_dsql_sqlx_connector::is_occ_error(&e).is_some();
                     let transport = is_transport(&e);
-                    let safe_read =
-                        matches!(plan.operation, "SELECT" | "FOUND_ROWS") && !self.transaction;
                     if owned
                         && rt
                             .block_on(
-                                sqlx::query("ROLLBACK")
-                                    .execute(&mut **self.connection.as_mut().unwrap()),
+                                sqlx::raw_sql("ROLLBACK")
+                                    .execute(self.connection.as_mut().unwrap()),
                             )
                             .is_err()
                     {
                         self.discard_connection();
+                    }
+                    // The parked connection had gone away: replay on a new one. This stands
+                    // in for the liveness check and is not counted as a retry of the read.
+                    if replayable && transport && unproven {
+                        self.discard_connection();
+                        self.check_connection()?;
+                        continue;
                     }
                     if !self.transaction
                         && ((conflict && self.error.retries < 3)
@@ -865,11 +1072,57 @@ impl Client {
     }
     pub(crate) fn raw(&mut self, sql: String, values: Vec<String>) -> Result<Output> {
         self.check_connection()?;
+        self.settle(false)?;
         let result = runtime().block_on(execute_command(
-            &mut *self.connection.as_mut().unwrap(),
+            self.connection.as_mut().unwrap(),
             &BoundCommand { sql, values },
         ));
         self.metadata_result(result)
+    }
+    /// A catalog read. Outside a transaction it needs no liveness check either: if the
+    /// parked connection has gone away, the read is replayed once on a new one.
+    pub(crate) fn raw_read(&mut self, sql: String, values: Vec<String>) -> Result<Output> {
+        self.check_connection()?;
+        if self.transaction || !std::mem::take(&mut self.probe) {
+            return self.raw(sql, values);
+        }
+        let command = BoundCommand { sql, values };
+        let mut result = runtime()
+            .block_on(within(
+                UNPROVEN_READ_TIMEOUT,
+                execute_command(self.connection.as_mut().unwrap(), &command),
+            ))
+            .unwrap_or_else(|_| Err(timed_out()));
+        if result.as_ref().is_err_and(is_transport) {
+            self.discard_connection();
+            self.check_connection()?;
+            result =
+                runtime().block_on(execute_command(self.connection.as_mut().unwrap(), &command));
+        }
+        self.metadata_result(result)
+    }
+    pub(crate) fn backend_catalog(&self) -> Result<Option<crate::catalog::SharedCatalog>> {
+        match &self.backend {
+            Some(b) => Ok(b
+                .catalog
+                .lock()
+                .map_err(|_| "Catalog cache lock failed")?
+                .clone()),
+            None => Ok(None),
+        }
+    }
+    pub(crate) fn share_catalog(
+        &self,
+        catalog: Option<crate::catalog::SharedCatalog>,
+    ) -> Result<()> {
+        if let Some(b) = &self.backend {
+            *b.catalog.lock().map_err(|_| "Catalog cache lock failed")? = catalog;
+        }
+        Ok(())
+    }
+    /// The next client reads the catalog from the database instead of trusting this worker's copy.
+    pub(crate) fn forget_shared_catalog(&self) {
+        self.share_catalog(None).ok();
     }
     fn metadata_result<T>(&mut self, result: std::result::Result<T, sqlx::Error>) -> Result<T> {
         #[cfg(test)]
@@ -889,6 +1142,7 @@ impl Client {
         self.catalog = None;
         self.metadata.clear();
         self.found = None;
+        self.forget_shared_catalog();
         if let Some(b) = &self.backend {
             b.plans
                 .lock()
@@ -914,7 +1168,6 @@ impl Client {
         }
     }
     pub(crate) fn generation(&mut self, generation: String) -> Result<()> {
-        use sqlx::Connection;
         let b = self
             .backend
             .as_ref()
@@ -941,23 +1194,35 @@ impl Client {
                 .map_err(|_| "Schema cache lock failed")?
                 .clear();
             self.metadata.clear();
-            // Drain each currently idle/returning connection once. Other live clients
-            // detect their stale epoch before reuse, or discard it when they close.
-            let idle = (b.pool.size() as usize)
-                .saturating_sub(b.leases.load(std::sync::atomic::Ordering::SeqCst));
-            runtime().block_on(async {
-                let mut idle_connections = Vec::new();
-                for _ in 0..idle {
-                    idle_connections.push(b.pool.acquire().await.map_err(db_error)?);
+            *b.catalog.lock().map_err(|_| "Catalog cache lock failed")? = None;
+            // The parked connection's prepared statements belong to the old generation.
+            // Other live clients detect their stale epoch before reuse, or when they close.
+            let parked = b
+                .parked
+                .lock()
+                .map_err(|_| "Connection slot lock failed")?
+                .take();
+            if let Some(mut parked) = parked {
+                let cleared = runtime().block_on(within(
+                    PROBE_TIMEOUT,
+                    parked.connection.clear_cached_statements(),
+                ));
+                let surplus = if matches!(cleared, Ok(Ok(()))) {
+                    parked.epoch = Some(generation.clone());
+                    let mut slot = b.parked.lock().map_err(|_| "Connection slot lock failed")?;
+                    if slot.is_none() {
+                        *slot = Some(parked);
+                        None
+                    } else {
+                        Some(parked.connection)
+                    }
+                } else {
+                    Some(parked.connection)
+                };
+                if let Some(connection) = surplus {
+                    runtime().block_on(close_quietly(connection));
                 }
-                for connection in &mut idle_connections {
-                    connection
-                        .clear_cached_statements()
-                        .await
-                        .map_err(db_error)?;
-                }
-                Ok::<(), String>(())
-            })?;
+            }
         }
         if changed || self.epoch.as_ref() != Some(&generation) {
             if self.transaction {
@@ -1009,18 +1274,43 @@ impl Client {
         if self.connection.is_some() {
             let rt = runtime();
             let _scope = rt.enter();
-            if self.transaction || !self.epoch_matches().unwrap_or(false) {
-                self.discard_connection();
-            } else {
-                if self.connection.is_some()
-                    && let Some(b) = &self.backend
-                {
-                    b.leases.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            let reusable = !self.transaction
+                && self.epoch_matches().unwrap_or(false)
+                && self.created.elapsed() < MAX_LIFETIME;
+            if let (true, Some(b)) = (reusable, self.backend.clone())
+                && let Some(connection) = self.connection.take()
+            {
+                b.leases.fetch_sub(1, Ordering::SeqCst);
+                // Park it for the worker's next request. The slot is already taken when a
+                // second client or the background refresh got there first.
+                let surplus = match b.parked.lock() {
+                    Ok(mut slot) if slot.is_none() => {
+                        *slot = Some(Parked {
+                            connection,
+                            created: self.created,
+                            since: Instant::now(),
+                            epoch: self.epoch.clone(),
+                        });
+                        None
+                    }
+                    _ => Some(connection),
+                };
+                if let Some(connection) = surplus {
+                    rt.block_on(close_quietly(connection));
                 }
-                drop(self.connection.take());
+            } else {
+                self.discard_connection();
+            }
+            // Replace an ageing connection, or a discarded one, before the next request.
+            if let Some(b) = &self.backend
+                && (!reusable || self.created.elapsed() >= REFRESH_AGE)
+            {
+                b.wake.notify_one();
             }
         }
-        self.backend = None;
+        if let Some(b) = self.backend.take() {
+            b.clients.fetch_sub(1, Ordering::SeqCst);
+        }
         self.metadata.clear();
         self.found = None;
         self.closed = true;
@@ -1072,9 +1362,34 @@ async fn execute_command(
     c: &mut sqlx::PgConnection,
     command: &BoundCommand,
 ) -> std::result::Result<Output, sqlx::Error> {
-    use sqlx::{Executor, SqlSafeStr, Statement, Type};
-    let types = vec![<String as Type<sqlx::Postgres>>::type_info(); command.values.len()];
+    use futures_util::TryStreamExt;
+    use sqlx::{Either, Executor, SqlSafeStr, Statement, Type};
     // Compiler emits only validated identifiers/operators and bound values.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(command.sql.as_str()));
+    for value in &command.values {
+        query = query.bind(value);
+    }
+    let mut fetched = Vec::new();
+    let mut affected = 0;
+    {
+        let mut results = (&mut *c).fetch_many(query);
+        while let Some(item) = results.try_next().await? {
+            match item {
+                Either::Left(done) => affected += done.rows_affected(),
+                Either::Right(row) => fetched.push(row),
+            }
+        }
+    }
+    // Decode once the whole result has arrived, so a decoding failure leaves nothing unread.
+    let mut rows = Vec::with_capacity(fetched.len());
+    for row in fetched {
+        rows.push(decode(row).map_err(|e| sqlx::Error::Decode(e.into()))?);
+    }
+    // Describe after executing, never before. Execution has put the statement in this
+    // connection's cache, so SQLx answers from memory. Describing first makes SQLx ask
+    // pg_catalog where each result column comes from, about 2 ms per column on DSQL, and
+    // the engine already maps columns itself from the relation OID and attribute number.
+    let types = vec![<String as Type<sqlx::Postgres>>::type_info(); command.values.len()];
     let stmt = c
         .prepare_with(
             sqlx::AssertSqlSafe(command.sql.as_str()).into_sql_str(),
@@ -1113,20 +1428,13 @@ async fn execute_command(
         metadata,
         ..Output::default()
     };
-    let mut query = stmt.query();
-    for value in &command.values {
-        query = query.bind(value);
-    }
-    if out.columns.is_empty() {
-        out.affected = query.execute(c).await?.rows_affected();
+    // A statement with a result reports its row count, as it did when fetched separately.
+    out.affected = if out.columns.is_empty() {
+        affected
     } else {
-        let rows = query.fetch_all(c).await?;
-        out.affected = rows.len() as u64;
-        for row in rows {
-            out.rows
-                .push(decode(row).map_err(|e| sqlx::Error::Decode(e.into()))?);
-        }
-    }
+        rows.len() as u64
+    };
+    out.rows = rows;
     Ok(out)
 }
 fn decode(row: PgRow) -> Result<Vec<Option<Vec<u8>>>> {
@@ -1226,57 +1534,115 @@ pub fn reset_worker() -> Result<()> {
     let _scope = rt.enter();
     if let Some(registry) = BACKENDS.get() {
         let mut backends = registry.lock().map_err(|_| "Pool registry poisoned")?;
-        if backends.values().any(|b| Arc::strong_count(b) != 1) {
+        if backends
+            .values()
+            .any(|b| b.clients.load(Ordering::SeqCst) != 0)
+        {
             return Err("Close all native clients before resetting the worker".into());
         }
         for (_, backend) in backends.drain() {
-            runtime().block_on(backend.pool.close());
+            if let Ok(mut task) = backend.refresher.lock()
+                && let Some(task) = task.take()
+            {
+                task.abort();
+            }
+            let parked = backend.parked.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(parked) = parked {
+                rt.block_on(close_quietly(parked.connection));
+            }
         }
     }
     Ok(())
 }
 
-/// One catalog round trip for all missing relations, including columns and keys.
-/// Only physical metadata enters the existing generation-scoped worker cache.
+/// `detail` is an index's key-column count followed by all of its attribute numbers.
+/// DSQL lists included columns after the keys, and an expression (attribute 0) names no column.
+fn key_columns(detail: &str, columns: &[Column]) -> Vec<String> {
+    let mut parts = detail.split(' ');
+    let count: usize = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    parts
+        .take(count)
+        .filter_map(|n| {
+            let ordinal: i16 = n.parse().ok()?;
+            let column = columns.iter().find(|column| column.ordinal == ordinal)?;
+            Some(column.name.clone())
+        })
+        .collect()
+}
+/// Physical metadata for the tables a statement needs, in two cheap catalog statements.
+///
+/// The first lists every table of the schema and every valid index: two small scans. The
+/// second reads columns by relation, about 2 ms per table on DSQL however it is phrased.
+/// A schema of ordinary size is therefore read whole, so a worker asks once per schema
+/// generation instead of once per first-touched table; a very large one is read only for
+/// the requested tables. Joining these catalogs in one statement costs DSQL far more.
 async fn load_tables(
     c: &mut sqlx::PgConnection,
     schema: &str,
     tables: &[String],
 ) -> std::result::Result<Schema, sqlx::Error> {
-    if tables.is_empty() {
-        return Ok(Schema::new());
-    }
-    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT 'column'::text AS kind,t.relname::text AS table_name,t.oid::text AS relation_id,         a.attname::text AS name,a.attnum::integer AS ordinal,a.atttypid::regtype::text AS ty,         (a.attidentity<>'') AS identity,NOT a.attnotnull AS nullable,         NULL::text AS index_id,false AS is_primary,false AS is_unique          FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class t ON t.oid=a.attrelid          JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=",
-    );
-    q.push_bind(schema).push(" AND t.relname IN (");
-    for (i, table) in tables.iter().enumerate() {
-        if i > 0 {
-            q.push(",");
-        }
-        q.push_bind(table);
-    }
-    q.push(") AND a.attnum>0 AND NOT a.attisdropped UNION ALL         SELECT 'index'::text,t.relname::text,t.oid::text,a.attname::text,k.ordinality::integer,        NULL::text,false,false,i.indexrelid::text,i.indisprimary,i.indisunique         FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class t ON t.oid=i.indrelid         JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace         CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum,ordinality)         JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.attnum         WHERE n.nspname=");
-    q.push_bind(schema).push(" AND t.relname IN (");
-    for (i, table) in tables.iter().enumerate() {
-        if i > 0 {
-            q.push(",");
-        }
-        q.push_bind(table);
-    }
-    q.push(") AND i.indisvalid AND k.ordinality<=i.indnkeyatts         ORDER BY table_name,kind,index_id,ordinal");
-    let rows = q.build().fetch_all(c).await?;
+    use sqlx::postgres::types::Oid;
     let mut result = Schema::new();
-    let mut keys: BTreeMap<String, BTreeMap<String, compiler::Index>> = BTreeMap::new();
+    if tables.is_empty() {
+        return Ok(result);
+    }
+    let rows = sqlx::query(
+        "SELECT 'table'::text AS kind,c.oid AS relation,c.relname::text AS name,\
+         NULL::text AS detail,false AS is_primary,false AS is_unique \
+         FROM pg_catalog.pg_class c \
+         WHERE c.relnamespace=(SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname=$1) \
+         AND c.relkind='r' \
+         UNION ALL SELECT 'index'::text,i.indrelid,i.indexrelid::text,\
+         i.indnkeyatts::text||' '||i.indkey::text,i.indisprimary,i.indisunique \
+         FROM pg_catalog.pg_index i WHERE i.indisvalid",
+    )
+    .bind(schema)
+    .fetch_all(&mut *c)
+    .await?;
+    let mut names: BTreeMap<u32, String> = BTreeMap::new();
+    let mut indexes = Vec::new();
     for row in rows {
-        let table: String = row.try_get("table_name")?;
-        let entry = result.entry(table.clone()).or_default();
-        entry.oid = row
-            .try_get::<String, _>("relation_id")?
-            .parse()
-            .unwrap_or(0);
-        if row.try_get::<String, _>("kind")? == "column" {
-            entry.columns.push(Column {
+        let relation = row.try_get::<Oid, _>("relation")?.0;
+        if row.try_get::<String, _>("kind")? == "table" {
+            names.insert(relation, row.try_get("name")?);
+        } else {
+            indexes.push((
+                relation,
+                row.try_get::<String, _>("name")?,
+                row.try_get::<String, _>("detail")?,
+                row.try_get::<bool, _>("is_primary")?,
+                row.try_get::<bool, _>("is_unique")?,
+            ));
+        }
+    }
+    // An absent relation is the caller's 42P01: read no columns and publish nothing.
+    if tables
+        .iter()
+        .any(|table| !names.values().any(|name| name == table))
+    {
+        return Ok(result);
+    }
+    let whole = names.len() <= WHOLE_SCHEMA_TABLES;
+    let wanted: Vec<Oid> = names
+        .iter()
+        .filter(|(_, name)| whole || tables.contains(name))
+        .map(|(oid, _)| Oid(*oid))
+        .collect();
+    let rows = sqlx::query(
+        "SELECT a.attrelid AS relation,a.attname::text AS name,a.attnum::integer AS ordinal,\
+         a.atttypid::regtype::text AS ty,(a.attidentity<>'') AS identity,\
+         NOT a.attnotnull AS nullable FROM pg_catalog.pg_attribute a \
+         WHERE a.attrelid=ANY($1) AND a.attnum>0 AND NOT a.attisdropped",
+    )
+    .bind(wanted)
+    .fetch_all(&mut *c)
+    .await?;
+    let mut columns: BTreeMap<u32, Vec<Column>> = BTreeMap::new();
+    for row in rows {
+        columns
+            .entry(row.try_get::<Oid, _>("relation")?.0)
+            .or_default()
+            .push(Column {
                 name: row.try_get("name")?,
                 ty: row.try_get("ty")?,
                 identity: row.try_get("identity")?,
@@ -1284,20 +1650,39 @@ async fn load_tables(
                 default: None,
                 ordinal: row.try_get::<i32, _>("ordinal")? as i16,
             });
-        } else {
-            let id: String = row.try_get("index_id")?;
-            let key = keys.entry(table).or_default().entry(id).or_default();
-            key.primary = row.try_get("is_primary")?;
-            key.unique = row.try_get("is_unique")?;
-            key.columns.push(row.try_get("name")?);
-        }
     }
-    for (table, table_keys) in keys {
-        if let Some(entry) = result.get_mut(&table) {
-            entry.keys = table_keys.into_values().collect();
+    for (oid, mut columns) in columns {
+        let Some(name) = names.get(&oid) else {
+            continue;
+        };
+        columns.sort_by_key(|column| column.ordinal);
+        // Keys keep index-identifier order, as the former joined statement returned them.
+        let mut keys: BTreeMap<&str, compiler::Index> = BTreeMap::new();
+        for (table, index, detail, primary, unique) in &indexes {
+            if *table != oid {
+                continue;
+            }
+            let members = key_columns(detail, &columns);
+            if !members.is_empty() {
+                keys.insert(
+                    index.as_str(),
+                    compiler::Index {
+                        columns: members,
+                        primary: *primary,
+                        unique: *unique,
+                    },
+                );
+            }
         }
+        result.insert(
+            name.clone(),
+            compiler::Table {
+                columns,
+                keys: keys.into_values().collect(),
+                oid,
+            },
+        );
     }
-    result.retain(|_, table| !table.columns.is_empty());
     Ok(result)
 }
 

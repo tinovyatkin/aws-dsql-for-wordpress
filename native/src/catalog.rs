@@ -6,13 +6,60 @@ use crate::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant, SystemTime},
+};
 #[derive(Default)]
 pub struct Catalog {
     pub present: bool,
     pub managed: bool,
     pub pending: Vec<String>,
     pub models: BTreeMap<String, Option<Value>>,
+}
+/// Even with an unchanged signal, the worker reads the catalog again after this long.
+const SHARED_CATALOG_TTL: Duration = Duration::from_secs(900);
+/// The catalog a worker validated against the database, kept between its requests.
+#[derive(Clone)]
+pub(crate) struct SharedCatalog {
+    generation: String,
+    present: bool,
+    managed: bool,
+    pending: Vec<String>,
+    checked: Instant,
+    signal: SystemTime,
+}
+impl SharedCatalog {
+    #[cfg(test)]
+    pub(crate) fn validated(generation: String, signal: SystemTime) -> Self {
+        Self {
+            generation,
+            present: true,
+            managed: true,
+            pending: vec![],
+            checked: Instant::now(),
+            signal,
+        }
+    }
+    /// Trusted only while the cross-process signal is exactly as it was before the read.
+    pub(crate) fn current(&self, signal: Option<SystemTime>) -> bool {
+        signal == Some(self.signal) && self.checked.elapsed() < SHARED_CATALOG_TTL
+    }
+}
+/// The schema coordinator journals every operation by creating and renaming files in its
+/// state directory, so the directory's modification time moves with every schema change
+/// made by any process on the host. Reading it costs microseconds; `None` means there is
+/// no usable signal and the catalog must be read from the database.
+pub(crate) fn schema_signal(directory: Option<&str>) -> Option<SystemTime> {
+    std::fs::metadata(directory?).ok()?.modified().ok()
+}
+/// Some filesystems record modification times to the second. A change inside the same
+/// second as this signal would leave it unchanged, so a signal this recent proves nothing
+/// yet and the catalog is not retained on its strength.
+fn settled(signal: SystemTime) -> bool {
+    signal
+        .elapsed()
+        .is_ok_and(|age| age >= Duration::from_secs(2))
 }
 pub fn rows(out: Output) -> Result<Vec<Row>> {
     let columns = out.columns;
@@ -51,8 +98,25 @@ impl Client {
             );
         }
         self.catalog = None;
+        self.check_connection()?;
+        // Taken before the database is read: a schema change that lands during the read
+        // moves the signal past this value, and the next request reads again.
+        let signal = schema_signal(self.config.schema_signal.as_deref());
+        let shared = self
+            .backend_catalog()?
+            .filter(|shared| shared.current(signal));
+        if let Some(shared) = shared {
+            self.generation(shared.generation)?;
+            self.catalog = Some(Catalog {
+                present: shared.present,
+                managed: shared.managed,
+                pending: shared.pending,
+                ..Catalog::default()
+            });
+            return Ok(());
+        }
         let relation = format!("{}.{}", qi(&self.config.schema), qi("__wp_dsql_schema"));
-        let exists = rows(self.raw(
+        let exists = rows(self.raw_read(
             "SELECT to_regclass($1)::text AS name".into(),
             vec![relation.clone()],
         )?)?
@@ -66,7 +130,7 @@ impl Client {
         };
         let mut signature = String::new();
         if exists {
-            let data=rows(self.raw(format!("SELECT table_name,fingerprint,CASE WHEN table_name='__catalog__' THEN metadata ELSE NULL END AS control FROM {relation} ORDER BY table_name"),vec![])?)?;
+            let data=rows(self.raw_read(format!("SELECT table_name,fingerprint,CASE WHEN table_name='__catalog__' THEN metadata ELSE NULL END AS control FROM {relation} ORDER BY table_name"),vec![])?)?;
             for r in data {
                 let table = cell(&r, "table_name").ok_or("Invalid catalog name")?;
                 let fingerprint = cell(&r, "fingerprint").ok_or("Invalid catalog fingerprint")?;
@@ -89,7 +153,20 @@ impl Client {
                 }
             }
         }
-        self.generation(format!("{:x}", Sha256::digest(signature.as_bytes())))?;
+        let generation = format!("{:x}", Sha256::digest(signature.as_bytes()));
+        self.generation(generation.clone())?;
+        self.share_catalog(
+            signal
+                .filter(|signal| settled(*signal))
+                .map(|signal| SharedCatalog {
+                    generation,
+                    present: catalog.present,
+                    managed: catalog.managed,
+                    pending: catalog.pending.clone(),
+                    checked: Instant::now(),
+                    signal,
+                }),
+        )?;
         self.catalog = Some(catalog);
         Ok(())
     }
