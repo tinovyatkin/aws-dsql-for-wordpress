@@ -86,6 +86,15 @@ struct Parked {
 async fn close_quietly(connection: PgConnection) {
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, connection.close()).await;
 }
+/// A deadline for blocking calls. Being async, the timer is created when `block_on` polls
+/// it, inside the runtime: `tokio::time::timeout` built outside runtime context panics,
+/// and PHP metadata entry points do not otherwise enter it.
+async fn within<F: std::future::Future>(
+    limit: Duration,
+    future: F,
+) -> std::result::Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout(limit, future).await
+}
 fn timed_out() -> sqlx::Error {
     sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))
 }
@@ -568,7 +577,7 @@ impl Client {
                         current,
                     ));
                 }
-                let cleared = rt.block_on(tokio::time::timeout(
+                let cleared = rt.block_on(within(
                     PROBE_TIMEOUT,
                     parked.connection.clear_cached_statements(),
                 ));
@@ -597,7 +606,7 @@ impl Client {
         // Bounded: a connection that stopped answering without closing must not hold
         // the worker. It is then discarded and replaced.
         let alive = matches!(
-            runtime().block_on(tokio::time::timeout(
+            runtime().block_on(within(
                 PROBE_TIMEOUT,
                 self.connection.as_mut().unwrap().ping()
             )),
@@ -958,7 +967,7 @@ impl Client {
                 Ok::<_, sqlx::Error>(last)
             };
             let result = if bounded {
-                rt.block_on(tokio::time::timeout(UNPROVEN_READ_TIMEOUT, work))
+                rt.block_on(within(UNPROVEN_READ_TIMEOUT, work))
                     .unwrap_or_else(|_| Err(timed_out()))
             } else {
                 rt.block_on(work)
@@ -1079,7 +1088,7 @@ impl Client {
         }
         let command = BoundCommand { sql, values };
         let mut result = runtime()
-            .block_on(tokio::time::timeout(
+            .block_on(within(
                 UNPROVEN_READ_TIMEOUT,
                 execute_command(self.connection.as_mut().unwrap(), &command),
             ))
@@ -1194,7 +1203,7 @@ impl Client {
                 .map_err(|_| "Connection slot lock failed")?
                 .take();
             if let Some(mut parked) = parked {
-                let cleared = runtime().block_on(tokio::time::timeout(
+                let cleared = runtime().block_on(within(
                     PROBE_TIMEOUT,
                     parked.connection.clear_cached_statements(),
                 ));

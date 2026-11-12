@@ -454,3 +454,31 @@ fn parked_connection_from_an_older_generation_is_cleared_before_reuse() {
     drop(b);
     reset_worker().unwrap();
 }
+#[test]
+#[ignore = "requires the explicitly selected synthetic AWS fixture"]
+fn metadata_entry_points_work_on_an_idle_parked_connection() {
+    let (cfg, table) = fixture_config();
+    let mut a = Client::new(cfg.clone()).unwrap();
+    a.query(&format!("SELECT post_title FROM `{table}` WHERE ID=1"))
+        .unwrap();
+    a.close();
+    let (b, _) = backend(&cfg).unwrap();
+    let idle = Instant::now() - PROBE_AFTER_IDLE - Duration::from_secs(1);
+    // PHP calls these without entering the runtime first; the probe's timer must still work.
+    b.parked.lock().unwrap().as_mut().unwrap().since = idle;
+    // A catalog read is replayable: bounded by a timer instead of a liveness check.
+    let mut c = Client::new(cfg.clone()).unwrap();
+    let model = c.logical_table(&table).unwrap().expect("fixture table");
+    assert!(model["columns"].as_array().is_some_and(|c| !c.is_empty()));
+    assert_eq!(c.connection_health_checks, 0);
+    c.close();
+    // Other direct statements (identity reseeding uses this path) are probed first.
+    b.parked.lock().unwrap().as_mut().unwrap().since = idle;
+    let mut d = Client::new(cfg).unwrap();
+    let one = d.raw("SELECT 1 AS one".into(), vec![]).unwrap();
+    assert_eq!(one.rows[0][0].as_deref(), Some(&b"1"[..]));
+    assert_eq!(d.connection_health_checks, 1);
+    d.close();
+    drop(b);
+    reset_worker().unwrap();
+}
