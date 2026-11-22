@@ -23,9 +23,11 @@ unsupported constructs fail explicitly. This is not general MySQL emulation.
 
 The tested deployment targets are **Debian 12, x86_64, PHP 8.5 and 8.6 NTS**.
 An extension binary is bound to one PHP minor version's Zend API, so the
-[Dockerfile](build/Dockerfile) takes the PHP image as `PHP_IMAGE` and CI builds
-one artifact per minor (`native-php85-…`, `native-php86-…`). It pins Rust and PHP
-image digests, runs Rust tests,
+[Dockerfile](build/Dockerfile) takes `PHP_MINOR` and CI builds one artifact per
+minor (`native-php8.5-nts-…`, `native-php8.6-nts-…`). It builds against the
+deployment's own `packages.sury.org` `php8.x-dev` packages (signing key verified by
+fingerprint) because the official `php:8.6` images are thread-safe (ZTS), which an
+NTS server cannot load. It pins the Rust image digest, rejects a ZTS PHP, runs Rust tests,
 builds the extension, checks PHP loading and native logging, and exports a binary
 with SHA-256, source commit, PHP ABI and dynamic-library metadata. The
 [GitHub workflow](../.github/workflows/native-linux.yml) runs this build off-host.
