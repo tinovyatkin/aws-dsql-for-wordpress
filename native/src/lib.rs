@@ -26,7 +26,7 @@ mod php {
         client: Client,
     }
     fn error(s: String) -> PhpException {
-        PhpException::default(s)
+        PhpException::from_message(s)
     }
     #[php_impl]
     impl NativeClient {

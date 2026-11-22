@@ -1,6 +1,8 @@
-# Debian 12 / x86_64 and PHP 8.5.10 NTS match the deployment ABI.
+# Debian 12 / x86_64 NTS images match the deployment ABI. An extension is bound to one
+# PHP minor version (its Zend API number), so CI builds one artifact per supported minor.
+ARG PHP_IMAGE=php:8.6.0-fpm-bookworm@sha256:a836c00ddc6d873275d40437eb74732bde56781ead316b9eff42fa46dc6d93db
 FROM rust:1.98.1-bookworm@sha256:828077e0f5ed0401fbd9cb5b4d5dedca23bd13c7fe032f3e8b7313e7acd2a57f AS rust
-FROM php:8.5.10-fpm-bookworm@sha256:cc45fc347dcdef585e907fa7dab27087039f2adf7bd911c22b79a3d80cc98d08 AS build
+FROM ${PHP_IMAGE} AS build
 COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
 ENV PATH="/usr/local/cargo/bin:${PATH}" RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo

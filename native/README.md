@@ -21,8 +21,11 @@ unsupported constructs fail explicitly. This is not general MySQL emulation.
 
 ## Build and enable
 
-The tested deployment target is **Debian 12, x86_64, PHP 8.5.10 NTS**. The
-[Dockerfile](build/Dockerfile) pins Rust and PHP image digests, runs Rust tests,
+The tested deployment targets are **Debian 12, x86_64, PHP 8.5 and 8.6 NTS**.
+An extension binary is bound to one PHP minor version's Zend API, so the
+[Dockerfile](build/Dockerfile) takes the PHP image as `PHP_IMAGE` and CI builds
+one artifact per minor (`native-php85-…`, `native-php86-…`). It pins Rust and PHP
+image digests, runs Rust tests,
 builds the extension, checks PHP loading and native logging, and exports a binary
 with SHA-256, source commit, PHP ABI and dynamic-library metadata. The
 [GitHub workflow](../.github/workflows/native-linux.yml) runs this build off-host.

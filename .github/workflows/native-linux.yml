@@ -13,22 +13,32 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '85'
+            image: php:8.5.10-fpm-bookworm@sha256:cc45fc347dcdef585e907fa7dab27087039f2adf7bd911c22b79a3d80cc98d08
+          - php: '86'
+            image: php:8.6.0-fpm-bookworm@sha256:a836c00ddc6d873275d40437eb74732bde56781ead316b9eff42fa46dc6d93db
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Build and test Debian 12 amd64 PHP 8.5.10 extension
+      - name: Build and test Debian 12 amd64 PHP ${{ matrix.php }} extension
         uses: docker/build-push-action@v6
         with:
           context: .
           file: native/build/Dockerfile
-          build-args: SOURCE_COMMIT=${{ github.sha }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            PHP_IMAGE=${{ matrix.image }}
           platforms: linux/amd64
           target: artifact
           outputs: type=local,dest=artifact
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=php${{ matrix.php }}
+          cache-to: type=gha,mode=max,scope=php${{ matrix.php }}
       - uses: actions/upload-artifact@v4
         with:
-          name: native-php85-debian12-amd64
+          name: native-php${{ matrix.php }}-debian12-amd64
           path: artifact/
           retention-days: 14
