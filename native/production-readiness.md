@@ -12,7 +12,7 @@ the deploying site; this repository contains the reusable test contracts.
       transaction ownership, reconnect/expiry and worker shutdown tests.
 - [x] Thin wpdb integration preserving filters, escaping, results and diagnostics.
 - [x] Controlled upgrade/DDL behavior and schema-cache invalidation verified.
-- [x] Reproducible Debian 12 x86_64 PHP 8.5 NTS build with ABI/load checks.
+- [x] Reproducible Debian 12 x86_64 PHP 8.5 and 8.6 NTS builds with ABI/load checks.
 - [x] Synthetic WordPress and plugin suite passing through the native engine.
 - [x] Protected staging application, admin, Site Health and full-page checks.
 - [x] Production backup/config rollback, atomic promotion, full verification.
